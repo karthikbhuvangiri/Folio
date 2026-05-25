@@ -30,7 +30,10 @@ DEFAULT_LLAMACPP_BASE_URL = os.getenv("LLAMACPP_BASE_URL", "http://host.docker.i
 DEFAULT_LLAMACPP_MODEL = os.getenv("LLAMACPP_MODEL", "local")
 DEFAULT_CATEGORIZE_MODEL = os.getenv("OLLAMA_MODEL_CATEGORIZE", "gemma4:e4b")
 DEFAULT_CONTROLLER_MODEL = os.getenv("OLLAMA_MODEL_CONTROLLER", DEFAULT_CATEGORIZE_MODEL)
-DEFAULT_COPILOT_MODEL = os.getenv("OLLAMA_MODEL_COPILOT", "gemma4:26b")
+DEFAULT_COPILOT_MODEL = os.getenv("OLLAMA_MODEL_COPILOT", "gemma4:e4b")
+DEFAULT_ADVISOR_MODEL = "gemma4:e4b"
+HIGH_MEMORY_ADVISOR_MODEL = "gemma4:26b"
+ADVISOR_HIGH_MEMORY_MIN_RAM_GB = 30
 DEFAULT_MEMORY_TIER = os.getenv("LOCAL_LLM_MEMORY_TIER", "16gb").strip().lower()
 ENABLE_EXPERIMENTAL_LOCAL_MODELS = os.getenv(
     "ENABLE_EXPERIMENTAL_LOCAL_MODELS",
@@ -143,7 +146,7 @@ def detect_memory_profile() -> dict:
 
     if ram_gb is None:
         tier = DEFAULT_MEMORY_TIER if DEFAULT_MEMORY_TIER in {"8gb", "16gb", "32gb"} else "16gb"
-    elif ram_gb >= 24:
+    elif ram_gb >= ADVISOR_HIGH_MEMORY_MIN_RAM_GB:
         tier = "32gb"
     elif ram_gb >= 14:
         tier = "16gb"
@@ -160,6 +163,36 @@ def detect_memory_profile() -> dict:
 def _tier_sort_key(tier: str) -> tuple[int, str]:
     order = {"8gb": 0, "16gb": 1, "32gb": 2}
     return (order.get(tier, 99), tier)
+
+
+def _configured_advisor_model() -> str:
+    return (
+        os.getenv("MIRA_ADVISOR_LENS_MODEL")
+        or os.getenv("OLLAMA_MODEL_ADVISOR")
+        or ""
+    ).strip()
+
+
+def _recommended_advisor_model(memory: dict, defaults: dict | None = None) -> str:
+    configured = _configured_advisor_model()
+    if configured:
+        return configured
+    ram_gb = memory.get("ramGb")
+    if ram_gb is not None and ram_gb >= ADVISOR_HIGH_MEMORY_MIN_RAM_GB:
+        return (defaults or {}).get("advisor_model") or HIGH_MEMORY_ADVISOR_MODEL
+    return DEFAULT_ADVISOR_MODEL
+
+
+def _model_requires_advanced(meta: dict | None) -> bool:
+    if not meta:
+        return False
+    if meta.get("expert_only") or meta.get("advanced_only"):
+        return True
+    return meta.get("validated_for_mira") is not True
+
+
+def _model_supports(meta: dict | None, task: str) -> bool:
+    return task in (meta or {}).get("task_fit", [])
 
 
 def _fetch_ollama_state(base_url: str) -> dict:
@@ -383,6 +416,7 @@ def _read_settings(conn) -> dict:
 
 
 def update_settings(conn, payload: dict) -> dict:
+    payload_keys = set((payload or {}).keys())
     current = _read_settings(conn)
     next_settings = dict(current)
     next_settings.update(payload or {})
@@ -405,22 +439,36 @@ def update_settings(conn, payload: dict) -> dict:
 
     preset = next_settings.get("local_ai_profile")
     if preset and preset not in presets:
-        raise ValueError("Unknown local_ai_profile.")
+        if preset in {"battery_saver", "balanced", "quality", "light"}:
+            next_settings["local_ai_profile"] = "default"
+        else:
+            raise ValueError("Unknown local_ai_profile.")
 
     expert_mode = bool(next_settings.get("expert_mode"))
+    disabling_advanced_mode = "expert_mode" in payload_keys and not expert_mode
     for key in ["categorize_model", "controller_model", "copilot_model"]:
         selected = next_settings.get(key)
         if not selected:
             continue
         if selected not in models:
             raise ValueError(f"Unsupported model: {selected}")
-        if models[selected].get("expert_only") and not expert_mode:
-            raise ValueError(f"{selected} requires expert mode.")
+        task = "copilot" if key == "copilot_model" else "categorize"
+        if not _model_supports(models[selected], task):
+            if key in payload_keys and not disabling_advanced_mode:
+                raise ValueError(f"{selected} is not supported for {task}.")
+            next_settings[key] = None
+            continue
+        if _model_requires_advanced(models[selected]) and not expert_mode:
+            if key in payload_keys and not disabling_advanced_mode:
+                raise ValueError(f"{selected} requires Advanced mode.")
+            next_settings[key] = None
 
     if next_settings.get("categorize_model"):
         model_meta = models[next_settings["categorize_model"]]
         if model_meta.get("categorize_default") == "avoid" and not expert_mode:
-            raise ValueError("Selected categorize_model requires expert mode.")
+            if "categorize_model" in payload_keys and not disabling_advanced_mode:
+                raise ValueError("Selected categorize_model requires Advanced mode.")
+            next_settings["categorize_model"] = None
 
     for key, value in next_settings.items():
         stored = None if value is None else str(int(value)) if isinstance(value, bool) else str(value)
@@ -465,8 +513,10 @@ def resolve_runtime_settings(conn=None) -> dict:
     )
 
     explicit_preset_key = settings.get("local_ai_profile")
-    preset_key = explicit_preset_key or defaults.get("preset") or "balanced"
-    preset = presets.get(preset_key, presets.get("balanced", {}))
+    if explicit_preset_key not in presets:
+        explicit_preset_key = None
+    preset_key = explicit_preset_key or defaults.get("preset") or "default"
+    preset = presets.get(preset_key, presets.get("default", {}))
     expert_mode = bool(settings.get("expert_mode"))
 
     default_categorize_model = (
@@ -479,21 +529,28 @@ def resolve_runtime_settings(conn=None) -> dict:
         if explicit_preset_key
         else defaults.get("copilot_model") or preset.get("copilot_model")
     )
+    default_advisor_model = _recommended_advisor_model(memory, defaults)
 
     categorize_model = settings.get("categorize_model") or default_categorize_model or DEFAULT_CATEGORIZE_MODEL
     controller_model = settings.get("controller_model") or DEFAULT_CONTROLLER_MODEL or categorize_model
     copilot_model = settings.get("copilot_model") or default_copilot_model or DEFAULT_COPILOT_MODEL
+    advisor_model = default_advisor_model
 
     if categorize_model in models:
-        if models[categorize_model].get("expert_only") and not expert_mode:
+        if not _model_supports(models[categorize_model], "categorize"):
+            categorize_model = preset.get("categorize_model") or defaults.get("categorize_model") or DEFAULT_CATEGORIZE_MODEL
+        elif _model_requires_advanced(models[categorize_model]) and not expert_mode:
             categorize_model = preset.get("categorize_model") or defaults.get("categorize_model") or DEFAULT_CATEGORIZE_MODEL
         elif models[categorize_model].get("categorize_default") == "avoid" and not expert_mode:
             categorize_model = preset.get("categorize_model") or defaults.get("categorize_model") or DEFAULT_CATEGORIZE_MODEL
 
-    if copilot_model in models and models[copilot_model].get("expert_only") and not expert_mode:
-        copilot_model = preset.get("copilot_model") or defaults.get("copilot_model") or DEFAULT_COPILOT_MODEL
+    if copilot_model in models:
+        if not _model_supports(models[copilot_model], "copilot"):
+            copilot_model = preset.get("copilot_model") or defaults.get("copilot_model") or DEFAULT_COPILOT_MODEL
+        elif _model_requires_advanced(models[copilot_model]) and not expert_mode:
+            copilot_model = preset.get("copilot_model") or defaults.get("copilot_model") or DEFAULT_COPILOT_MODEL
     if controller_model in models:
-        if models[controller_model].get("expert_only") and not expert_mode:
+        if _model_requires_advanced(models[controller_model]) and not expert_mode:
             controller_model = categorize_model
         elif models[controller_model].get("categorize_default") == "avoid" and not expert_mode:
             controller_model = categorize_model
@@ -518,6 +575,7 @@ def resolve_runtime_settings(conn=None) -> dict:
         "selectedCategorizeModel": categorize_model,
         "selectedControllerModel": controller_model,
         "selectedCopilotModel": copilot_model,
+        "selectedAdvisorModel": advisor_model,
         "categorizeBatchSize": max(1, int(batch_size)),
         "interBatchDelayMs": max(0, int(delay_ms)),
     }
@@ -544,6 +602,7 @@ def get_catalog_response(conn=None) -> dict:
                 "selectedForCategorize": resolved["selectedCategorizeModel"] == model_id,
                 "selectedForController": resolved["selectedControllerModel"] == model_id,
                 "selectedForCopilot": resolved["selectedCopilotModel"] == model_id,
+                "selectedForAdvisor": resolved["selectedAdvisorModel"] == model_id,
             }
             tier_models.append(enriched)
             model_list.append(enriched)
@@ -583,6 +642,7 @@ def get_status_response(conn=None) -> dict:
         "selectedCategorizeModel": resolved["selectedCategorizeModel"],
         "selectedControllerModel": resolved["selectedControllerModel"],
         "selectedCopilotModel": resolved["selectedCopilotModel"],
+        "selectedAdvisorModel": resolved["selectedAdvisorModel"],
         "preset": resolved["preset"],
         "lowPowerMode": resolved["lowPowerMode"],
         "expertMode": resolved["expertMode"],
@@ -594,8 +654,12 @@ def get_status_response(conn=None) -> dict:
 
 def get_frontend_flags(conn=None) -> dict:
     resolved = resolve_runtime_settings(conn)
+    local_llm_configured = (
+        (resolved["provider"] == "ollama" and bool(resolved["ollamaBaseUrl"]))
+        or (resolved["provider"] == "llamacpp" and bool(resolved["llamaCppBaseUrl"]))
+    )
     return {
-        "localLlmEnabled": resolved["provider"] in {"ollama", "llamacpp"},
+        "localLlmEnabled": local_llm_configured,
         "localLlmProvider": resolved["provider"],
         "memoryTier": resolved["memory"]["memoryTier"],
         "localAiProfile": resolved["preset"],
@@ -604,6 +668,7 @@ def get_frontend_flags(conn=None) -> dict:
         "selectedCategorizeModel": resolved["selectedCategorizeModel"],
         "selectedControllerModel": resolved["selectedControllerModel"],
         "selectedCopilotModel": resolved["selectedCopilotModel"],
+        "selectedAdvisorModel": resolved["selectedAdvisorModel"],
     }
 
 
@@ -664,6 +729,7 @@ def get_ollama_config() -> dict:
         "categorize_model": resolved["selectedCategorizeModel"],
         "controller_model": resolved["selectedControllerModel"],
         "copilot_model": resolved["selectedCopilotModel"],
+        "advisor_model": resolved["selectedAdvisorModel"],
     }
 
 

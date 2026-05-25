@@ -786,11 +786,35 @@ def run_agent_stream(question: str, profile: str | None, history: list[dict] | N
     """
     from copilot_agents.dispatcher import run_agent_stream as run_dispatcher_stream
 
-    dispatched = run_dispatcher_stream(question, profile, history, forced_intent=forced_intent)
-    if dispatched is not None:
-        yield from dispatched
-        return
-    yield {"type": "error", "message": "Mira could not route that request cleanly."}
+    trace_token = llm_client.start_trace()
+    try:
+        dispatched = run_dispatcher_stream(question, profile, history, forced_intent=forced_intent)
+        if dispatched is not None:
+            for event in dispatched:
+                if isinstance(event, dict) and event.get("type") == "done":
+                    event = dict(event)
+                    trace = dict(event.get("trace") or {})
+                    llm_calls = llm_client.current_trace_calls()
+                    trace["llm_calls"] = llm_calls
+                    trace["llm_call_count"] = len(llm_calls)
+                    trace["llm_call_summary"] = _summarize_llm_calls_for_trace(llm_calls)
+                    event["trace"] = trace
+                yield event
+            return
+        yield {"type": "error", "message": "Mira could not route that request cleanly."}
+    finally:
+        llm_client.finish_trace(trace_token)
+
+
+def _summarize_llm_calls_for_trace(calls: list[dict]) -> dict:
+    by_purpose: dict[str, int] = {}
+    for call in calls or []:
+        purpose = str(call.get("purpose") or "unknown")
+        by_purpose[purpose] = by_purpose.get(purpose, 0) + 1
+    return {
+        "count": len(calls or []),
+        "by_purpose": by_purpose,
+    }
 
 
 def _legacy_tool_names() -> list[str]:

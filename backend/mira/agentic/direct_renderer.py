@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from typing import Any
 
+from mira.agentic.confidence import confidence_caveat_from_summary
+from mira.agentic.temporal_parser import bounded_range_dates
+from mira.persona import direct_scalar_spend_answer
 from mira.agentic.schemas import EvidencePacket
 
 
@@ -82,11 +85,30 @@ def try_direct_scalar_answer(question: str, evidence: EvidencePacket) -> str:
         subject_phrase = f"on {subject}"
 
     range_phrase = direct_range_phrase(result, args)
-    sentence = f"You spent {format_money(total)} {subject_phrase}{range_phrase}."
+    amount_text = format_money(total)
+    templated = direct_scalar_spend_answer(
+        amount=amount_text,
+        subject_phrase=subject_phrase,
+        range_phrase=range_phrase,
+        count=count,
+    )
+    if templated:
+        return append_confidence_caveat(templated, result)
+
+    sentence = f"You spent {amount_text} {subject_phrase}{range_phrase}."
     if count is not None:
         noun = "transaction" if count == 1 else "transactions"
         sentence += f" That is based on {count} {noun}."
-    return sentence
+    return append_confidence_caveat(sentence, result)
+
+
+def append_confidence_caveat(answer: str, result: dict[str, Any]) -> str:
+    caveat = confidence_caveat_from_summary(result.get("confidence_summary"))
+    if not caveat:
+        return answer
+    if caveat.lower() in str(answer or "").lower():
+        return answer
+    return f"{answer} {caveat}"
 
 
 def record_has_caveats(record: dict[str, Any]) -> bool:
@@ -140,6 +162,10 @@ def format_money(value: float) -> str:
 def direct_range_phrase(record: dict[str, Any], args: dict[str, Any]) -> str:
     range_token = str(args.get("range") or record.get("range") or "").strip()
     month = str(record.get("month") or args.get("month") or "").strip()
+    bounded = bounded_range_dates(range_token)
+    if bounded:
+        start, end = bounded
+        return f" from {start} to {end}"
     if range_token == "current_month":
         return " this month"
     if range_token == "last_month":

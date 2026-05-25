@@ -36,6 +36,152 @@
   -moz-osx-font-smoothing: grayscale;
 }
 
+.mira-mark {
+    --mira-mark-size: 24px;
+    --mira-mark-bg: transparent;
+    --mira-mark-border: transparent;
+    --mira-mark-ink: var(--text-primary);
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: var(--mira-mark-size);
+    height: var(--mira-mark-size);
+    flex: 0 0 var(--mira-mark-size);
+    border-radius: 10px;
+    border: 1px solid var(--mira-mark-border);
+    background: var(--mira-mark-bg);
+    color: var(--mira-mark-ink);
+    line-height: 1;
+    overflow: hidden;
+}
+
+.mira-mark__letter {
+    position: relative;
+    z-index: 1;
+    display: block;
+    transform: translateY(-1px);
+    font-family: 'Instrument Serif', 'Newsreader', Georgia, serif;
+    font-size: calc(var(--mira-mark-size) * 0.78);
+    font-style: italic;
+    font-weight: 400;
+    letter-spacing: 0;
+    line-height: 1;
+}
+
+.mira-mark__dot {
+    position: absolute;
+    right: calc(var(--mira-mark-size) * 0.14);
+    top: calc(var(--mira-mark-size) * 0.16);
+    width: calc(var(--mira-mark-size) * 0.22);
+    height: calc(var(--mira-mark-size) * 0.22);
+    border-radius: 999px;
+    border: 1.5px solid var(--mira-mark-dot);
+    background: color-mix(in srgb, var(--mira-mark-bg) 88%, #ffffff);
+}
+
+.mira-mark__dot::after {
+    content: '';
+    position: absolute;
+    inset: 27%;
+    border-radius: inherit;
+    background: var(--mira-mark-dot);
+}
+
+.mira-mark--nav {
+    --mira-mark-size: 23px;
+    --mira-mark-bg: transparent;
+    --mira-mark-border: transparent;
+    --mira-mark-ink: var(--sidebar-text);
+    border-radius: 0;
+    background-image: url('/mira-mark-dark.png');
+    background-position: center;
+    background-repeat: no-repeat;
+    background-size: 22px auto;
+    box-shadow: none;
+    overflow: visible;
+    opacity: 0.94;
+}
+
+.mira-mark--nav .mira-mark__letter {
+    transform: translate(-1px, 0) rotate(-5deg);
+    font-family: 'Instrument Serif', Georgia, serif;
+    font-size: 25px;
+    font-weight: 600;
+    color: var(--mira-mark-ink);
+    -webkit-text-fill-color: currentColor;
+    filter: none;
+}
+
+.mira-mark--nav .mira-mark__dot {
+    display: none;
+}
+
+.rail-link:hover .mira-mark--nav,
+.rail-link--active .mira-mark--nav {
+    --mira-mark-ink: var(--sidebar-text-active);
+    opacity: 1;
+}
+
+.dark .mira-mark--nav .mira-mark__letter {
+    color: var(--mira-mark-ink);
+    -webkit-text-fill-color: currentColor;
+}
+
+.dark .mira-mark--nav {
+    background-image: url('/mira-mark-dark.png');
+    background-size: 22px auto;
+}
+
+.mira-mark--hero {
+    --mira-mark-size: 46px;
+    --mira-mark-bg: transparent;
+    --mira-mark-border: transparent;
+    --mira-mark-ink: #FBFAF6;
+    border-radius: 0;
+    box-shadow: none;
+    overflow: visible;
+}
+
+.mira-mark--avatar {
+    --mira-mark-size: 26px;
+    --mira-mark-bg: transparent;
+    --mira-mark-border: transparent;
+    border-radius: 0;
+    background-image: url('/mira-mark-dark.png');
+    background-position: center;
+    background-repeat: no-repeat;
+    background-size: 26px auto;
+    box-shadow: none;
+    overflow: visible;
+    opacity: 0.96;
+}
+
+.mira-mark--hero .mira-mark__letter {
+    transform: translate(-2px, 1px) skewX(-10deg) scaleX(1.08);
+}
+
+.mira-mark--hero .mira-mark__letter {
+    font-size: 52px;
+    text-shadow:
+        0 1px 0 rgba(255, 255, 255, 0.08),
+        0 10px 24px rgba(5, 10, 18, 0.24);
+}
+
+.mira-mark--hero .mira-mark__dot {
+    display: none;
+}
+
+.dark .mira-mark--hero {
+    --mira-mark-bg: transparent;
+    --mira-mark-border: transparent;
+    box-shadow: none;
+}
+
+.dark .mira-mark--avatar {
+    background-image: url('/mira-mark-dark.png');
+}
+
 /* ———————————————————————————————————————————
    Folio — BASE DESIGN SYSTEM v11
    Shared styles across Light & Dark
@@ -1041,19 +1187,24 @@ h1, h2, h3, h4, h5, h6 {
     position: relative;
     padding: 3px;
     border-radius: 14px;
-    background: var(--glass-bg-subtle);
-    border: 1px solid var(--card-border);
-    box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.04);
+    background: #faf7f2;
+    border: 1px solid #ded6ca;
+    box-shadow:
+        0 8px 20px rgba(36, 28, 18, 0.06),
+        inset 0 1px 0 rgba(255, 255, 255, 0.82);
     transform: translateZ(0);
     min-width: 0;
 }
 
 .dark .period-toggle-track {
-    background: rgba(45, 48, 56, 0.72);
-    border-color: rgba(114, 124, 140, 0.20);
+    padding: 3px;
+    border-radius: 14px;
+    background: rgba(38, 42, 51, 0.78);
+    border: 1px solid rgba(114, 124, 140, 0.26);
     box-shadow:
         inset 0 1px 2px rgba(255, 255, 255, 0.02),
-        inset 0 -1px 3px rgba(0, 0, 0, 0.18);
+        inset 0 -1px 3px rgba(0, 0, 0, 0.18),
+        0 8px 24px rgba(0, 0, 0, 0.12);
 }
 
 .period-toggle-thumb {
@@ -1063,10 +1214,10 @@ h1, h2, h3, h4, h5, h6 {
     left: 3px;
     width: calc((100% - 6px) / var(--seg-count, 4));
     border-radius: 11px;
-    background: var(--glass-bg-strong);
+    background: #ffffff;
     box-shadow:
-        0 1px 6px rgba(16, 42, 67, 0.10),
-        0 0 0 1px rgba(59, 130, 246, 0.08);
+        0 1px 7px rgba(36, 28, 18, 0.12),
+        0 0 0 1px rgba(37, 99, 235, 0.10);
     transition: transform 300ms cubic-bezier(0.25, 1, 0.5, 1);
     transform: translateX(calc(var(--active-idx, 0) * 100%));
     z-index: 0;
@@ -1074,6 +1225,7 @@ h1, h2, h3, h4, h5, h6 {
 }
 
 .dark .period-toggle-thumb {
+    display: block;
     background: rgba(90, 159, 212, 0.14);
     box-shadow:
         0 1px 4px rgba(0, 0, 0, 0.30),
@@ -1089,8 +1241,8 @@ h1, h2, h3, h4, h5, h6 {
     background: transparent;
     border-radius: 11px;
     font-size: 0.75rem;
-    font-weight: 500;
-    color: var(--text-muted);
+    font-weight: 600;
+    color: #7a8798;
     cursor: pointer;
     transition: color 200ms ease;
     white-space: nowrap;
@@ -1098,12 +1250,29 @@ h1, h2, h3, h4, h5, h6 {
 }
 
 .period-toggle-label:hover {
-    color: var(--text-secondary);
+    color: #4f5f73;
 }
 
 .period-toggle-label.active {
+    color: #2563eb;
+    font-weight: 700;
+}
+
+.period-toggle-label.active::after {
+    display: none;
+}
+
+.dark .period-toggle-label:hover {
+    color: var(--text-secondary);
+}
+
+.dark .period-toggle-label.active {
     color: var(--accent);
     font-weight: 600;
+}
+
+.dark .period-toggle-label.active::after {
+    display: none;
 }
 
 /* ———————————————————————————————————————————
@@ -1125,15 +1294,21 @@ h1, h2, h3, h4, h5, h6 {
     font-weight: 600;
     white-space: nowrap;
     cursor: pointer;
-    border: 1px solid var(--card-border);
-    background: var(--glass-bg-subtle);
+    border: 1px solid #ded6ca;
+    background: #faf7f2;
     color: var(--text-primary);
+    box-shadow:
+        0 8px 20px rgba(36, 28, 18, 0.06),
+        inset 0 1px 0 rgba(255, 255, 255, 0.82);
     transition: border-color 0.2s, box-shadow 0.2s, background 0.2s;
 }
 
 .dark .month-dropdown-trigger {
-    background: rgba(45, 48, 56, 0.70);
-    border-color: rgba(114, 124, 140, 0.20);
+    background: rgba(38, 42, 51, 0.78);
+    border-color: rgba(114, 124, 140, 0.26);
+    box-shadow:
+        0 8px 24px rgba(0, 0, 0, 0.12),
+        inset 0 1px 0 rgba(255, 255, 255, 0.025);
 }
 
 .month-dropdown-trigger:hover {

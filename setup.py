@@ -19,6 +19,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import json
 from datetime import datetime, timedelta, timezone
@@ -28,6 +29,7 @@ from setup_helpers import (
     detect_system_profile,
     format_system_profile,
     load_model_presets,
+    recommend_advisor_model,
     recommend_model_preset,
 )
 from setup_ui import ui
@@ -38,6 +40,7 @@ CERTS_DIR = ROOT_DIR / "certs"
 DATA_DIR = ROOT_DIR / "data"
 BACKEND_DIR = ROOT_DIR / "backend"
 FRONTEND_DIR = ROOT_DIR / "frontend"
+FOLIO_LAUNCHER = ROOT_DIR / "folio.sh"
 DEPENDENCY_COOLDOWN_DAYS = int(os.environ.get("FOLIO_DEPENDENCY_COOLDOWN_DAYS", "7"))
 PIP_VERSION = os.environ.get("FOLIO_PIP_VERSION", "26.0.1")
 
@@ -56,6 +59,18 @@ NODE_DOWNLOAD_URLS = {
     "windows": "https://nodejs.org/en/download",
 }
 MODEL_PRESETS = load_model_presets(ROOT_DIR)
+DISTILBERT_HF_MODEL = "DoDataThings/distilbert-us-transaction-classifier-v2"
+DISTILBERT_MODEL_DIR = ROOT_DIR / "models" / "distilbert-us-transaction-classifier-v2"
+DISTILBERT_CONTAINER_MODEL_PATH = "/models/distilbert-us-transaction-classifier-v2"
+DISTILBERT_MODEL_FILES = (
+    "config.json",
+    "label_mapping.json",
+    "onnx/model_quantized.onnx",
+    "special_tokens_map.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "vocab.txt",
+)
 
 
 def dependency_cutoff_iso(days: int = DEPENDENCY_COOLDOWN_DAYS) -> str:
@@ -154,6 +169,67 @@ def check_python() -> bool:
 
 def check_node() -> bool:
     return shutil.which("node") is not None
+
+
+def check_tmux() -> bool:
+    return shutil.which("tmux") is not None
+
+
+def folio_launcher_available(host_os: str) -> bool:
+    return host_os != "windows" and FOLIO_LAUNCHER.exists()
+
+
+def tuned_ollama_session_running() -> bool:
+    if not check_tmux():
+        return False
+    session_name = os.environ.get("FOLIO_OLLAMA_TMUX_SESSION", "folio-mira-ollama")
+    try:
+        result = subprocess.run(
+            ["tmux", "has-session", "-t", session_name],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def env_file_uses_local_ai() -> bool:
+    if not ENV_FILE.exists():
+        return False
+
+    values = read_env_values()
+    truthy = {"1", "true", "yes", "on"}
+    return (
+        values.get("MIRA_ENABLED", "").lower() in truthy
+        or bool(values.get("OLLAMA_MODEL_COPILOT"))
+        or values.get("ENABLE_LLM_CATEGORIZATION", "").lower() in truthy
+        or values.get("RECEIPT_INTELLIGENCE_ENABLED", "").lower() in truthy
+    )
+
+
+def env_file_uses_distilbert() -> bool:
+    if not ENV_FILE.exists():
+        return False
+
+    values = read_env_values()
+    truthy = {"1", "true", "yes", "on"}
+    return (
+        values.get("CATEGORIZATION_BACKEND", "").lower() == "distilbert"
+        or values.get("INSTALL_DISTILBERT", "").lower() in truthy
+    )
+
+
+def read_env_values() -> dict[str, str]:
+    values: dict[str, str] = {}
+    for line in ENV_FILE.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, value = stripped.split("=", 1)
+        values[key.strip()] = value.strip().strip('"').strip("'")
+    return values
 
 
 def maybe_install_node(host_os: str) -> bool:
@@ -385,54 +461,46 @@ def generate_token_encryption_key() -> str:
 def choose_ai_mode(system_profile: dict) -> str:
     recommended_preset = MODEL_PRESETS[recommend_model_preset(system_profile, MODEL_PRESETS)]
     ui.panel(
-        "AI Modes",
+        "AI And Categorization Modes",
         [
-            f"1. Local AI (recommended for your system: {recommended_preset['label']})",
-            "2. No AI",
+            f"1. Local AI with Mira ({recommended_preset['label']})",
+            "2. No Ollama: DistilBERT categorization, Mira off",
+            "3. Rules only: no local model, Mira off",
         ],
         ui.BLUE,
     )
     choice = ask("  AI mode", default="1").lower()
     if choice in ("1", "local", "local ai", ""):
         return "local"
-    return "none"
+    if choice in ("2", "distilbert", "ml", "no ollama"):
+        return "distilbert"
+    return "rules_only"
 
 
 def choose_model_preset(system_profile: dict) -> dict:
     recommended_key = recommend_model_preset(system_profile, MODEL_PRESETS)
-    recommended_preset = MODEL_PRESETS[recommended_key]
+    recommended_preset = dict(MODEL_PRESETS[recommended_key])
+    advisor_model = recommend_advisor_model(system_profile)
+    recommended_preset["advisor_model"] = advisor_model
+    recommended_preset["controller_model"] = recommended_preset.get(
+        "controller_model",
+        recommended_preset.get("categorize_model"),
+    )
 
     ui.info("Detected system profile:")
     ui.kv("System", format_system_profile(system_profile))
     ui.kv(
-        "Recommendation",
-        f"{recommended_preset['label']} (~{recommended_preset['disk_gb']} GB download)",
+        "Mira default",
+        f"{recommended_preset['label']} (~{recommended_preset['disk_gb']} GB chat model download)",
     )
+    ui.kv("Chat model", recommended_preset["copilot_model"])
+    ui.kv("Advisor model", advisor_model)
     if system_profile.get("ram_gb") is not None and system_profile["ram_gb"] < 16:
-        ui.muted("Note: lower-memory systems are better off starting with Light.")
-
-    ui.info("Choose a local model preset:")
-    for idx, (key, preset) in enumerate(MODEL_PRESETS.items(), start=1):
-        suffix = " (recommended for your system)" if key == recommended_key else ""
-        ui.muted(
-            f"    {idx}. {preset['label']} — {preset['description']} "
-            f"(~{preset['disk_gb']} GB){suffix}"
-        )
-    default_choice = {
-        "light": "1",
-        "balanced": "2",
-        "quality": "3",
-    }[recommended_key]
-    choice = ask("  Model preset", default=default_choice)
-    selected_key = {
-        "1": "light",
-        "2": "balanced",
-        "3": "quality",
-        "light": "light",
-        "balanced": "balanced",
-        "quality": "quality",
-    }.get(choice.lower(), "balanced")
-    return MODEL_PRESETS[selected_key]
+        ui.warning("This local model can be memory-tight on 8 GB machines. Use No AI if the laptop is under pressure.")
+    if advisor_model != recommended_preset["copilot_model"]:
+        ui.muted("Advisor uses 26B only on systems with at least 30 GB RAM; chat stays on the tested E4B default.")
+    ui.muted("Advanced model experiments are available later in Control Center.")
+    return recommended_preset
 
 
 def check_ollama_cli() -> bool:
@@ -504,7 +572,48 @@ def maybe_install_ollama(host_os: str) -> bool:
     return False
 
 
-def ensure_ollama_running(host_os: str) -> bool:
+def ensure_ollama_running(host_os: str, prefer_folio_launcher: bool = False) -> bool:
+    if prefer_folio_launcher and folio_launcher_available(host_os):
+        if not check_tmux():
+            ui.error("tmux is required for ./folio.sh to start tuned Ollama.")
+            ui.muted("Install tmux, then rerun setup.py. On macOS with Homebrew: brew install tmux")
+            return False
+
+        if check_ollama_server():
+            if tuned_ollama_session_running():
+                ui.success("Tuned Folio Ollama tmux session is already running.")
+                return True
+
+            ui.warning("Ollama is already listening on http://localhost:11434, but not from Folio's tuned tmux session.")
+            ui.muted("For Mira's dual-slot prompt-cache behavior, stop the normal Ollama app/server and rerun setup.py.")
+            return False
+
+        ui.info("Starting tuned Ollama through ./folio.sh for Mira's dual-slot cache behavior...")
+        try:
+            launcher_env = os.environ.copy()
+            launcher_env["FOLIO_ENV_FILE"] = "/dev/null"
+            launcher_env["OLLAMA_HOST"] = "127.0.0.1:11434"
+            launcher_env["OLLAMA_NUM_PARALLEL"] = "2"
+            launcher_env["OLLAMA_MULTIUSER_CACHE"] = "1"
+            launcher_env["OLLAMA_KEEP_ALIVE"] = "30m"
+            subprocess.run(
+                [str(FOLIO_LAUNCHER), "ollama-start"],
+                cwd=str(ROOT_DIR),
+                env=launcher_env,
+                check=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            ui.error(f"Could not start tuned Ollama with ./folio.sh: {exc}")
+            return False
+
+        for _ in range(15):
+            if check_ollama_server():
+                return True
+            time.sleep(1)
+
+        ui.error("Tuned Ollama did not become reachable on http://localhost:11434.")
+        return False
+
     if check_ollama_server():
         return True
 
@@ -556,6 +665,58 @@ def ensure_ollama_model(model: str, available_models: set[str]) -> set[str]:
     return available_models
 
 
+def distilbert_model_present(model_dir: Path = DISTILBERT_MODEL_DIR) -> bool:
+    return all((model_dir / file_path).is_file() for file_path in DISTILBERT_MODEL_FILES)
+
+
+def distilbert_resolve_url(model_id: str, file_path: str) -> str:
+    repo = urllib.parse.quote(model_id, safe="/")
+    path = urllib.parse.quote(file_path, safe="/")
+    return f"https://huggingface.co/{repo}/resolve/main/{path}"
+
+
+def download_distilbert_model(
+    model_id: str = DISTILBERT_HF_MODEL,
+    target_dir: Path = DISTILBERT_MODEL_DIR,
+) -> bool:
+    if distilbert_model_present(target_dir):
+        ui.success(f"Found existing DistilBERT model cache: {target_dir}")
+        return True
+
+    print()
+    ui.info(f"Downloading DistilBERT model from Hugging Face: {model_id}")
+    ui.muted(f"Target: {target_dir}")
+    ui.muted("Credit: DoDataThings / Winston B. Model license: Apache-2.0.")
+
+    tmp_dir = target_dir.with_name(f".{target_dir.name}.tmp")
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    try:
+        for file_path in DISTILBERT_MODEL_FILES:
+            destination = tmp_dir / file_path
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            url = distilbert_resolve_url(model_id, file_path)
+            ui.muted(f"  fetching {file_path}")
+            request = urllib.request.Request(
+                url,
+                headers={"User-Agent": "Folio-setup/1.0"},
+            )
+            with urllib.request.urlopen(request, timeout=180) as response:
+                with destination.open("wb") as handle:
+                    shutil.copyfileobj(response, handle)
+
+        target_dir.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(tmp_dir, target_dir, dirs_exist_ok=True)
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+    except (OSError, urllib.error.URLError, TimeoutError) as exc:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        ui.warning(f"Could not download DistilBERT during setup: {exc}")
+        ui.muted("Folio will leave runtime Hugging Face download enabled and will still fall back safely if the model is unavailable.")
+        return False
+
+    ui.success("DistilBERT model downloaded.")
+    return True
+
+
 def gather_ai_config(ai_mode: str, runtime_mode: str, host_os: str) -> dict:
     internal_trove_seed = hashlib.sha256(str(ROOT_DIR).encode("utf-8")).hexdigest()[:24]
     config = {
@@ -566,16 +727,30 @@ def gather_ai_config(ai_mode: str, runtime_mode: str, host_os: str) -> dict:
         "enable_trove": "false",
         "enable_local_enrichment": "false",
         "enable_llm_categorization": "false",
+        "categorization_backend": "rules_only",
         "enable_experimental_local_models": "false",
+        "receipt_intelligence_enabled": "false",
         "ollama_base_url": "",
         "llamacpp_base_url": "",
         "llamacpp_model": "local",
         "ollama_model_categorize": "",
+        "ollama_model_controller": "",
         "ollama_model_copilot": "",
+        "mira_advisor_lens_model": "",
         "local_llm_memory_tier": "",
         "local_llm_ram_gb": "",
         "local_enrichment_batch_size": "20",
         "local_enrichment_min_confidence": "medium",
+        "mira_enabled": "false",
+        "install_distilbert": "false",
+        "distilbert_model": DISTILBERT_HF_MODEL,
+        "distilbert_model_path": DISTILBERT_CONTAINER_MODEL_PATH,
+        "distilbert_local_files_only": "true",
+        "distilbert_allow_download": "false",
+        "distilbert_required": "false",
+        "distilbert_confidence_threshold": "0.90",
+        "distilbert_batch_size": "64",
+        "distilbert_shadow": "false",
     }
 
     if ai_mode == "local":
@@ -588,7 +763,10 @@ def gather_ai_config(ai_mode: str, runtime_mode: str, host_os: str) -> dict:
             ui.error("Local AI setup could not continue without Ollama.")
             sys.exit(1)
 
-        if not ensure_ollama_running(host_os):
+        if not ensure_ollama_running(
+            host_os,
+            prefer_folio_launcher=runtime_mode == "docker",
+        ):
             ui.error("Ollama is required for Local AI mode.")
             sys.exit(1)
 
@@ -599,23 +777,32 @@ def gather_ai_config(ai_mode: str, runtime_mode: str, host_os: str) -> dict:
             [
                 f"Preset: {preset['label']}",
                 f"Categorization/enrichment: {preset['categorize_model']}",
-                f"Copilot: {preset['copilot_model']}",
-                f"Approx disk for models: {preset['disk_gb']} GB",
+                f"Mira chat: {preset['copilot_model']}",
+                f"Advisor: {preset['advisor_model']}",
+                f"Chat model download: ~{preset['disk_gb']} GB",
             ],
             ui.CYAN,
         )
 
         available_models = get_ollama_models()
-        available_models = ensure_ollama_model(preset["categorize_model"], available_models)
-        if preset["copilot_model"] != preset["categorize_model"]:
-            available_models = ensure_ollama_model(preset["copilot_model"], available_models)
+        for model in dict.fromkeys(
+            [
+                preset["categorize_model"],
+                preset.get("controller_model") or preset["categorize_model"],
+                preset["copilot_model"],
+                preset["advisor_model"],
+            ]
+        ):
+            available_models = ensure_ollama_model(model, available_models)
 
         config.update(
             {
                 "llm_provider": "ollama",
                 "enable_local_enrichment": "true",
                 "enable_llm_categorization": "true",
+                "categorization_backend": "local_llm",
                 "enable_trove": "false",
+                "receipt_intelligence_enabled": "true",
                 "ollama_base_url": (
                     "http://host.docker.internal:11434"
                     if runtime_mode == "docker"
@@ -627,20 +814,58 @@ def gather_ai_config(ai_mode: str, runtime_mode: str, host_os: str) -> dict:
                     else "http://localhost:8081"
                 ),
                 "ollama_model_categorize": preset["categorize_model"],
+                "ollama_model_controller": preset.get("controller_model") or preset["categorize_model"],
                 "ollama_model_copilot": preset["copilot_model"],
+                "mira_advisor_lens_model": preset["advisor_model"],
                 "local_llm_memory_tier": (
-                    "32gb" if (system_profile.get("ram_gb") or 0) >= 24
+                    "32gb" if (system_profile.get("ram_gb") or 0) >= 30
                     else "16gb" if (system_profile.get("ram_gb") or 0) >= 14
                     else "8gb" if system_profile.get("ram_gb")
                     else ""
                 ),
                 "local_llm_ram_gb": str(system_profile["ram_gb"]) if system_profile.get("ram_gb") else "",
+                "mira_enabled": "true",
+            }
+        )
+        return config
+
+    if ai_mode == "distilbert":
+        print()
+        ui.info("No-Ollama mode will use deterministic rules plus optional local DistilBERT categorization.")
+        ui.muted("Mira, receipt parsing, and LLM merchant enrichment stay disabled without a local LLM.")
+        ui.muted("DistilBERT is conservative: if the model is unavailable, Folio falls back to rules and 'Other'.")
+        model_path = (
+            DISTILBERT_CONTAINER_MODEL_PATH
+            if runtime_mode == "docker"
+            else str(DISTILBERT_MODEL_DIR)
+        )
+        pull_now = ask_yes_no(
+            "  Download the DistilBERT transaction model now into ./models? (~260 MB)",
+            default=True,
+        )
+        if pull_now and download_distilbert_model(config["distilbert_model"], DISTILBERT_MODEL_DIR):
+            distilbert_model_path = model_path
+            distilbert_local_files_only = "true"
+            distilbert_allow_download = "false"
+        else:
+            distilbert_model_path = ""
+            distilbert_local_files_only = "false"
+            distilbert_allow_download = "true"
+            ui.muted("The backend can download the model later from Hugging Face, or fall back to rules if unavailable.")
+        config.update(
+            {
+                "categorization_backend": "distilbert",
+                "install_distilbert": "true",
+                "distilbert_model_path": distilbert_model_path,
+                "distilbert_local_files_only": distilbert_local_files_only,
+                "distilbert_allow_download": distilbert_allow_download,
+                "mira_enabled": "false",
             }
         )
         return config
 
     print()
-    ui.info("No AI mode keeps only deterministic rules and manual categorization.")
+    ui.info("Rules-only mode keeps deterministic rules and manual categorization.")
     return config
 
 
@@ -703,17 +928,69 @@ def write_env_file(config: dict):
             f"VITE_TELLER_ENVIRONMENT={config.get('teller_env', 'sandbox')}",
             "",
             "# -- Feature Toggles --",
+            "DEMO_MODE=false",
             f"ENABLE_TROVE={config.get('enable_trove', 'false')}",
             f"ENABLE_LOCAL_ENRICHMENT={config.get('enable_local_enrichment', 'false')}",
             f"ENABLE_LLM_CATEGORIZATION={config.get('enable_llm_categorization', 'false')}",
+            f"CATEGORIZATION_BACKEND={config.get('categorization_backend', 'rules_only')}",
             f"ENABLE_EXPERIMENTAL_LOCAL_MODELS={config.get('enable_experimental_local_models', 'false')}",
+            f"RECEIPT_INTELLIGENCE_ENABLED={config.get('receipt_intelligence_enabled', 'false')}",
+            f"MIRA_ENABLED={config.get('mira_enabled', 'false')}",
             "COPILOT_MAX_WRITE_ROWS=5000",
+            "MIRA_AGENTIC_RUNTIME=vnext",
+            "MIRA_VNEXT_EVIDENCE_MAX_TOKENS=180",
+            "MIRA_VNEXT_GENERAL_MAX_TOKENS=1000",
+            "MIRA_SELECTOR_DECISION_CACHE_ENABLED=1",
+            "MIRA_SELECTOR_DECISION_CACHE_TTL_SECONDS=300",
+            "MIRA_SELECTOR_DECISION_CACHE_MAX=128",
+            "MIRA_SELECTOR_COMPACT_OUTPUT_ENABLED=1",
+            "MIRA_FRONT_CONTROLLER_PROTOCOL_ENABLED=0",
+            "MIRA_FRONT_CONTROLLER_CHAT_FAST_LANE_ENABLED=1",
+            "MIRA_FRONT_CONTROLLER_FINANCE_SCALAR_FAST_LANE_ENABLED=0",
+            "MIRA_FRONT_CONTROLLER_READ_ONLY_TABLE_FAST_LANE_ENABLED=0",
+            "MIRA_FRONT_CONTROLLER_CHART_FAST_LANE_ENABLED=0",
+            "MIRA_FRONT_CONTROLLER_EXPLAIN_COMPARE_FAST_LANE_ENABLED=0",
+            "MIRA_FRONT_CONTROLLER_WRITE_PREVIEW_FAST_LANE_ENABLED=0",
+            "MIRA_EXPLAIN_LAST_FAST_LANE_ENABLED=0",
+            "MIRA_MEMORY_SLASH_BYPASS_ENABLED=1",
+            "MIRA_VNEXT_SELECTOR_FALLBACK_ENABLED=0",
+            "MIRA_FRONT_CONTROLLER_COMPLEX_FINANCE_REACT_LITE_ENABLED=0",
+            "MIRA_COMPLEX_FINANCE_PREVIEW_LLM_ENABLED=0",
+            "MIRA_COMPLEX_FINANCE_PREVIEW_MAX_TOKENS=80",
+            "MIRA_COMPLEX_FINANCE_PREVIEW_ONLY_ENABLED=1",
+            "MIRA_FRONT_CONTROLLER_MAX_TOKENS=900",
+            "MIRA_FRONT_CONTROLLER_BACKGROUND_DRAIN_ENABLED=0",
+            "MIRA_MEMORY_SUGGESTIONS_ON_EVIDENCE_ENABLED=0",
+            "MIRA_FRONT_CONTROLLER_REWARM_AFTER_EVIDENCE_ENABLED=0",
+            "MIRA_FRONT_CONTROLLER_REWARM_MAX_TOKENS=16",
+            "MIRA_FRONT_CONTROLLER_REWARM_DELAY_MS=3000",
+            "MIRA_FRONT_CONTROLLER_REWARM_MIN_QUIET_MS=1200",
+            "MIRA_FRONT_CONTROLLER_REWARM_MIN_INTERVAL_SECONDS=8",
+            "MIRA_SESSION_SUMMARIES_ENABLED=1",
+            "MIRA_SESSION_SUMMARY_CONTEXT_ENABLED=0",
+            "MIRA_SESSION_SUMMARY_IDLE_SECONDS=90",
+            "MIRA_PENDING_STATE_FAST_RESOLVER_ENABLED=1",
+            "MIRA_MEMORY_SUGGESTIONS_ENABLED=true",
+            "MIRA_MEMORY_PREFERENCE_CONTEXT_ENABLED=true",
+            "MIRA_LLM_TEMPORAL_PARSER_ENABLED=1",
+            "MIRA_PERSONA_TEMPLATES_ENABLED=true",
+            "MIRA_PERSONA_V2_ENABLED=true",
+            "MIRA_CONFIDENCE_CAVEATS_ENABLED=true",
             "",
             "# -- LLM Provider --",
             f"LLM_PROVIDER={config.get('llm_provider', 'ollama')}",
             "",
             "# -- Ollama (Local AI mode) --",
             f"OLLAMA_BASE_URL={config.get('ollama_base_url', '')}",
+            "# Host Ollama server launch settings. Use scripts/start_mira_ollama.sh",
+            "# or set these in the process that runs `ollama serve`.",
+            "OLLAMA_HOST=127.0.0.1:11434",
+            "OLLAMA_NUM_PARALLEL=2",
+            "OLLAMA_MULTIUSER_CACHE=1",
+            "OLLAMA_KEEP_ALIVE=30m",
+            "OLLAMA_PREWARM_KEEP_ALIVE=30m",
+            "OLLAMA_CONTROLLER_KEEP_ALIVE=30m",
+            "OLLAMA_COPILOT_KEEP_ALIVE=30m",
             f"LLAMACPP_BASE_URL={config.get('llamacpp_base_url', '')}",
             f"LLAMACPP_MODEL={config.get('llamacpp_model', 'local')}",
             "LLAMACPP_TIMEOUT=240",
@@ -722,22 +999,92 @@ def write_env_file(config: dict):
             "LLAMACPP_TOP_K=64",
             "LLAMACPP_THINK=false",
             f"OLLAMA_MODEL_CATEGORIZE={config.get('ollama_model_categorize', '')}",
+            f"OLLAMA_MODEL_CONTROLLER={config.get('ollama_model_controller', '')}",
             f"OLLAMA_MODEL_COPILOT={config.get('ollama_model_copilot', '')}",
+            f"OLLAMA_MODEL_RECEIPT={config.get('ollama_model_copilot', '')}",
+            f"MIRA_ADVISOR_LENS_MODEL={config.get('mira_advisor_lens_model', '')}",
             f"LOCAL_LLM_MEMORY_TIER={config.get('local_llm_memory_tier', '')}",
             f"LOCAL_LLM_RAM_GB={config.get('local_llm_ram_gb', '')}",
             f"LOCAL_ENRICHMENT_BATCH_SIZE={config.get('local_enrichment_batch_size', '20')}",
             f"LOCAL_ENRICHMENT_MIN_CONFIDENCE={config.get('local_enrichment_min_confidence', 'medium')}",
             "OLLAMA_TIMEOUT_CATEGORIZE=600",
+            "OLLAMA_TIMEOUT_CONTROLLER=90",
             "OLLAMA_TIMEOUT_COPILOT=240",
+            "OLLAMA_TIMEOUT_ADVISOR=600",
+            "OLLAMA_PREWARM_TTL_SECONDS=240",
+            "",
+            "# -- Mira Background And Advisor --",
+            "MIRA_BACKGROUND_ANALYST_ENABLED=1",
+            "MIRA_BACKGROUND_ANALYST_STORE_ENABLED=1",
+            "MIRA_BACKGROUND_ANALYST_AUTO_ENABLED=0",
+            "MIRA_BACKGROUND_ANALYST_MIN_INTERVAL_MINUTES=360",
+            "MIRA_BACKGROUND_ANALYST_MAX_TOKENS=900",
+            "MIRA_BACKGROUND_ANALYST_MAX_DRAFTS=3",
+            "MIRA_FINANCIAL_UNDERSTANDING_ENABLED=1",
+            "MIRA_FINANCIAL_UNDERSTANDING_LLM_ENABLED=0",
+            "MIRA_FINANCIAL_UNDERSTANDING_MAX_FACTS=8",
+            "MIRA_FINANCIAL_UNDERSTANDING_MAX_TOKENS=900",
+            "MIRA_FINANCIAL_CONTEXT_TOOL_ENABLED=1",
+            "MIRA_LIFESTYLE_CONTEXT_PROMPT_ENABLED=1",
+            "MIRA_FINANCIAL_CONTEXT_MAX_FACTS=5",
+            "MIRA_ADVISOR_CASES_ENABLED=0",
+            "MIRA_ADVISOR_CARDS_ENABLED=0",
+            "MIRA_ADVISOR_BACKGROUND_AUTO_ENABLED=0",
+            "MIRA_ADVISOR_CARD_MAX_COUNT=4",
+            "MIRA_ADVISOR_SYNTHESIS_ENABLED=0",
+            "MIRA_ADVISOR_SYNTHESIS_STORE_ENABLED=0",
+            "MIRA_ADVISOR_SYNTHESIS_MAX_OBSERVATIONS=5",
+            "MIRA_ADVISOR_SYNTHESIS_MAX_TOKENS=1400",
+            "MIRA_ADVISOR_LENS_SYNTHESIS_ENABLED=0",
+            "MIRA_ADVISOR_LENS_STORE_ENABLED=0",
+            "MIRA_ADVISOR_LENS_BACKGROUND_AUTO_ENABLED=0",
+            "MIRA_ADVISOR_LENS_THINK=0",
+            "MIRA_ADVISOR_LENS_KEEP_ALIVE=2m",
+            "MIRA_ADVISOR_LENS_TIMEOUT=600",
+            "MIRA_ADVISOR_LENS_MIN_INTERVAL_MINUTES=1440",
+            "MIRA_ADVISOR_LENS_MIN_MEMO_CHARS=2200",
+            "MIRA_ADVISOR_LENS_MAX_TOKENS=1800",
+            "MIRA_ADVISOR_LENS_FINAL_MAX_TOKENS=2600",
+            "MIRA_ADVISOR_LENS_CONTEXT_ENABLED=0",
+            "MIRA_ADVISOR_LENS_CONTEXT_MAX_CHARS=2200",
+            "MIRA_ADVISOR_LENS_CONTEXT_MAX_TOKENS=520",
+            "MIRA_ADVISOR_LENS_UI_ENABLED=0",
+            "MIRA_ADVISOR_LENS_POST_REWARM_ENABLED=0",
+            "MIRA_ADVISOR_LENS_POST_REWARM_PURPOSES=controller",
+            "MIRA_ADVISOR_LENS_POST_REWARM_MAX_TOKENS=8",
+            "MIRA_FINANCIAL_FEEDBACK_LOOP_ENABLED=0",
+            "MIRA_MONEY_OUTLOOK_ENABLED=1",
+            "MIRA_SAFE_TO_SPEND_ENABLED=1",
+            "MIRA_CASH_LOW_POINT_RADAR_ENABLED=1",
+            "MIRA_STATED_INTENT_MEMORY_ENABLED=0",
+            "MIRA_HABIT_STREAKS_ENABLED=0",
+            "MIRA_MONTHLY_RETROSPECTIVE_ENABLED=0",
+            "MIRA_ENRICHMENT_REPAIR_ENABLED=0",
+            "",
+            "# -- DistilBERT Categorization (No-Ollama local ML mode) --",
+            f"DISTILBERT_CATEGORIZATION_MODEL={config.get('distilbert_model', 'DoDataThings/distilbert-us-transaction-classifier-v2')}",
+            f"DISTILBERT_MODEL_PATH={config.get('distilbert_model_path', '')}",
+            f"DISTILBERT_LOCAL_FILES_ONLY={config.get('distilbert_local_files_only', 'true')}",
+            f"DISTILBERT_ALLOW_DOWNLOAD={config.get('distilbert_allow_download', 'false')}",
+            f"DISTILBERT_REQUIRED={config.get('distilbert_required', 'false')}",
+            f"DISTILBERT_CONFIDENCE_THRESHOLD={config.get('distilbert_confidence_threshold', '0.90')}",
+            f"DISTILBERT_BATCH_SIZE={config.get('distilbert_batch_size', '64')}",
+            f"DISTILBERT_SHADOW={config.get('distilbert_shadow', 'false')}",
             "",
             "# -- Trove Merchant Enrichment --",
             f"TROVE_API_KEY={config.get('trove_key', '')}",
             f"TROVE_USER_SEED={config.get('trove_seed', 'Folio-self-hosted')}",
             "",
             "# -- App Settings --",
+            "FOLIO_AUTO_SYNC_ENABLED=true",
+            "FOLIO_AUTO_SYNC_INTERVAL_HOURS=12",
+            "FOLIO_AUTO_SYNC_STARTUP_DELAY_SECONDS=30",
+            "FOLIO_AUTO_SYNC_CHECK_SECONDS=300",
+            "FOLIO_AUTO_SYNC_FAILURE_BACKOFF_MINUTES=60",
             "CORS_ORIGINS=http://localhost:5173,http://localhost:3000",
             "",
             "# -- Docker Settings --",
+            f"INSTALL_DISTILBERT={config.get('install_distilbert', 'false')}",
             "BACKEND_PORT=8000",
             "FRONTEND_PORT=3000",
             "DB_FILE=Folio.db",
@@ -757,14 +1104,22 @@ def copy_env_for_local():
     ui.success("Copied .env to backend/ and frontend/")
 
 
-def start_docker():
+def start_docker(use_folio_launcher: bool = False):
     print()
-    ui.info("Building and starting containers...")
+    using_folio_launcher = use_folio_launcher and folio_launcher_available(detect_os())
+    if using_folio_launcher:
+        ui.info("Starting Folio through ./folio.sh so tuned Ollama is active...")
+        command = [str(FOLIO_LAUNCHER), "rebuild"]
+    else:
+        if use_folio_launcher:
+            ui.warning("./folio.sh is not available on this platform; falling back to Docker Compose.")
+        ui.info("Building and starting containers...")
+        command = ["docker", "compose", "up", "--build", "-d"]
     ui.muted("This may take a few minutes on first run.")
     print()
     try:
         subprocess.run(
-            ["docker", "compose", "up", "--build", "-d"],
+            command,
             cwd=str(ROOT_DIR),
             check=True,
         )
@@ -774,11 +1129,11 @@ def start_docker():
             "Services",
             [
                 "Frontend:  http://localhost:3000",
-                "Backend:   http://localhost:8000",
+                "Backend:   internal Docker service via /api",
                 "",
-                "Stop:      docker compose down",
+                "Stop:      ./folio.sh stop" if using_folio_launcher else "Stop:      docker compose down",
                 "Logs:      docker compose logs -f",
-                "Restart:   docker compose restart",
+                "Restart:   ./folio.sh restart" if using_folio_launcher else "Restart:   docker compose restart",
             ],
             ui.CYAN,
         )
@@ -826,6 +1181,20 @@ def start_local():
         ],
         check=True,
     )
+    if env_file_uses_distilbert():
+        ui.info("Installing optional DistilBERT categorization dependencies...")
+        subprocess.run(
+            [
+                python,
+                "-m",
+                "pip",
+                "install",
+                "--require-hashes",
+                "-r",
+                str(BACKEND_DIR / "requirements-distilbert.lock"),
+            ],
+            check=True,
+        )
 
     if not (FRONTEND_DIR / "node_modules").exists():
         ui.info(f"Installing frontend dependencies with a {DEPENDENCY_COOLDOWN_DAYS}-day npm cooldown...")
@@ -898,7 +1267,7 @@ def main():
                 if not docker_daemon_ok:
                     ui.warning("Docker Desktop is installed but not ready. Start/restart Docker Desktop first.")
                     sys.exit(1)
-                start_docker()
+                start_docker(use_folio_launcher=env_file_uses_local_ai())
             else:
                 start_local()
             return
@@ -954,13 +1323,14 @@ def main():
     if runtime_mode == "docker":
         if not docker_daemon_ok:
             ui.warning("Docker Desktop is not ready yet.")
+            next_command = "./folio.sh" if ai_mode == "local" else "docker compose up --build -d"
             ui.panel(
                 "Next Step",
-                ["Start/restart Docker Desktop, then run:", "docker compose up --build -d"],
+                ["Start/restart Docker Desktop, then run:", next_command],
                 ui.YELLOW,
             )
             return
-        start_docker()
+        start_docker(use_folio_launcher=ai_mode == "local")
     else:
         start_local()
 

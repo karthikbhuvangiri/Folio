@@ -143,26 +143,20 @@
     --rail-separator-glow-center: rgba(90, 159, 212, 0.28);
 
     /* ── Glass Rail v2 — Copilot ── */
-    --rail-copilot-bg:              rgba(139, 92, 246, 0.06);
-    --rail-copilot-bg-hover:        rgba(139, 92, 246, 0.12);
-    --rail-copilot-bg-active:       rgba(90, 159, 212, 0.14);
-    --rail-copilot-border:          rgba(139, 92, 246, 0.14);
-    --rail-copilot-border-hover:    rgba(139, 92, 246, 0.30);
-    --rail-copilot-border-active:   rgba(90, 159, 212, 0.28);
+    --rail-copilot-bg:              var(--rail-link-hover);
+    --rail-copilot-bg-hover:        var(--rail-link-hover);
+    --rail-copilot-bg-active:       var(--rail-link-active-bg);
+    --rail-copilot-border:          var(--rail-active-border);
+    --rail-copilot-border-hover:    var(--rail-active-border);
+    --rail-copilot-border-active:   var(--rail-active-border);
     --rail-copilot-border-gradient: linear-gradient(
         135deg,
-        rgba(139, 92, 246, 0.25) 0%,
-        rgba(59, 130, 246, 0.15) 50%,
-        rgba(139, 92, 246, 0.25) 100%
+        rgba(148, 163, 184, 0.12) 0%,
+        rgba(90, 159, 212, 0.10) 50%,
+        rgba(148, 163, 184, 0.12) 100%
     );
-    --rail-copilot-glow-hover:
-        0 0 0 1px rgba(139, 92, 246, 0.15),
-        0 0 20px rgba(139, 92, 246, 0.10),
-        0 0 40px rgba(139, 92, 246, 0.04);
-    --rail-copilot-glow-active:
-        0 0 0 1px rgba(90, 159, 212, 0.18),
-        0 0 16px rgba(90, 159, 212, 0.10),
-        0 0 32px rgba(90, 159, 212, 0.04);
+    --rail-copilot-glow-hover:      var(--rail-link-active-shadow);
+    --rail-copilot-glow-active:     var(--rail-link-active-shadow);
 
     /* —— Topbar —— */
     --topbar-bg:     rgba(46, 49, 57, 0.94);

@@ -5,16 +5,18 @@ FastAPI backend for Folio personal finance tracker.
 
 from pathlib import Path as FilePath
 from datetime import date, datetime, timedelta
+from threading import Lock
 import csv
 import io
 import json
+import re
 
 from fastapi import FastAPI, Depends, HTTPException, Query, BackgroundTasks, UploadFile, File
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, StrictInt, ValidationError
 from auth import verify_api_key, rate_limit_middleware
 import bank
 from bank import validate_teller_config, close_all_clients
@@ -28,10 +30,27 @@ setup_logging()
 
 logger = get_logger(__name__)
 
-DEMO_MODE = os.getenv("DEMO_MODE", "").strip().lower() in {"1", "true", "yes", "on"}
+_mira_background_job_lock = Lock()
+_mira_background_jobs: dict[str, dict] = {}
+_mira_advisor_read_job_lock = Lock()
+_mira_advisor_read_jobs: dict[str, dict] = {}
+_mira_money_outlook_job_lock = Lock()
+_mira_money_outlook_jobs: dict[str, dict] = {}
+
+_TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() in _TRUE_ENV_VALUES
+
+
+DEMO_MODE = _env_flag("DEMO_MODE", False)
 _receipt_flag = os.getenv("RECEIPT_INTELLIGENCE_ENABLED")
 RECEIPT_INTELLIGENCE_ENABLED = (
-    (_receipt_flag.strip().lower() in {"1", "true", "yes", "on"})
+    (_receipt_flag.strip().lower() in _TRUE_ENV_VALUES)
     if _receipt_flag is not None
     else not DEMO_MODE
 )
@@ -55,6 +74,7 @@ from data_manager import (
     update_transaction_excluded, update_transaction_metadata,
     get_transaction_splits, replace_transaction_splits,
     create_manual_account, update_manual_account, deactivate_manual_account,
+    update_account_payment_details,
     get_data_health_summary,
     get_scheduled_transactions_data,
     get_cash_flow_forecast_data,
@@ -81,8 +101,6 @@ from local_llm import (
     install_model as install_local_llm_model,
     schedule_prewarm_selected_model,
 )
-from experimental_import_review import router as experimental_import_review_router
-
 
 def schedule_prewarm_chat_prompt(*args, **kwargs) -> bool:
     return False
@@ -116,7 +134,6 @@ app = FastAPI(
 
 # Mount health as a sub-application — bypasses all main app middleware and deps
 app.mount("/healthz", _health_app)
-app.include_router(experimental_import_review_router)
 
 if os.getenv("MERCURY_MIRA_EXPERIMENT", "").strip().lower() in {"1", "true", "yes", "on"}:
     from mira.mercury_adapter import router as mercury_mira_router
@@ -160,11 +177,19 @@ def startup():
     schedule_prewarm_selected_model("controller")
     schedule_prewarm_selected_model("copilot")
     schedule_prewarm_chat_prompt()
+    if not DEMO_MODE:
+        from auto_sync import start_auto_sync_scheduler
+        start_auto_sync_scheduler(on_success=_after_auto_sync_success)
 
 
 @app.on_event("shutdown")
 def shutdown():
     """Close any remaining thread-local DB connections and Teller clients on server shutdown."""
+    try:
+        from auto_sync import stop_auto_sync_scheduler
+        stop_auto_sync_scheduler()
+    except Exception:
+        logger.debug("Auto sync scheduler shutdown skipped", exc_info=True)
     close_thread_local_connection()
     close_all_clients()
 
@@ -215,6 +240,32 @@ def _invalidate_copilot_cache() -> None:
         copilot_cache.invalidate_all()
     except Exception:
         logger.debug("Copilot cache invalidation skipped", exc_info=True)
+
+
+def _after_auto_sync_success(data: dict) -> None:
+    _invalidate_copilot_cache()
+    try:
+        background_refresh = _maybe_queue_mira_background_refresh(
+            background_tasks=None,
+            profile=None,
+            reason="auto_sync_completed",
+        )
+        with get_db() as conn:
+            money_outlook_refresh = _maybe_queue_mira_money_outlook_refresh(
+                background_tasks=None,
+                conn=conn,
+                profile=None,
+                reason="auto_sync_completed",
+            )
+        logger.info(
+            "Auto sync post-refresh complete: accounts=%s transactions=%s background=%s money_outlook=%s",
+            len(data.get("accounts", [])) if isinstance(data, dict) else None,
+            len(data.get("transactions", [])) if isinstance(data, dict) else None,
+            background_refresh.get("status") or background_refresh.get("queued"),
+            money_outlook_refresh.get("reason"),
+        )
+    except Exception:
+        logger.debug("Auto sync post-refresh skipped", exc_info=True)
 
 
 def _display_name_from_profile_id(profile_id: str) -> str:
@@ -348,6 +399,19 @@ def _mira_agentic_runtime_payload() -> dict:
     }
 
 
+def _mira_enabled() -> bool:
+    explicit = os.getenv("MIRA_ENABLED")
+    if explicit is not None and explicit.strip():
+        return explicit.strip().lower() in _TRUE_ENV_VALUES
+
+    provider = os.getenv("LLM_PROVIDER", "ollama").strip().lower() or "ollama"
+    if provider == "llamacpp":
+        return bool(os.getenv("LLAMACPP_BASE_URL", "").strip())
+    if provider == "ollama":
+        return bool(os.getenv("OLLAMA_BASE_URL", "").strip() and os.getenv("OLLAMA_MODEL_COPILOT", "").strip())
+    return False
+
+
 def _categorization_status_payload(*, preload_distilbert: bool = False) -> dict:
     backend = resolve_categorization_backend()
     payload = {
@@ -370,12 +434,82 @@ def _categorization_status_payload(*, preload_distilbert: bool = False) -> dict:
 
 
 def _app_config_payload(db=None) -> dict:
+    advisor_read_ui_enabled = False
+    advisor_read_context_enabled = False
+    advisor_read_generation_enabled = False
+    financial_feedback_loop_enabled = False
+    stated_intent_memory_enabled = False
+    habit_streaks_enabled_flag = False
+    monthly_retrospective_enabled_flag = False
+    money_outlook_enabled_flag = False
+    safe_to_spend_enabled_flag = False
+    cash_low_point_radar_enabled_flag = False
+    try:
+        from mira.advisor_lens_synthesis import (
+            advisor_lens_context_enabled,
+            advisor_lens_store_enabled,
+            advisor_lens_synthesis_enabled,
+            advisor_lens_ui_enabled,
+        )
+
+        advisor_read_ui_enabled = advisor_lens_ui_enabled()
+        advisor_read_context_enabled = advisor_lens_context_enabled()
+        advisor_read_generation_enabled = advisor_lens_synthesis_enabled() and advisor_lens_store_enabled()
+    except Exception as exc:
+        logger.debug("Failed to load advisor read UI flag: %s", exc)
+    try:
+        from mira.financial_feedback import financial_feedback_loop_enabled as _feedback_enabled
+
+        financial_feedback_loop_enabled = _feedback_enabled()
+    except Exception as exc:
+        logger.debug("Failed to load financial feedback flag: %s", exc)
+    try:
+        from mira.stated_intents import stated_intent_memory_enabled as _stated_intent_enabled
+
+        stated_intent_memory_enabled = _stated_intent_enabled()
+    except Exception as exc:
+        logger.debug("Failed to load stated intent memory flag: %s", exc)
+    try:
+        from mira.habit_streaks import habit_streaks_enabled as _habit_streaks_enabled
+
+        habit_streaks_enabled_flag = _habit_streaks_enabled()
+    except Exception as exc:
+        logger.debug("Failed to load habit streaks flag: %s", exc)
+    try:
+        from mira.monthly_retrospectives import monthly_retrospective_enabled as _monthly_retrospective_enabled
+
+        monthly_retrospective_enabled_flag = _monthly_retrospective_enabled()
+    except Exception as exc:
+        logger.debug("Failed to load monthly retrospective flag: %s", exc)
+    try:
+        from mira.money_outlook import (
+            cash_low_point_radar_enabled,
+            money_outlook_enabled,
+            safe_to_spend_enabled,
+        )
+
+        money_outlook_enabled_flag = money_outlook_enabled()
+        safe_to_spend_enabled_flag = safe_to_spend_enabled()
+        cash_low_point_radar_enabled_flag = cash_low_point_radar_enabled()
+    except Exception as exc:
+        logger.debug("Failed to load money outlook flags: %s", exc)
     payload = {
         "demoMode": DEMO_MODE,
         "bankLinkingEnabled": not DEMO_MODE,
         "manualSyncEnabled": not DEMO_MODE,
         "demoPersistence": "ephemeral" if DEMO_MODE else "persistent",
         "receiptIntelligenceEnabled": RECEIPT_INTELLIGENCE_ENABLED,
+        "miraEnabled": _mira_enabled(),
+        "miraAdvisorReadUiEnabled": advisor_read_ui_enabled,
+        "miraAdvisorReadContextEnabled": advisor_read_context_enabled,
+        "miraAdvisorReadGenerationEnabled": advisor_read_generation_enabled,
+        "miraFinancialFeedbackLoopEnabled": financial_feedback_loop_enabled,
+        "miraStatedIntentMemoryEnabled": stated_intent_memory_enabled,
+        "miraHabitStreaksEnabled": habit_streaks_enabled_flag,
+        "miraMonthlyRetrospectiveEnabled": monthly_retrospective_enabled_flag,
+        "miraMoneyOutlookEnabled": money_outlook_enabled_flag,
+        "miraSafeToSpendEnabled": safe_to_spend_enabled_flag,
+        "miraCashLowPointRadarEnabled": cash_low_point_radar_enabled_flag,
         "categorization": _categorization_status_payload(preload_distilbert=False),
         **_mira_agentic_runtime_payload(),
     }
@@ -384,6 +518,932 @@ def _app_config_payload(db=None) -> dict:
     except Exception as exc:
         logger.debug("Failed to load local LLM frontend flags: %s", exc)
     return payload
+
+
+_ADVISOR_PUBLIC_REF_RE = re.compile(r"\b(?:metric|txn):[A-Za-z0-9_.:-]+\b")
+
+
+def _advisor_public_text(value, *, max_chars: int) -> str:
+    text = str(value or "")
+    text = _ADVISOR_PUBLIC_REF_RE.sub("", text)
+    text = re.sub(r"\bevidence_ids?\b", "sources", text, flags=re.IGNORECASE)
+    text = re.sub(r"\brun_sql\b", "finance query", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bsafe_finance_query\b", "finance evidence", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bSQL\b", "finance query", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = text.strip()
+    if len(text) <= max_chars:
+        return text
+    trimmed = text[:max_chars].rsplit(" ", 1)[0].strip()
+    return trimmed or text[:max_chars].strip()
+
+
+def _advisor_public_text_list(values, *, max_items: int = 8, max_chars: int = 80) -> list[str]:
+    out: list[str] = []
+    for value in values or []:
+        clean = _advisor_public_text(value, max_chars=max_chars)
+        if clean and clean not in out:
+            out.append(clean)
+        if len(out) >= max_items:
+            break
+    return out
+
+
+def _public_advisor_delta_payload(delta: dict | None, memo: dict | None = None) -> dict | None:
+    if not isinstance(delta, dict):
+        return None
+    if memo and delta.get("source_memo_fingerprint") and memo.get("fingerprint"):
+        if delta.get("source_memo_fingerprint") != memo.get("fingerprint"):
+            return None
+    packet = delta.get("delta_packet") if isinstance(delta.get("delta_packet"), dict) else {}
+    if not packet or packet.get("status") not in {"changed", "fresh"}:
+        return None
+    headline = _advisor_public_text(packet.get("headline"), max_chars=180)
+    action = _advisor_public_text(packet.get("action"), max_chars=220)
+    sections = _advisor_public_text_list(packet.get("invalidated_sections"), max_items=8, max_chars=80)
+    months = _advisor_public_text_list(packet.get("touched_months"), max_items=8, max_chars=16)
+    categories: list[str] = []
+    for item in packet.get("category_change_summary") or []:
+        if not isinstance(item, dict):
+            continue
+        categories.extend(item.get("added") or [])
+        categories.extend(item.get("changed") or [])
+        categories.extend(item.get("removed") or [])
+    merchants: list[str] = []
+    for item in packet.get("merchant_change_summary") or []:
+        if not isinstance(item, dict):
+            continue
+        merchants.extend(item.get("added") or [])
+        merchants.extend(item.get("changed") or [])
+        merchants.extend(item.get("removed") or [])
+    public_delta = {
+        "generated_at": delta.get("generated_at"),
+        "status": _advisor_public_text(packet.get("status"), max_chars=24),
+        "headline": headline,
+        "action": action,
+        "touched_months": months,
+        "changed_sections": sections,
+        "categories": _advisor_public_text_list(categories, max_items=8, max_chars=80),
+        "merchants": _advisor_public_text_list(merchants, max_items=8, max_chars=80),
+        "needs_full_rebuild": bool(packet.get("needs_full_rebuild")),
+    }
+    if not headline and not action and not months and not sections:
+        return None
+    return public_delta
+
+
+def _latest_public_advisor_delta(*, conn, profile: str | None, memo: dict | None) -> dict | None:
+    if not memo:
+        return None
+    try:
+        from mira.advisor_fact_snapshot import list_portrait_delta_packets
+
+        deltas = list_portrait_delta_packets(conn, profile=profile, limit=6)
+    except Exception as exc:
+        logger.debug("Failed to load advisor portrait delta: %s", exc)
+        return None
+    for delta in deltas:
+        public_delta = _public_advisor_delta_payload(delta, memo=memo)
+        if public_delta:
+            return public_delta
+    return None
+
+
+def _advisor_read_feedback_by_card(*, conn, profile: str | None, cards: list[dict]) -> dict[str, dict]:
+    try:
+        from mira.financial_feedback import feedback_effect_summary, financial_feedback_loop_enabled
+    except Exception:
+        return {}
+    if not financial_feedback_loop_enabled():
+        return {}
+    feedback: dict[str, dict] = {}
+    for card in cards or []:
+        if not isinstance(card, dict):
+            continue
+        card_id = str(card.get("id") or "").strip()
+        if not card_id:
+            continue
+        summary = feedback_effect_summary(conn=conn, profile=profile, target_type="advisor_card", target_id=card_id)
+        if summary.get("count"):
+            feedback[card_id] = summary
+    return feedback
+
+
+def _attach_public_advisor_feedback(public_memo: dict | None, *, conn, profile: str | None) -> dict | None:
+    if not isinstance(public_memo, dict):
+        return public_memo
+    cards = public_memo.get("cards") if isinstance(public_memo.get("cards"), list) else []
+    feedback_by_card = _advisor_read_feedback_by_card(conn=conn, profile=profile, cards=cards)
+    if not feedback_by_card:
+        return public_memo
+    for card in cards:
+        if not isinstance(card, dict):
+            continue
+        card_feedback = feedback_by_card.get(str(card.get("id") or ""))
+        if card_feedback:
+            card["feedback"] = {
+                "count": card_feedback.get("count") or 0,
+                "effects": card_feedback.get("effects") or {},
+                "feedback_types": card_feedback.get("feedback_types") or {},
+                "safe_summaries": card_feedback.get("safe_summaries") or [],
+            }
+    return public_memo
+
+
+def _public_advisor_read_payload(memo: dict, *, delta: dict | None = None, feedback_by_card: dict[str, dict] | None = None) -> dict:
+    from mira.advisor_lens_synthesis import build_advisor_ranked_actions, build_advisor_read_cards
+
+    quality = memo.get("quality") if isinstance(memo.get("quality"), dict) else {}
+    stored_payload = memo.get("payload") if isinstance(memo.get("payload"), dict) else {}
+    public_delta = (
+        delta
+        if isinstance(delta, dict) and "changed_sections" in delta and "delta_packet" not in delta
+        else _public_advisor_delta_payload(delta, memo=memo)
+    )
+    public_theses = []
+    for thesis in memo.get("theses") or []:
+        if not isinstance(thesis, dict):
+            continue
+        summary = _advisor_public_text(thesis.get("summary"), max_chars=360)
+        paragraph = _advisor_public_text(thesis.get("paragraph"), max_chars=520)
+        caveat = _advisor_public_text(thesis.get("caveat"), max_chars=260)
+        if not summary and not paragraph:
+            continue
+        public_theses.append(
+            {
+                "summary": summary,
+                "paragraph": paragraph,
+                "caveat": caveat,
+                "confidence": _advisor_public_text(thesis.get("confidence") or "medium", max_chars=32),
+            }
+        )
+    action_plan = []
+    raw_actions = stored_payload.get("action_plan") if isinstance(stored_payload.get("action_plan"), list) and stored_payload.get("action_plan") else None
+    if raw_actions is None:
+        raw_actions = memo.get("action_plan") if isinstance(memo.get("action_plan"), list) and memo.get("action_plan") else None
+    if raw_actions is None:
+        raw_actions = build_advisor_ranked_actions({"memo_markdown": memo.get("memo_markdown"), "theses": memo.get("theses") or []})
+    for action in raw_actions:
+        if not isinstance(action, dict):
+            continue
+        action_plan.append(
+            {
+                "rank": action.get("rank"),
+                "title": _advisor_public_text(action.get("title"), max_chars=140),
+                "why": _advisor_public_text(action.get("why"), max_chars=320),
+                "action": _advisor_public_text(action.get("action"), max_chars=320),
+                "tradeoff": _advisor_public_text(action.get("tradeoff"), max_chars=260),
+                "pain": _advisor_public_text(action.get("pain"), max_chars=32),
+            }
+        )
+    public_memo = {
+        "id": memo.get("id"),
+        "generated_at": memo.get("generated_at"),
+        "valid_until": memo.get("valid_until"),
+        "version": memo.get("version"),
+        "memo_markdown": _advisor_public_text(memo.get("memo_markdown"), max_chars=9000),
+        "theses": public_theses[:12],
+        "action_plan": action_plan[:6],
+        "delta": public_delta,
+        "quality": {
+            "ok": bool(quality.get("ok")),
+            "score": quality.get("score"),
+            "coverage_count": quality.get("coverage_count"),
+            "required_count": quality.get("required_count"),
+        },
+    }
+    stored_cards = stored_payload.get("cards") if isinstance(stored_payload.get("cards"), list) else None
+    if stored_cards is None:
+        stored_cards = memo.get("cards") if isinstance(memo.get("cards"), list) else None
+    public_memo["cards"] = build_advisor_read_cards({**public_memo, "cards": stored_cards or []}, delta=public_delta)
+    if feedback_by_card:
+        for card in public_memo["cards"]:
+            if not isinstance(card, dict):
+                continue
+            card_feedback = feedback_by_card.get(str(card.get("id") or ""))
+            if card_feedback:
+                card["feedback"] = {
+                    "count": card_feedback.get("count") or 0,
+                    "effects": card_feedback.get("effects") or {},
+                    "feedback_types": card_feedback.get("feedback_types") or {},
+                    "safe_summaries": card_feedback.get("safe_summaries") or [],
+                }
+    return public_memo
+
+
+_ADVISOR_FOLLOWUP_TYPES = {
+    "focus",
+    "levers",
+    "risk",
+    "changes",
+    "normal_month",
+    "money_map",
+    "event_noise",
+    "first_move",
+    "general",
+}
+_ADVISOR_FOLLOWUP_GENERIC_PHRASES = (
+    "that's a big",
+    "financial co-pilot",
+    "local-first companion",
+    "designed to help",
+    "generally, you should",
+    "daily fluctuations",
+    "spending habits",
+    "if you want me to dig",
+    "if you want to dig",
+    "just let me know what you're curious",
+    "what you're curious about",
+    "simple number",
+    "small tweaks could make a big difference",
+    "just data points",
+    "prioritization is a bit limited",
+    "no active financial-understanding facts",
+)
+_ADVISOR_FOLLOWUP_FORBIDDEN_PHRASES = (
+    "[object object]",
+    "dashboard snapshot",
+    "available for your review",
+    "safe_finance_query",
+    "run_sql",
+    "sql",
+    "query layer",
+    "validator",
+    "backend",
+    "evidence_id",
+    "evidence id",
+    "metric:",
+    "txn:",
+)
+_ADVISOR_FOLLOWUP_NUMERIC_RE = re.compile(r"(?<![A-Za-z])\$?\d[\d,]*(?:\.\d+)?%?(?![A-Za-z])")
+
+
+def _advisor_read_followup_kind(value: str | None) -> str:
+    kind = str(value or "general").strip().lower().replace("-", "_")
+    return kind if kind in _ADVISOR_FOLLOWUP_TYPES else "general"
+
+
+def _advisor_followup_number_tokens(text: str) -> set[str]:
+    tokens: set[str] = set()
+    for raw in _ADVISOR_FOLLOWUP_NUMERIC_RE.findall(str(text or "")):
+        normalized = raw.replace("$", "").replace(",", "").strip()
+        if normalized.endswith("%"):
+            normalized = normalized[:-1]
+        if normalized:
+            tokens.add(normalized)
+    return tokens
+
+
+def _advisor_read_public_number_text(public_memo: dict | None) -> str:
+    if not isinstance(public_memo, dict):
+        return ""
+    parts = [str(public_memo.get("memo_markdown") or "")]
+    for thesis in public_memo.get("theses") or []:
+        if not isinstance(thesis, dict):
+            continue
+        parts.extend(
+            [
+                str(thesis.get("summary") or ""),
+                str(thesis.get("paragraph") or ""),
+                str(thesis.get("caveat") or ""),
+            ]
+        )
+    for action in public_memo.get("action_plan") or []:
+        if not isinstance(action, dict):
+            continue
+        parts.extend(
+            [
+                str(action.get("title") or ""),
+                str(action.get("why") or ""),
+                str(action.get("action") or ""),
+                str(action.get("tradeoff") or ""),
+            ]
+        )
+    for card in public_memo.get("cards") or []:
+        if not isinstance(card, dict):
+            continue
+        parts.extend(
+            [
+                str(card.get("title") or ""),
+                str(card.get("summary") or ""),
+                str(card.get("detail") or ""),
+                str(card.get("tradeoff") or ""),
+            ]
+        )
+        for row in card.get("rows") or []:
+            if not isinstance(row, dict):
+                continue
+            parts.extend(
+                [
+                    str(row.get("label") or ""),
+                    str(row.get("value") or ""),
+                    str(row.get("detail") or ""),
+                ]
+            )
+    delta = public_memo.get("delta") if isinstance(public_memo.get("delta"), dict) else {}
+    if delta:
+        parts.extend(
+            [
+                str(delta.get("headline") or ""),
+                str(delta.get("action") or ""),
+                " ".join(str(item) for item in delta.get("touched_months") or []),
+                " ".join(str(item) for item in delta.get("changed_sections") or []),
+                " ".join(str(item) for item in delta.get("categories") or []),
+                " ".join(str(item) for item in delta.get("merchants") or []),
+            ]
+        )
+    return "\n".join(parts)
+
+
+def _advisor_question_asks_for_actions(question: str) -> bool:
+    lowered = " ".join(str(question or "").lower().split())
+    markers = (
+        "what should i fix",
+        "fix first",
+        "do first",
+        "next move",
+        "next step",
+        "action plan",
+        "rank",
+        "priority",
+        "prioritize",
+        "where should i start",
+    )
+    return any(marker in lowered for marker in markers)
+
+
+_ADVISOR_STRATEGIC_RISK_TERMS = (
+    "income continuity",
+    "income source",
+    "income stream",
+    "source label",
+    "source labels",
+    "forward income",
+    "fixed monthly floor",
+    "fixed floor",
+    "operating floor",
+    "floor burn",
+    "goal capacity",
+    "planning capacity",
+    "configured goals",
+    "explicit goals",
+    "goal targets",
+    "reconciled operating burn",
+)
+_ADVISOR_FIRST_ACTION_TERMS = (
+    "fee",
+    "fees",
+    "interest",
+    "leakage",
+    "amazon",
+    "geico",
+    "vendor",
+    "recurring",
+    "subscription",
+)
+
+
+def _advisor_has_strategic_risk_anchor(text: str) -> bool:
+    lowered = " ".join(str(text or "").lower().split())
+    return any(term in lowered for term in _ADVISOR_STRATEGIC_RISK_TERMS)
+
+
+def _advisor_followup_sentences(text: str) -> list[str]:
+    return [
+        sentence.strip()
+        for sentence in re.split(r"(?<=[.!?])\s+", str(text or "").strip())
+        if sentence.strip()
+    ]
+
+
+def _advisor_pick_sentences(text: str, terms: tuple[str, ...], *, limit: int = 2) -> list[str]:
+    picked: list[str] = []
+    seen: set[str] = set()
+    for sentence in _advisor_followup_sentences(text):
+        lowered = sentence.lower()
+        if not any(term in lowered for term in terms):
+            continue
+        normalized = " ".join(lowered.split())
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        picked.append(_advisor_public_text(sentence, max_chars=320))
+        if len(picked) >= limit:
+            break
+    return picked
+
+
+def _advisor_action_sentence(action: dict) -> str:
+    title = str(action.get("title") or "").strip()
+    why = str(action.get("why") or "").strip()
+    next_step = str(action.get("action") or "").strip()
+    parts = []
+    if title:
+        parts.append(title)
+    if why:
+        parts.append(why)
+    if next_step:
+        parts.append(f"Next: {next_step}")
+    return _advisor_public_text(". ".join(parts), max_chars=520)
+
+
+def _advisor_normalize_strategic_risk_text(text: str) -> str:
+    cleaned = _advisor_public_text(text, max_chars=760)
+    if not cleaned:
+        return cleaned
+    lowered = cleaned.lower()
+    if "fixed monthly floor" in lowered:
+        return cleaned
+    if "fixed floor" in lowered:
+        return re.sub(r"\bfixed floor\b", "fixed monthly floor", cleaned, flags=re.IGNORECASE)
+    if "income continuity" in lowered and "floor" not in lowered:
+        return cleaned.rstrip(".") + " against the fixed monthly floor."
+    return cleaned
+
+
+def _advisor_read_followup_spine(public_memo: dict) -> dict[str, str]:
+    actions = [item for item in public_memo.get("action_plan") or [] if isinstance(item, dict)]
+    full_text = _advisor_read_public_number_text(public_memo)
+    first_action = _advisor_action_sentence(actions[0]) if actions else ""
+    lever_lines = []
+    for action in actions:
+        line = _advisor_action_sentence(action)
+        if not line:
+            continue
+        lowered = line.lower()
+        if any(term in lowered for term in _ADVISOR_FIRST_ACTION_TERMS):
+            lever_lines.append(line)
+        if len(lever_lines) >= 3:
+            break
+    risk_lines: list[str] = []
+    for terms in (
+        (
+            "income continuity",
+            "income source",
+            "income stream",
+            "source label",
+            "source labels",
+            "forward income",
+        ),
+        (
+            "fixed monthly floor",
+            "fixed floor",
+            "operating floor",
+            "floor burn",
+        ),
+        (
+            "goal capacity",
+            "planning capacity",
+            "configured goals",
+            "explicit goals",
+            "goal targets",
+            "reconciled operating burn",
+        ),
+    ):
+        for sentence in _advisor_pick_sentences(full_text, terms, limit=1):
+            if sentence not in risk_lines:
+                risk_lines.append(sentence)
+        if len(risk_lines) >= 3:
+            break
+    overreact_lines = _advisor_pick_sentences(
+        full_text,
+        (
+            "do not overreact",
+            "not overreact",
+            "do not treat",
+            "not the concern",
+            "not the main",
+            "broad lifestyle verdict",
+            "travel/event",
+            "travel month",
+        ),
+        limit=2,
+    )
+    return {
+        "first_action": first_action or "Use the ranked action plan in order.",
+        "low_pain_levers": " ".join(lever_lines) or first_action or "Inspect low-pain operational levers before broad category cuts.",
+        "strategic_risk": _advisor_normalize_strategic_risk_text(" ".join(risk_lines))
+        or "Income continuity against the fixed monthly floor is the strategic risk to verify before relying on the plan.",
+        "do_not_overreact": " ".join(overreact_lines)
+        or "Do not turn one noisy month or first-action cleanup into a broad lifestyle verdict.",
+    }
+
+
+def _advisor_read_followup_prompt(
+    *,
+    public_memo: dict,
+    question: str,
+    followup_type: str,
+    history: list[dict] | None = None,
+) -> str:
+    theses = public_memo.get("theses") if isinstance(public_memo.get("theses"), list) else []
+    action_plan = public_memo.get("action_plan") if isinstance(public_memo.get("action_plan"), list) else []
+    spine = _advisor_read_followup_spine(public_memo)
+    action_lines = []
+    for action in action_plan[:6]:
+        if not isinstance(action, dict):
+            continue
+        title = str(action.get("title") or "").strip()
+        why = str(action.get("why") or "").strip()
+        next_step = str(action.get("action") or "").strip()
+        tradeoff = str(action.get("tradeoff") or "").strip()
+        if not title or not next_step:
+            continue
+        line = f"{action.get('rank')}. {title}: {next_step}"
+        if why:
+            line += f" Why: {why}"
+        if tradeoff:
+            line += f" Tradeoff: {tradeoff}"
+        action_lines.append(line[:800])
+    thesis_lines = []
+    for idx, thesis in enumerate(theses[:8], start=1):
+        if not isinstance(thesis, dict):
+            continue
+        summary = str(thesis.get("summary") or "").strip()
+        paragraph = str(thesis.get("paragraph") or "").strip()
+        caveat = str(thesis.get("caveat") or "").strip()
+        if not summary and not paragraph:
+            continue
+        line = f"{idx}. {summary or paragraph}"
+        if paragraph and paragraph != summary:
+            line += f" {paragraph}"
+        if caveat:
+            line += f" Caveat: {caveat}"
+        thesis_lines.append(line[:700])
+    delta = public_memo.get("delta") if isinstance(public_memo.get("delta"), dict) else {}
+    delta_lines: list[str] = []
+    if delta:
+        headline = str(delta.get("headline") or "").strip()
+        action = str(delta.get("action") or "").strip()
+        touched_months = ", ".join(str(item) for item in (delta.get("touched_months") or []) if str(item).strip())
+        sections = ", ".join(str(item) for item in (delta.get("changed_sections") or []) if str(item).strip())
+        categories = ", ".join(str(item) for item in (delta.get("categories") or []) if str(item).strip())
+        merchants = ", ".join(str(item) for item in (delta.get("merchants") or []) if str(item).strip())
+        if headline:
+            delta_lines.append(f"Headline: {headline}")
+        if action:
+            delta_lines.append(f"Action: {action}")
+        if touched_months:
+            delta_lines.append(f"Touched months: {touched_months}")
+        if sections:
+            delta_lines.append(f"Changed read sections: {sections}")
+        if categories:
+            delta_lines.append(f"Changed categories: {categories}")
+        if merchants:
+            delta_lines.append(f"Changed merchants: {merchants}")
+    card_lines: list[str] = []
+    for card in (public_memo.get("cards") or [])[:6]:
+        if not isinstance(card, dict):
+            continue
+        title = str(card.get("title") or "").strip()
+        summary = str(card.get("summary") or "").strip()
+        detail = str(card.get("detail") or "").strip()
+        rows = []
+        for row in (card.get("rows") or [])[:4]:
+            if not isinstance(row, dict):
+                continue
+            label = str(row.get("label") or "").strip()
+            value = str(row.get("value") or "").strip()
+            row_detail = str(row.get("detail") or "").strip()
+            if label:
+                rows.append(f"{label}: {value}{f' ({row_detail})' if row_detail else ''}")
+        line = f"{title}: {summary}"
+        if detail:
+            line += f" {detail}"
+        if rows:
+            line += " Rows: " + "; ".join(rows)
+        card_lines.append(line[:900])
+    memo_excerpt = str(public_memo.get("memo_markdown") or "").strip()[:5000]
+    recent_lines: list[str] = []
+    for turn in (history or [])[-6:]:
+        if not isinstance(turn, dict):
+            continue
+        role = "User" if str(turn.get("role") or "").lower() == "user" else "Mira"
+        content = _advisor_public_text(turn.get("content"), max_chars=700)
+        if content:
+            recent_lines.append(f"{role}: {content}")
+    return f"""
+You are Mira, answering a follow-up about a validated stored financial portrait.
+Use only the stored read below. Do not run tools, do not invent new facts, and do not give generic finance advice.
+
+User question:
+{question}
+
+Follow-up type:
+{followup_type}
+
+Recent advisor-read conversation:
+{chr(10).join(recent_lines) if recent_lines else "(none)"}
+
+Required behavior:
+- Answer directly from the stored read in 2-4 short plain-text paragraphs.
+- Name the concrete thesis, the reason it matters, what not to overreact to, and the practical next move.
+- If the type is focus, start with the real focus from the read and include what not to overreact to.
+- If the type is levers, name the low-pain levers from the read before broad category cuts.
+- If the type is risk, lead with the largest strategic risk from the read, not the first low-pain action unless those are the same thing. You may mention the first action after you distinguish it from the strategic risk.
+- If the type is changes, answer from the stored delta first; explain what changed, what sections it affects, and whether the core read still stands.
+- If the type is normal_month, explain the monthly baseline table from the stored read: income, normal spend, fixed floor, flexible spend, recurring commitments, and capacity.
+- If the type is money_map, explain where the money is going using the stored money-map card and distinguish normal pattern from event noise.
+- If the type is event_noise, explain what to keep out of the verdict and why it should not become the lifestyle baseline.
+- If the type is first_move, answer from the first ranked action and say why it comes before broader cuts.
+- If the user asks what to fix first, use the ranked action plan in order.
+- Do not use Markdown bullets, numbered lists, headings, bold text, or asterisks.
+- Never mention SQL, tools, evidence IDs, validators, backend internals, or dashboard snapshots.
+- Never say you cannot answer when the stored read contains the answer.
+- Avoid generic openers like "That's a big question" or "Generally".
+
+Advisor distinction spine:
+First low-pain action: {spine["first_action"]}
+Largest strategic risk: {spine["strategic_risk"]}
+Low-pain levers: {spine["low_pain_levers"]}
+What not to overreact to: {spine["do_not_overreact"]}
+
+Ranked action plan:
+{chr(10).join(action_lines) if action_lines else "(none)"}
+
+Stored delta since the read:
+{chr(10).join(delta_lines) if delta_lines else "(none)"}
+
+Advisor read cards:
+{chr(10).join(card_lines) if card_lines else "(none)"}
+
+Validated thesis summaries:
+{chr(10).join(thesis_lines) if thesis_lines else "(none)"}
+
+Stored read excerpt:
+{memo_excerpt}
+""".strip()
+
+
+def _advisor_read_followup_reject_reasons(
+    answer: str,
+    followup_type: str,
+    public_memo: dict | None = None,
+    question: str | None = None,
+) -> list[str]:
+    text = " ".join(str(answer or "").split())
+    lowered = text.lower()
+    reasons: list[str] = []
+    if len(text) < 60:
+        reasons.append("too_short")
+    for phrase in _ADVISOR_FOLLOWUP_GENERIC_PHRASES:
+        if phrase in lowered:
+            reasons.append(f"generic:{phrase}")
+    for phrase in _ADVISOR_FOLLOWUP_FORBIDDEN_PHRASES:
+        if phrase in lowered:
+            reasons.append(f"forbidden:{phrase}")
+    if "**" in text or re.search(r"(?m)^\s*(?:[-*•]|\d+[.)])\s+", str(answer or "")):
+        reasons.append("markdown_formatting")
+    if public_memo is not None:
+        supported_numbers = _advisor_followup_number_tokens(_advisor_read_public_number_text(public_memo))
+        unsupported_numbers = _advisor_followup_number_tokens(text) - supported_numbers
+        if unsupported_numbers:
+            reasons.append("unsupported_numeric_claim")
+    if re.search(r"\bdays_\d+_\d+\b", lowered):
+        reasons.append("raw_bucket")
+    kind = _advisor_read_followup_kind(followup_type)
+    if kind == "focus" and not ("cash" in lowered and ("income" in lowered or "fixed" in lowered or "floor" in lowered)):
+        reasons.append("missing_focus_thesis")
+    if kind == "levers" and not any(term in lowered for term in ("fee", "amazon", "geico", "vendor", "recurring", "subscription", "soft ceiling", "rhythm", "private")):
+        reasons.append("missing_lever_thesis")
+    if kind == "event_noise" and not (
+        ("travel" in lowered or "event" in lowered or "trip" in lowered)
+        and ("baseline" in lowered or "overreact" in lowered or "verdict" in lowered)
+    ):
+        reasons.append("missing_event_noise_thesis")
+    if kind == "risk":
+        if not _advisor_has_strategic_risk_anchor(lowered):
+            reasons.append("missing_risk_thesis")
+        first_clause = lowered[:260]
+        if any(term in first_clause for term in _ADVISOR_FIRST_ACTION_TERMS) and not _advisor_has_strategic_risk_anchor(first_clause):
+            reasons.append("risk_confuses_first_action")
+    if kind == "changes":
+        has_delta = bool(public_memo and isinstance(public_memo.get("delta"), dict) and public_memo.get("delta"))
+        if has_delta and not any(term in lowered for term in ("changed", "update", "current month", "since the read", "still stand")):
+            reasons.append("missing_delta_change")
+    if _advisor_question_asks_for_actions(question or ""):
+        has_action_language = (
+            ("first" in lowered or "start" in lowered or "priority" in lowered)
+            and any(term in lowered for term in ("fee", "leakage", "income", "geico", "amazon", "capacity", "goal"))
+        )
+        if not has_action_language:
+            reasons.append("missing_ranked_action")
+    return sorted(set(reasons))
+
+
+def _advisor_read_followup_fallback(public_memo: dict, followup_type: str) -> str:
+    kind = _advisor_read_followup_kind(followup_type)
+    theses = [item for item in public_memo.get("theses") or [] if isinstance(item, dict)]
+    actions = [item for item in public_memo.get("action_plan") or [] if isinstance(item, dict)]
+    cards = {str(item.get("id") or ""): item for item in public_memo.get("cards") or [] if isinstance(item, dict)}
+    spine = _advisor_read_followup_spine(public_memo)
+    caveats = [str(item.get("caveat") or "").strip() for item in theses if str(item.get("caveat") or "").strip()]
+    caveat = caveats[0] if caveats else "That priority can change if sync, goals, budgets, or income labeling are incomplete."
+    ranked = []
+    for action in actions[:3]:
+        title = str(action.get("title") or "").strip()
+        why = str(action.get("why") or "").strip()
+        next_step = str(action.get("action") or "").strip()
+        tradeoff = str(action.get("tradeoff") or "").strip()
+        if title and next_step:
+            ranked.append((title, why, next_step, tradeoff))
+    if kind == "normal_month":
+        card = cards.get("normal_month") or {}
+        rows = []
+        for row in (card.get("rows") or [])[:6]:
+            label = str(row.get("label") or "").strip()
+            value = str(row.get("value") or "").strip()
+            detail = str(row.get("detail") or "").strip()
+            if label and value:
+                rows.append(f"{label} is {value}{f'; {detail}' if detail else ''}")
+        if rows:
+            return (
+                "The normal-month read is the planning baseline, not a raw spending recap. "
+                + ". ".join(rows[:4])
+                + ".\n\n"
+                "The useful point is sequence: cover the fixed floor first, then judge flexible spend, recurring commitments, and goal capacity. Do not pull trip or event noise into the lifestyle baseline unless it repeats.\n\n"
+                f"Next move: verify the fixed commitments and goal targets before treating the remaining capacity as spendable. Caveat: {caveat}"
+            )
+    if kind == "money_map":
+        card = cards.get("money_map") or {}
+        rows = []
+        for row in (card.get("rows") or [])[:5]:
+            label = str(row.get("label") or "").strip()
+            value = str(row.get("value") or "").strip()
+            detail = str(row.get("detail") or "").strip()
+            if label:
+                rows.append(f"{label}{f' averages {value}' if value else ''}{f'; driven by {detail}' if detail else ''}")
+        if rows:
+            return (
+                "The money-map read is about controllability, not just category size. "
+                + ". ".join(rows[:4])
+                + ".\n\n"
+                "Start with reviewable leakage, recurring/vendor items, and small-purchase cleanup before broad cuts. Do not treat travel or one-off event clusters as normal lifestyle drift unless the pattern repeats.\n\n"
+                f"Next move: pick one low-pain review item first, then revisit flexible categories after that cleanup. Caveat: {caveat}"
+            )
+    if kind == "event_noise":
+        card = cards.get("event_noise") or {}
+        rows = []
+        for row in (card.get("rows") or [])[:3]:
+            label = str(row.get("label") or "").strip()
+            value = str(row.get("value") or "").strip()
+            detail = str(row.get("detail") or "").strip().rstrip(".")
+            if label:
+                rows.append(f"{label}{f' was {value}' if value else ''}{f'; {detail}' if detail else ''}")
+        if rows:
+            return (
+                "The thing not to overreact to is event noise: "
+                + ". ".join(rows)
+                + ".\n\n"
+                "That belongs outside the normal lifestyle baseline until it repeats. The point is not to ignore it; it is to avoid using a trip or one-off event as proof your everyday operating floor changed.\n\n"
+                f"Next move: keep those clusters excluded when judging normal spend, then inspect the recurring and lower-pain levers separately. Caveat: {caveat}"
+            )
+    if kind == "first_move":
+        if ranked:
+            first = ranked[0]
+            answer = f"First move: {first[0]}. {first[2]} The reason it comes first is: {first[1]}"
+            if first[3]:
+                answer += f"\n\nDo not overreact here: {first[3]}"
+            if len(ranked) > 1:
+                answer += f"\n\nAfter that, move to {ranked[1][0].lower()}; that is the next dependency once the first cleanup is handled."
+            return answer
+    if ranked and kind == "general":
+        first = ranked[0]
+        second = ranked[1] if len(ranked) > 1 else None
+        answer = f"First: {first[0]}. {first[2]} The reason is: {first[1]}"
+        if second:
+            answer += f"\n\nSecond: {second[0]}. {second[2]}"
+        if first[3]:
+            answer += f"\n\nDo not overreact here: {first[3]}"
+            return answer
+    delta = public_memo.get("delta") if isinstance(public_memo.get("delta"), dict) else {}
+    if kind == "changes":
+        if delta:
+            headline = str(delta.get("headline") or "The stored facts changed since this read.").strip()
+            action = str(delta.get("action") or "Use the changed facts to update the affected sections before making a new decision.").strip()
+            months = ", ".join(str(item) for item in delta.get("touched_months") or [] if str(item).strip())
+            sections = ", ".join(str(item) for item in delta.get("changed_sections") or [] if str(item).strip())
+            subjects = ", ".join(
+                str(item)
+                for item in (delta.get("categories") or []) + (delta.get("merchants") or [])
+                if str(item).strip()
+            )
+            answer = f"{headline} The core read can still stand, but this update should be checked before acting on the current month."
+            if months or sections:
+                answer += f"\n\nIt touches {months or 'the latest period'} and affects {sections or 'the current read sections'}."
+            if subjects:
+                answer += f"\n\nThe visible changed subjects are {subjects}. {action}"
+            else:
+                answer += f"\n\n{action}"
+            return answer
+        return (
+            "I do not have a stored change packet after this read, so I would treat the stored portrait as the latest validated read for now.\n\n"
+            "If you want a fresh rebuild, use Fresh read; otherwise I can answer from the current stored portrait without pretending it has new facts."
+        )
+    if kind == "levers":
+        card = cards.get("soft_levers") or {}
+        rows = []
+        for row in (card.get("rows") or [])[:5]:
+            label = str(row.get("label") or "").strip()
+            value = str(row.get("value") or "").strip()
+            detail = str(row.get("detail") or "").strip().rstrip(".")
+            if label:
+                rows.append(f"{label}{f' at {value}' if value else ''}{f': {detail}' if detail else ''}")
+        if rows:
+            return (
+                "The lower-pain levers from the read are: "
+                + ". ".join(rows[:4])
+                + ".\n\n"
+                "These come before broad cuts because they are timing, vendor, recurring, or rhythm cleanups rather than a demand to shrink everything you enjoy.\n\n"
+                f"Next move: fix or verify the first review item, then decide whether any flexible category still needs a real trim. Caveat: {caveat}"
+            )
+        if ranked:
+            first = ranked[0]
+            extra = ranked[1] if len(ranked) > 1 else None
+            answer = f"Start with {first[0].lower()}: {first[2]} The reason is: {first[1]}"
+            if extra:
+                answer += f"\n\nThen look at {extra[0].lower()}: {extra[2]}"
+            answer += "\n\nDo not turn this into broad cuts before the low-pain cleanup is done."
+            return answer
+        return (
+            "Start with the tune-ups before broad cuts: fees, Amazon-style small purchases, recurring charges, and vendor reviews are the lower-pain places to inspect first.\n\n"
+            "Do not overcorrect from one noisy month or a private rhythm that is already improving; the read treats those as tuning signals, not a character verdict.\n\n"
+            f"Next move: check the repeat charges and vendor pricing first, then only trim broader categories if the pattern survives that cleanup. Caveat: {caveat}"
+        )
+    if kind == "risk":
+        first_action = spine.get("first_action") or "the first ranked action"
+        strategic_risk = spine.get("strategic_risk") or "income continuity against the fixed monthly floor"
+        do_not_overreact = spine.get("do_not_overreact") or "Do not turn a noisy month into a broad lifestyle verdict."
+        return (
+            f"The biggest strategic risk in the read: {strategic_risk}\n\n"
+            f"That is different from the first low-pain action: {first_action} Use that cleanup first, but do not mistake it for the whole risk picture.\n\n"
+            f"Do not overreact here: {do_not_overreact}\n\n"
+            f"Next move: verify income-source labels, fixed obligations, and goal targets before making bigger tradeoffs. Caveat: {caveat}"
+        )
+    if kind == "focus":
+        return (
+            "Cash is not the concern; the useful focus is whether income continuity comfortably supports the fixed monthly floor once one-offs and travel/event spend are separated from the baseline.\n\n"
+            "Do not overreact to a noisy month before isolating what was temporary. The sharper move is to protect the parts already improving and inspect fees, recurring charges, and vendor pricing first.\n\n"
+            f"Next move: verify income source labels and the operating floor, then decide what actually needs tuning. Caveat: {caveat}"
+        )
+    summaries = [str(item.get("summary") or "").strip() for item in theses if str(item.get("summary") or "").strip()]
+    if summaries:
+        return "From the stored read, the main point is: " + " ".join(summaries[:3])
+    return "Mira has a stored financial read, but it does not contain enough validated detail to answer this follow-up cleanly."
+
+
+def _compose_advisor_read_followup(
+    *,
+    memo: dict,
+    question: str,
+    followup_type: str,
+    history: list[dict] | None = None,
+    delta: dict | None = None,
+    complete_fn=None,
+) -> dict:
+    import llm_client
+
+    kind = _advisor_read_followup_kind(followup_type)
+    public_memo = _public_advisor_read_payload(memo, delta=delta)
+    prompt = _advisor_read_followup_prompt(
+        public_memo=public_memo,
+        question=question,
+        followup_type=kind,
+        history=history,
+    )
+    raw = ""
+    error = None
+    try:
+        fn = complete_fn or llm_client.complete
+        raw = str(fn(prompt, max_tokens=420, purpose="copilot") or "").strip()
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+    reject_reasons = _advisor_read_followup_reject_reasons(raw, kind, public_memo=public_memo, question=question)
+    used_fallback = bool(error or reject_reasons)
+    answer = _advisor_read_followup_fallback(public_memo, kind) if used_fallback else raw
+    final_reject_reasons = _advisor_read_followup_reject_reasons(answer, kind, public_memo=public_memo, question=question)
+    return {
+        "answer": answer,
+        "followup_type": kind,
+        "used_fallback": used_fallback,
+        "reject_reasons": reject_reasons,
+        "final_reject_reasons": final_reject_reasons,
+        "llm_error": error,
+        "memo_id": public_memo.get("id"),
+        "memo_generated_at": public_memo.get("generated_at"),
+        "delta": public_memo.get("delta"),
+    }
+
+
+def _advisor_read_generation_enabled() -> bool:
+    try:
+        from mira.advisor_lens_synthesis import advisor_lens_store_enabled, advisor_lens_synthesis_enabled
+
+        return advisor_lens_synthesis_enabled() and advisor_lens_store_enabled()
+    except Exception as exc:
+        logger.debug("Failed to load advisor read generation flags: %s", exc)
+        return False
 
 
 # ── Models ──
@@ -403,6 +1463,45 @@ class CopilotRequest(BaseModel):
     history: list[dict] | None = None
 
 
+class AdvisorReadFollowupRequest(BaseModel):
+    question: str
+    followup_type: str = "general"
+    history: list[dict] | None = None
+
+
+class MiraFinancialFeedbackRequest(BaseModel):
+    feedback_type: str
+    target_type: str = "advisor_read"
+    target_id: str = ""
+    fact_id: StrictInt | None = None
+    insight_id: StrictInt | None = None
+    subject_type: str = "profile"
+    subject_key: str = ""
+    correction_text: str = ""
+    normalized_effect: str = ""
+    safe_summary: str = ""
+    sensitivity: str = ""
+    source: str = "chat"
+    expires_at: str = ""
+    metadata: dict | None = None
+
+
+class MiraStatedIntentCreateRequest(BaseModel):
+    subject_type: str
+    subject_key: str
+    intent_kind: str = "monitor"
+    target_text: str
+    subject_label: str = ""
+    baseline_scope: str = ""
+    feedback_state: str = "neutral"
+
+
+class MiraStatedIntentUpdateRequest(BaseModel):
+    target_text: str | None = None
+    status: str | None = None
+    feedback_state: str | None = None
+
+
 class SaveInsightRequest(BaseModel):
     question: str
     answer: str
@@ -413,6 +1512,7 @@ class SaveInsightRequest(BaseModel):
 class MonthExplanationRequest(BaseModel):
     month: str
     use_llm: bool = True
+    save: bool = True
 
 
 class MemoryEntryCreate(BaseModel):
@@ -440,6 +1540,21 @@ class MiraMemoryUpdate(BaseModel):
     confidence: float | None = None
     pinned: bool | None = None
     expires_at: str | None = None
+    status: str | None = None
+
+
+class MiraMemoryCreate(BaseModel):
+    text: str
+    memory_type: str | None = None
+    topic: str | None = None
+    source_summary: str = ""
+    source_turn_id: str | None = None
+    pinned: bool = False
+    expires_at: str | None = None
+
+
+class MiraSessionSummaryUpdate(BaseModel):
+    summary_text: str | None = None
     status: str | None = None
 
 
@@ -581,9 +1696,24 @@ def post_local_llm_install(body: LocalLlmInstallRequest, db=Depends(get_db_sessi
     }
 
 
+class AccountPaymentDetailsPayload(BaseModel):
+    usual_due_day: StrictInt | None = None
+
+
 @app.get("/api/accounts")
 def accounts(profile: str | None = Depends(validate_profile), db=Depends(get_db_session)):
     return get_accounts_filtered(profile=profile, conn=db)
+
+
+@app.patch("/api/accounts/{account_id}/payment-details")
+def update_account_payment_details_endpoint(account_id: str, body: AccountPaymentDetailsPayload, profile: str | None = Depends(validate_profile), db=Depends(get_db_session)):
+    try:
+        account = update_account_payment_details(account_id, body.model_dump(), profile=profile, conn=db)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found.")
+    return {"status": "updated", "account": account}
 
 
 @app.get("/api/transactions")
@@ -806,7 +1936,7 @@ def discard_receipt(receipt_id: int, profile: str | None = Depends(validate_prof
 
 
 @app.patch("/api/transactions/{tx_id}/category")
-def update_category(tx_id: str, body: CategoryUpdate):
+def update_category(tx_id: str, body: CategoryUpdate, db=Depends(get_db_session)):
     active_cats = get_active_categories()
     # Allow new categories — they'll be auto-created
     # Only reject empty strings
@@ -819,6 +1949,11 @@ def update_category(tx_id: str, body: CategoryUpdate):
     if not result:
         raise HTTPException(status_code=404, detail="Transaction not found")
     _invalidate_copilot_cache()
+    _mark_mira_money_outlook_stale_after_write(
+        conn=db,
+        tx_id=tx_id,
+        reason="transaction_category_changed",
+    )
 
     response = {"status": "updated", "tx_id": tx_id, "category": body.category}
 
@@ -840,6 +1975,11 @@ def update_transaction_exclusion(tx_id: str, body: TransactionExcludeUpdate, db=
     if not result:
         raise HTTPException(status_code=404, detail="Transaction not found")
     _invalidate_copilot_cache()
+    _mark_mira_money_outlook_stale_after_write(
+        conn=db,
+        tx_id=tx_id,
+        reason="transaction_exclusion_changed",
+    )
     return {"status": "updated", "transaction": result}
 
 
@@ -883,6 +2023,11 @@ def delete_category(category_name: str, body: CategoryDeactivateBody | None = No
     if not result:
         raise HTTPException(status_code=404, detail="Category not found.")
     _invalidate_copilot_cache()
+    _mark_mira_money_outlook_stale_after_write(
+        conn=db,
+        all_profiles=True,
+        reason="category_deleted",
+    )
     return {"status": "deleted", **result}
 
 
@@ -919,6 +2064,11 @@ def update_expense_type(category_name: str, body: ExpenseTypeUpdate, db=Depends(
         (body.expense_type, category_name),
     )
     _invalidate_copilot_cache()
+    _mark_mira_money_outlook_stale_after_write(
+        conn=db,
+        all_profiles=True,
+        reason="category_expense_type_changed",
+    )
     return {
         "status": "updated",
         "category": category_name,
@@ -974,6 +2124,11 @@ def update_category_rule_endpoint(rule_id: int, body: CategoryRuleUpdate, db=Dep
         raise HTTPException(status_code=404, detail="Rule not found.")
 
     _invalidate_copilot_cache()
+    _mark_mira_money_outlook_stale_after_write(
+        conn=db,
+        all_profiles=True,
+        reason="category_rule_changed",
+    )
     return {"status": "updated", "rule": result}
 
 
@@ -1118,6 +2273,11 @@ def confirm_subscription(body: SubscriptionConfirm, profile: str | None = Query(
             },
         )
 
+    _mark_mira_money_outlook_stale_after_write(
+        conn=db,
+        profile=created_by,
+        reason="recurring_subscription_confirmed",
+    )
     return {"status": "confirmed", "merchant": body.merchant, "pattern": pattern}
 
 
@@ -1171,6 +2331,11 @@ def dismiss_subscription(body: SubscriptionDismiss, profile: str | None = Query(
         payload={"pattern": pattern},
     )
 
+    _mark_mira_money_outlook_stale_after_write(
+        conn=db,
+        profile=created_by,
+        reason="recurring_subscription_dismissed",
+    )
     return {"status": "dismissed", "merchant": body.merchant, "pattern": pattern}
 
 
@@ -1217,6 +2382,11 @@ def declare_subscription_endpoint(body: SubscriptionDeclare, db=Depends(get_db_s
         profile=profile,
         category=body.category or "Subscriptions",
         expected_day=body.expected_day,
+    )
+    _mark_mira_money_outlook_stale_after_write(
+        conn=db,
+        profile=profile,
+        reason="recurring_subscription_declared",
     )
     return {"status": "ok", "message": "Subscription declared", "subscription": result}
 
@@ -1270,6 +2440,11 @@ def dismiss_subscription_amount_review(body: SubscriptionAmountReviewDismiss, db
             "latest_date": body.latest_date.strip(),
         },
     )
+    _mark_mira_money_outlook_stale_after_write(
+        conn=db,
+        profile=profile_id,
+        reason="recurring_amount_review_dismissed",
+    )
     return {"status": "dismissed", "merchant": merchant, "suggested_amount": body.suggested_amount}
 
 
@@ -1285,6 +2460,11 @@ def cancel_subscription_endpoint(merchant: str, profile: str | None = Query(None
         raise HTTPException(status_code=400, detail="Merchant name required.")
 
     result = cancel_subscription(merchant=merchant.strip(), profile=profile)
+    _mark_mira_money_outlook_stale_after_write(
+        conn=db,
+        profile=profile,
+        reason="recurring_subscription_cancelled",
+    )
     return result
 
 
@@ -1318,6 +2498,11 @@ def restore_subscription_endpoint(merchant: str, profile: str | None = Query(Non
     success = restore_subscription(merchant=decoded_merchant, profile=profile)
     if not success:
         raise HTTPException(status_code=404, detail="Merchant not found in dismissed list.")
+    _mark_mira_money_outlook_stale_after_write(
+        conn=db,
+        profile=profile_id,
+        reason="recurring_subscription_restored",
+    )
     return {"status": "ok", "message": "Subscription restored"}
 
 
@@ -1366,6 +2551,13 @@ def redetect_subscriptions(profile: str | None = Depends(validate_profile)):
                 "items_detected": 0,
                 "events_generated": 0,
             }
+        with get_db() as conn:
+            _mark_mira_money_outlook_stale_after_write(
+                conn=conn,
+                profile=profile,
+                all_profiles=profile is None,
+                reason="recurring_redetected",
+            )
         return {
             "status": "ok",
             "items_detected": len(result.get("items", [])),
@@ -1376,7 +2568,7 @@ def redetect_subscriptions(profile: str | None = Depends(validate_profile)):
 
 
 @app.post("/api/sync")
-def sync(profile: str | None = Query(None)):
+def sync(background_tasks: BackgroundTasks, profile: str | None = Query(None)):
     _require_live_mode("Manual sync is disabled in demo mode.")
     # Currently syncs all profiles. Profile param reserved for future selective sync.
     job_id = start_sync("manual-sync", phase="starting", detail="Starting manual sync")
@@ -1384,11 +2576,25 @@ def sync(profile: str | None = Query(None)):
         data = fetch_fresh_data(sync_job_id=job_id)
         finish_sync(job_id, status="completed")
         _invalidate_copilot_cache()
+        background_refresh = _maybe_queue_mira_background_refresh(
+            background_tasks=background_tasks,
+            profile=None,
+            reason="manual_sync_completed",
+        )
+        with get_db() as conn:
+            money_outlook_refresh = _maybe_queue_mira_money_outlook_refresh(
+                background_tasks=background_tasks,
+                conn=conn,
+                profile=None,
+                reason="manual_sync_completed",
+            )
         return {
             "status": "synced",
             "accounts": len(data["accounts"]),
             "transactions": len(data["transactions"]),
             "last_updated": data["last_updated"],
+            "background_analyst_refresh": background_refresh,
+            "money_outlook_refresh": money_outlook_refresh,
         }
     except Exception as exc:
         finish_sync(job_id, status="failed", error=str(exc))
@@ -1421,7 +2627,7 @@ def explain_month(
     db=Depends(get_db_session),
 ):
     try:
-        return create_month_explanation(body.month, profile=profile, use_llm=body.use_llm, conn=db)
+        return create_month_explanation(body.month, profile=profile, use_llm=body.use_llm, save=body.save, conn=db)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -1497,6 +2703,17 @@ async def copilot_ask_stream(body: CopilotRequest, profile: str | None = Query(N
                     )
                     log_copilot_conversation(**record)
                     prune_copilot_conversations(profile=validated_profile)
+                    try:
+                        from mira import memory_v2
+
+                        memory_v2.schedule_session_summary_after_idle(
+                            profile=validated_profile,
+                            history=body.history,
+                            latest_question=body.question,
+                            latest_answer=final_event.get("answer") or "",
+                        )
+                    except Exception:
+                        logger.exception("Failed to schedule Mira session summary")
                 except Exception:
                     logger.exception("Failed to persist Copilot conversation history")
         except Exception as e:
@@ -1844,6 +3061,35 @@ def mira_memory_list(
     }
 
 
+@app.post("/api/mira/memories")
+def mira_memory_create(
+    body: MiraMemoryCreate,
+    profile: str | None = Depends(validate_profile),
+    db=Depends(get_db_session),
+):
+    from mira import memory_v2
+
+    try:
+        result = memory_v2.remember_user_context(
+            conn=db,
+            profile=profile,
+            text=body.text,
+            memory_type=body.memory_type,
+            topic=body.topic,
+            source_summary=body.source_summary,
+            source_turn_id=body.source_turn_id,
+            pinned=body.pinned,
+            expires_at=body.expires_at,
+            consent="explicit",
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if result.get("saved"):
+        db.commit()
+        _invalidate_copilot_cache()
+    return result
+
+
 @app.patch("/api/mira/memories/{memory_id}")
 def mira_memory_update(
     memory_id: int,
@@ -1890,6 +3136,362 @@ def mira_memory_delete(
     db.commit()
     _invalidate_copilot_cache()
     return {"deleted": True, "id": memory_id}
+
+
+@app.get("/api/mira/stated-intents")
+def mira_stated_intents_endpoint(
+    subject_type: str | None = Query(None),
+    subject_key: str | None = Query(None),
+    include_inactive: bool = Query(False),
+    profile: str | None = Depends(validate_profile),
+    db=Depends(get_db_session),
+):
+    from mira.stated_intents import list_stated_intents, stated_intent_memory_enabled
+
+    if not stated_intent_memory_enabled():
+        return {
+            "enabled": False,
+            "status": "disabled",
+            "items": [],
+            "summary": {"count": 0},
+        }
+    items = list_stated_intents(
+        conn=db,
+        profile=profile,
+        subject_type=subject_type,
+        subject_key=subject_key,
+        include_inactive=include_inactive,
+        limit=100,
+    )
+    return {
+        "enabled": True,
+        "status": "ok",
+        "items": items,
+        "summary": {"count": len(items)},
+    }
+
+
+@app.post("/api/mira/stated-intents")
+def mira_stated_intent_create_endpoint(
+    body: MiraStatedIntentCreateRequest,
+    profile: str | None = Depends(validate_profile),
+    db=Depends(get_db_session),
+):
+    from mira.stated_intents import create_stated_intent, stated_intent_memory_enabled
+
+    if not stated_intent_memory_enabled():
+        return {
+            "enabled": False,
+            "status": "disabled",
+            "reason": "stated_intent_memory_disabled",
+        }
+    try:
+        intent = create_stated_intent(
+            conn=db,
+            profile=profile,
+            subject_type=body.subject_type,
+            subject_key=body.subject_key,
+            subject_label=body.subject_label,
+            intent_kind=body.intent_kind,
+            baseline_scope=body.baseline_scope or "mtd_vs_prior_3_full_months",
+            target_text=body.target_text,
+            feedback_state=body.feedback_state,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    db.commit()
+    _invalidate_copilot_cache()
+    return {"enabled": True, "status": "stored", "intent": intent}
+
+
+@app.patch("/api/mira/stated-intents/{intent_id}")
+def mira_stated_intent_update_endpoint(
+    intent_id: int,
+    body: MiraStatedIntentUpdateRequest,
+    profile: str | None = Depends(validate_profile),
+    db=Depends(get_db_session),
+):
+    from mira.stated_intents import stated_intent_memory_enabled, update_stated_intent
+
+    if not stated_intent_memory_enabled():
+        return {
+            "enabled": False,
+            "status": "disabled",
+            "reason": "stated_intent_memory_disabled",
+        }
+    try:
+        intent = update_stated_intent(
+            conn=db,
+            profile=profile,
+            intent_id=intent_id,
+            target_text=body.target_text,
+            status=body.status,
+            feedback_state=body.feedback_state,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not intent:
+        raise HTTPException(status_code=404, detail="Stated intent not found.")
+    db.commit()
+    _invalidate_copilot_cache()
+    return {"enabled": True, "status": "updated", "intent": intent}
+
+
+@app.delete("/api/mira/stated-intents/{intent_id}")
+def mira_stated_intent_clear_endpoint(
+    intent_id: int,
+    profile: str | None = Depends(validate_profile),
+    db=Depends(get_db_session),
+):
+    from mira.stated_intents import clear_stated_intent, stated_intent_memory_enabled
+
+    if not stated_intent_memory_enabled():
+        return {
+            "enabled": False,
+            "status": "disabled",
+            "reason": "stated_intent_memory_disabled",
+        }
+    intent = clear_stated_intent(conn=db, profile=profile, intent_id=intent_id)
+    if not intent:
+        raise HTTPException(status_code=404, detail="Stated intent not found.")
+    db.commit()
+    _invalidate_copilot_cache()
+    return {"enabled": True, "status": "dismissed", "intent": intent}
+
+
+@app.post("/api/mira/stated-intents/{intent_id}/evaluate")
+def mira_stated_intent_evaluate_endpoint(
+    intent_id: int,
+    as_of: str | None = Query(None),
+    profile: str | None = Depends(validate_profile),
+    db=Depends(get_db_session),
+):
+    from mira.stated_intents import evaluate_stated_intent, stated_intent_memory_enabled
+
+    if not stated_intent_memory_enabled():
+        return {
+            "enabled": False,
+            "status": "disabled",
+            "reason": "stated_intent_memory_disabled",
+        }
+    intent = evaluate_stated_intent(conn=db, profile=profile, intent_id=intent_id, as_of=as_of)
+    if not intent:
+        raise HTTPException(status_code=404, detail="Stated intent not found.")
+    db.commit()
+    _invalidate_copilot_cache()
+    return {"enabled": True, "status": "evaluated", "intent": intent}
+
+
+@app.get("/api/mira/habit-streaks")
+def mira_habit_streaks_endpoint(
+    subject_type: str | None = Query(None),
+    subject_key: str | None = Query(None),
+    include_inactive: bool = Query(False),
+    profile: str | None = Depends(validate_profile),
+    db=Depends(get_db_session),
+):
+    from mira.habit_streaks import habit_streaks_enabled, list_habit_streaks
+
+    if not habit_streaks_enabled():
+        return {
+            "enabled": False,
+            "status": "disabled",
+            "items": [],
+            "summary": {"count": 0},
+        }
+    items = list_habit_streaks(
+        conn=db,
+        profile=profile,
+        subject_type=subject_type,
+        subject_key=subject_key,
+        include_inactive=include_inactive,
+        limit=100,
+    )
+    return {
+        "enabled": True,
+        "status": "ok",
+        "items": items,
+        "summary": {"count": len(items)},
+    }
+
+
+@app.post("/api/mira/habit-streaks/generate")
+def mira_habit_streaks_generate_endpoint(
+    as_of: str | None = Query(None),
+    profile: str | None = Depends(validate_profile),
+    db=Depends(get_db_session),
+):
+    from mira.habit_streaks import generate_habit_streaks, habit_streaks_enabled
+
+    if not habit_streaks_enabled():
+        return {
+            "enabled": False,
+            "status": "disabled",
+            "reason": "habit_streaks_disabled",
+            "items": [],
+        }
+    result = generate_habit_streaks(conn=db, profile=profile, as_of=as_of)
+    db.commit()
+    _invalidate_copilot_cache()
+    return {"enabled": True, **result}
+
+
+@app.delete("/api/mira/habit-streaks/{streak_id}")
+def mira_habit_streak_dismiss_endpoint(
+    streak_id: int,
+    profile: str | None = Depends(validate_profile),
+    db=Depends(get_db_session),
+):
+    from mira.habit_streaks import dismiss_habit_streak, habit_streaks_enabled
+
+    if not habit_streaks_enabled():
+        return {
+            "enabled": False,
+            "status": "disabled",
+            "reason": "habit_streaks_disabled",
+        }
+    streak = dismiss_habit_streak(conn=db, profile=profile, streak_id=streak_id)
+    if not streak:
+        raise HTTPException(status_code=404, detail="Habit streak not found.")
+    db.commit()
+    _invalidate_copilot_cache()
+    return {"enabled": True, "status": "dismissed", "streak": streak}
+
+
+@app.get("/api/mira/monthly-retrospectives")
+def mira_monthly_retrospectives_endpoint(
+    include_inactive: bool = Query(False),
+    profile: str | None = Depends(validate_profile),
+    db=Depends(get_db_session),
+):
+    from mira.monthly_retrospectives import list_monthly_retrospectives, monthly_retrospective_enabled
+
+    if not monthly_retrospective_enabled():
+        return {
+            "enabled": False,
+            "status": "disabled",
+            "items": [],
+            "summary": {"count": 0},
+        }
+    items = list_monthly_retrospectives(
+        conn=db,
+        profile=profile,
+        include_inactive=include_inactive,
+        limit=24,
+    )
+    return {
+        "enabled": True,
+        "status": "ok",
+        "items": items,
+        "summary": {"count": len(items)},
+    }
+
+
+@app.post("/api/mira/monthly-retrospectives/generate")
+def mira_monthly_retrospective_generate_endpoint(
+    month_key: str | None = Query(None),
+    as_of: str | None = Query(None),
+    profile: str | None = Depends(validate_profile),
+    db=Depends(get_db_session),
+):
+    from mira.monthly_retrospectives import generate_monthly_retrospective, monthly_retrospective_enabled
+
+    if not monthly_retrospective_enabled():
+        return {
+            "enabled": False,
+            "status": "disabled",
+            "reason": "monthly_retrospective_disabled",
+            "item": None,
+        }
+    try:
+        result = generate_monthly_retrospective(conn=db, profile=profile, month_key=month_key, as_of=as_of)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    db.commit()
+    _invalidate_copilot_cache()
+    return {"enabled": True, **result}
+
+
+@app.delete("/api/mira/monthly-retrospectives/{retrospective_id}")
+def mira_monthly_retrospective_dismiss_endpoint(
+    retrospective_id: int,
+    profile: str | None = Depends(validate_profile),
+    db=Depends(get_db_session),
+):
+    from mira.monthly_retrospectives import dismiss_monthly_retrospective, monthly_retrospective_enabled
+
+    if not monthly_retrospective_enabled():
+        return {
+            "enabled": False,
+            "status": "disabled",
+            "reason": "monthly_retrospective_disabled",
+        }
+    item = dismiss_monthly_retrospective(conn=db, profile=profile, retrospective_id=retrospective_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="Monthly retrospective not found.")
+    db.commit()
+    _invalidate_copilot_cache()
+    return {"enabled": True, "status": "dismissed", "item": item}
+
+
+@app.get("/api/mira/session-summaries")
+def mira_session_summary_list(
+    profile: str | None = Depends(validate_profile),
+    include_inactive: bool = Query(False),
+    limit: int = Query(50, ge=1, le=200),
+    db=Depends(get_db_session),
+):
+    from mira import memory_v2
+
+    return {
+        "items": memory_v2.list_session_summaries(
+            db,
+            profile,
+            include_inactive=include_inactive,
+            limit=limit,
+        )
+    }
+
+
+@app.patch("/api/mira/session-summaries/{summary_id}")
+def mira_session_summary_update(
+    summary_id: int,
+    body: MiraSessionSummaryUpdate,
+    profile: str | None = Depends(validate_profile),
+    db=Depends(get_db_session),
+):
+    from mira import memory_v2
+
+    try:
+        updated = memory_v2.update_session_summary(
+            conn=db,
+            profile=profile,
+            summary_id=summary_id,
+            summary_text=body.summary_text,
+            status=body.status,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if not updated:
+        raise HTTPException(status_code=404, detail="session summary not found")
+    db.commit()
+    _invalidate_copilot_cache()
+    return updated
+
+
+@app.delete("/api/mira/session-summaries/{summary_id}")
+def mira_session_summary_delete(
+    summary_id: int,
+    profile: str | None = Depends(validate_profile),
+    db=Depends(get_db_session),
+):
+    from mira import memory_v2
+
+    if not memory_v2.delete_session_summary(conn=db, profile=profile, summary_id=summary_id):
+        raise HTTPException(status_code=404, detail="session summary not found")
+    db.commit()
+    _invalidate_copilot_cache()
+    return {"deleted": True, "id": summary_id}
 
 
 @app.get("/api/copilot/explain-category")
@@ -2207,6 +3809,11 @@ def update_budget_endpoint(
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    _mark_mira_money_outlook_stale_after_write(
+        conn=db,
+        profile=profile,
+        reason="budget_changed",
+    )
     return {"status": "updated", "budget": result}
 
 
@@ -2232,6 +3839,11 @@ def create_goal(body: GoalPayload, profile: str | None = Depends(validate_profil
         goal = upsert_goal(body.model_dump(), profile=profile, conn=db)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    _mark_mira_money_outlook_stale_after_write(
+        conn=db,
+        profile=profile,
+        reason="goal_created",
+    )
     return {"status": "created", "goal": goal}
 
 
@@ -2243,6 +3855,11 @@ def update_goal(goal_id: int, body: GoalPayload, profile: str | None = Depends(v
         goal = upsert_goal(payload, profile=profile, conn=db)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    _mark_mira_money_outlook_stale_after_write(
+        conn=db,
+        profile=profile,
+        reason="goal_changed",
+    )
     return {"status": "updated", "goal": goal}
 
 
@@ -2250,6 +3867,11 @@ def update_goal(goal_id: int, body: GoalPayload, profile: str | None = Depends(v
 def remove_goal(goal_id: int, profile: str | None = Depends(validate_profile), db=Depends(get_db_session)):
     if not delete_goal(goal_id, profile=profile, conn=db):
         raise HTTPException(status_code=404, detail="Goal not found.")
+    _mark_mira_money_outlook_stale_after_write(
+        conn=db,
+        profile=profile,
+        reason="goal_deleted",
+    )
     return {"status": "deleted"}
 
 
@@ -2298,6 +3920,11 @@ def update_transaction_splits_endpoint(tx_id: str, body: TransactionSplitsUpdate
     )
     if not result:
         raise HTTPException(status_code=404, detail="Transaction not found.")
+    _mark_mira_money_outlook_stale_after_write(
+        conn=db,
+        tx_id=tx_id,
+        reason="transaction_splits_changed",
+    )
     return {"status": "updated", **result}
 
 
@@ -2497,13 +4124,968 @@ def dashboard_bundle(
 
 @app.get("/api/proactive-insights")
 def proactive_insights_endpoint(
+    background_tasks: BackgroundTasks,
     include_dismissed: bool = Query(False),
     profile: str | None = Depends(validate_profile),
     db=Depends(get_db_session),
 ):
     from proactive_insights import list_insights
 
-    return {"items": list_insights(profile=profile, include_dismissed=include_dismissed, conn=db, generate=True)}
+    items = list_insights(profile=profile, include_dismissed=include_dismissed, conn=db, generate=True)
+    auto_refresh = _maybe_queue_mira_background_refresh(
+        background_tasks=background_tasks,
+        profile=profile,
+        conn=db,
+        reason="proactive_insights_open",
+    )
+    return {"items": items, "auto_refresh": auto_refresh, "job": _mira_background_job_snapshot(profile)}
+
+
+def _mira_background_job_key(profile: str | None) -> str:
+    return profile if profile and profile != "household" else "household"
+
+
+def _mira_background_job_snapshot(profile: str | None) -> dict:
+    key = _mira_background_job_key(profile)
+    with _mira_background_job_lock:
+        return dict(_mira_background_jobs.get(key) or {"status": "idle"})
+
+
+def _set_mira_background_job(profile: str | None, payload: dict) -> None:
+    key = _mira_background_job_key(profile)
+    with _mira_background_job_lock:
+        _mira_background_jobs[key] = dict(payload)
+
+
+def _mark_mira_background_job_queued(profile: str | None, payload: dict) -> tuple[bool, dict]:
+    key = _mira_background_job_key(profile)
+    with _mira_background_job_lock:
+        existing = dict(_mira_background_jobs.get(key) or {"status": "idle"})
+        if existing.get("status") in {"queued", "running"}:
+            return False, existing
+        _mira_background_jobs[key] = dict(payload)
+        return True, dict(payload)
+
+
+def _run_mira_background_refresh_task(profile: str | None, force: bool, reason: str = "manual_refresh") -> None:
+    from mira.background_analyst import run_background_mira_analysis
+
+    started_at = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    _set_mira_background_job(profile, {"status": "running", "started_at": started_at, "force": force, "reason": reason})
+    try:
+        run = run_background_mira_analysis(profile=profile, force=force)
+        _set_mira_background_job(
+            profile,
+            {
+                "status": "completed",
+                "started_at": started_at,
+                "finished_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                "force": force,
+                "reason": reason,
+                "run": run,
+            },
+        )
+    except Exception as exc:
+        logger.exception("Mira background analyst refresh failed")
+        _set_mira_background_job(
+            profile,
+            {
+                "status": "error",
+                "started_at": started_at,
+                "finished_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                "force": force,
+                "reason": reason,
+                "error": f"{type(exc).__name__}: {exc}",
+            },
+        )
+
+
+def _maybe_queue_mira_background_refresh(
+    *,
+    background_tasks: BackgroundTasks | None,
+    profile: str | None,
+    reason: str,
+    conn=None,
+) -> dict:
+    from mira.background_analyst import background_analyst_auto_decision
+
+    try:
+        decision = background_analyst_auto_decision(profile=profile, conn=conn)
+    except Exception as exc:
+        logger.exception("Mira background analyst auto-decision failed")
+        return {"status": "error", "reason": f"decision_error:{type(exc).__name__}"}
+
+    if not decision.get("should_queue"):
+        if decision.get("reason") == "fresh_cache":
+            run = {"status": "fresh_cache", "stored_count": 0, "fresh_cache": True}
+            _set_mira_background_job(
+                profile,
+                {
+                    "status": "completed",
+                    "finished_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                    "force": False,
+                    "reason": reason,
+                    "auto": True,
+                    "run": run,
+                },
+            )
+            return {"status": "fresh_cache", "reason": "fresh_cache", "run": run}
+        return {"status": "skipped", "reason": decision.get("reason") or "not_needed", "decision": decision}
+
+    queued_at = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    queued_payload = {
+        "status": "queued",
+        "queued_at": queued_at,
+        "force": False,
+        "reason": reason,
+        "auto": True,
+        "decision": decision,
+    }
+    queued, job = _mark_mira_background_job_queued(profile, queued_payload)
+    if not queued:
+        return {"status": job.get("status") or "queued", "reason": "already_queued", "job": job}
+
+    if background_tasks is not None:
+        background_tasks.add_task(_run_mira_background_refresh_task, profile, False, reason)
+    else:
+        _run_mira_background_refresh_task(profile, False, reason)
+        job = _mira_background_job_snapshot(profile)
+    return {"status": "queued", "reason": reason, "job": job}
+
+
+def _mira_advisor_read_job_snapshot(profile: str | None) -> dict:
+    key = _mira_background_job_key(profile)
+    with _mira_advisor_read_job_lock:
+        return dict(_mira_advisor_read_jobs.get(key) or {"status": "idle"})
+
+
+def _set_mira_advisor_read_job(profile: str | None, payload: dict) -> None:
+    key = _mira_background_job_key(profile)
+    with _mira_advisor_read_job_lock:
+        _mira_advisor_read_jobs[key] = dict(payload)
+
+
+def _mark_mira_advisor_read_job_queued(profile: str | None, payload: dict) -> tuple[bool, dict]:
+    key = _mira_background_job_key(profile)
+    with _mira_advisor_read_job_lock:
+        existing = dict(_mira_advisor_read_jobs.get(key) or {"status": "idle"})
+        if existing.get("status") in {"queued", "running"}:
+            return False, existing
+        _mira_advisor_read_jobs[key] = dict(payload)
+        return True, dict(payload)
+
+
+def _advisor_read_run_summary(run: dict) -> dict:
+    quality = run.get("quality") if isinstance(run.get("quality"), dict) else {}
+    return {
+        "status": run.get("status"),
+        "stored_count": run.get("stored_count"),
+        "latency_ms": run.get("latency_ms"),
+        "quality_ok": bool(quality.get("ok")),
+        "quality_score": quality.get("score"),
+        "coverage_count": quality.get("coverage_count"),
+        "required_count": quality.get("required_count"),
+        "failure_reasons": (quality.get("failure_reasons") or [])[:8],
+        "post_advisor_rewarm": run.get("post_advisor_rewarm"),
+    }
+
+
+def _run_mira_advisor_read_generation_task(profile: str | None, force: bool) -> None:
+    from mira.advisor_lens_synthesis import run_advisor_lens_background_memo
+
+    started_at = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    _set_mira_advisor_read_job(profile, {"status": "running", "started_at": started_at, "force": force})
+    try:
+        with get_db() as conn:
+            run = run_advisor_lens_background_memo(conn=conn, profile=profile, force=force)
+        run_summary = _advisor_read_run_summary(run)
+        stored = int(run.get("stored_count") or 0)
+        job_status = "completed" if (run.get("status") == "ok" and stored > 0) or run.get("status") == "fresh_cache" else "no_valid_memo"
+        _set_mira_advisor_read_job(
+            profile,
+            {
+                "status": job_status,
+                "started_at": started_at,
+                "finished_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                "force": force,
+                "run": run_summary,
+            },
+        )
+    except Exception as exc:
+        logger.exception("Mira advisor read generation failed")
+        _set_mira_advisor_read_job(
+            profile,
+            {
+                "status": "error",
+                "started_at": started_at,
+                "finished_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                "force": force,
+                "error": f"{type(exc).__name__}: {exc}",
+            },
+        )
+
+
+@app.post("/api/proactive-insights/background-refresh")
+def proactive_insights_background_refresh_endpoint(
+    background_tasks: BackgroundTasks,
+    force: bool = Query(False),
+    wait: bool = Query(False),
+    profile: str | None = Depends(validate_profile),
+    db=Depends(get_db_session),
+):
+    from mira.background_analyst import has_fresh_background_analyst_insight, run_background_mira_analysis
+    from proactive_insights import list_insights
+
+    if wait:
+        run = run_background_mira_analysis(profile=profile, conn=db, force=force)
+        _set_mira_background_job(
+            profile,
+            {
+                "status": "completed",
+                "finished_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                "force": force,
+                "run": run,
+            },
+        )
+        return {
+            "status": "completed",
+            "run": run,
+            "items": list_insights(profile=profile, include_dismissed=False, conn=db, generate=False),
+        }
+
+    job = _mira_background_job_snapshot(profile)
+    if job.get("status") in {"queued", "running"} and not force:
+        return {
+            "status": job["status"],
+            "job": job,
+            "items": list_insights(profile=profile, include_dismissed=False, conn=db, generate=False),
+        }
+    if not force and has_fresh_background_analyst_insight(profile=profile, conn=db):
+        run = {"status": "fresh_cache", "stored_count": 0, "fresh_cache": True}
+        _set_mira_background_job(
+            profile,
+            {
+                "status": "completed",
+                "finished_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                "force": force,
+                "run": run,
+            },
+        )
+        return {
+            "status": "fresh_cache",
+            "run": run,
+            "items": list_insights(profile=profile, include_dismissed=False, conn=db, generate=False),
+        }
+
+    _set_mira_background_job(
+        profile,
+        {
+            "status": "queued",
+            "queued_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            "force": force,
+            "reason": "manual_refresh",
+        },
+    )
+    background_tasks.add_task(_run_mira_background_refresh_task, profile, force, "manual_refresh")
+    return {
+        "status": "queued",
+        "job": _mira_background_job_snapshot(profile),
+        "items": list_insights(profile=profile, include_dismissed=False, conn=db, generate=False),
+    }
+
+
+@app.get("/api/proactive-insights/background-refresh/status")
+def proactive_insights_background_refresh_status_endpoint(
+    profile: str | None = Depends(validate_profile),
+    db=Depends(get_db_session),
+):
+    from proactive_insights import list_insights
+
+    return {
+        "job": _mira_background_job_snapshot(profile),
+        "items": list_insights(profile=profile, include_dismissed=False, conn=db, generate=False),
+    }
+
+
+def _advisor_read_effective_profile(conn, profile: str | None) -> str | None:
+    normalized = _canonicalize_profile_id(profile)
+    if normalized and normalized != "household":
+        return normalized
+    try:
+        real_profiles = sorted(_load_valid_profiles(conn))
+    except Exception:
+        logger.debug("Failed to resolve advisor read profile scope", exc_info=True)
+        return normalized or None
+    if len(real_profiles) == 1:
+        return real_profiles[0]
+    return normalized or None
+
+
+def _money_outlook_effective_profile(conn, profile: str | None) -> str | None:
+    return _advisor_read_effective_profile(conn, profile)
+
+
+def _mira_money_outlook_public_snapshot(snapshot: dict | None) -> dict | None:
+    if not snapshot:
+        return None
+    evidence = snapshot.get("evidence") if isinstance(snapshot.get("evidence"), dict) else {}
+    summary = evidence.get("summary") if isinstance(evidence.get("summary"), dict) else {}
+    public = {key: value for key, value in dict(snapshot).items() if key != "evidence"}
+    public["evidence_summary"] = {
+        "as_of_date": evidence.get("as_of_date"),
+        "mtd_income": summary.get("mtd_income"),
+        "mtd_spend": summary.get("mtd_spend"),
+        "expected_month_income": summary.get("expected_month_income"),
+        "expected_month_outflow": summary.get("expected_month_outflow"),
+        "current_flexible_mtd": summary.get("current_flexible_mtd"),
+        "flexible_baseline": summary.get("flexible_baseline"),
+    }
+    public["safe_to_spend"] = {
+        "safe_to_spend_today": snapshot.get("safe_to_spend_today"),
+        "safe_to_spend_this_week": snapshot.get("safe_to_spend_this_week"),
+        "buffer_status": snapshot.get("buffer_status"),
+        "next_pressure_date": snapshot.get("low_point_date"),
+        "top_caveat": snapshot.get("safe_to_spend_top_caveat"),
+    }
+    public["low_point"] = {
+        "low_point_date": snapshot.get("low_point_date"),
+        "low_point_amount": snapshot.get("low_point_amount"),
+        "buffer_amount": snapshot.get("buffer_amount"),
+        "buffer_status": snapshot.get("buffer_status"),
+        "buffer_breach": bool(snapshot.get("buffer_breach")),
+        "drivers": snapshot.get("low_point_drivers") or [],
+    }
+    return public
+
+
+def _mira_money_outlook_job_key(profile: str | None) -> str:
+    return str(profile or "household")
+
+
+def _mira_money_outlook_job_snapshot(profile: str | None) -> dict:
+    key = _mira_money_outlook_job_key(profile)
+    with _mira_money_outlook_job_lock:
+        return dict(_mira_money_outlook_jobs.get(key) or {"status": "idle"})
+
+
+def _set_mira_money_outlook_job(profile: str | None, payload: dict) -> None:
+    key = _mira_money_outlook_job_key(profile)
+    with _mira_money_outlook_job_lock:
+        _mira_money_outlook_jobs[key] = dict(payload)
+
+
+def _mark_mira_money_outlook_job_queued(profile: str | None, payload: dict) -> tuple[bool, dict]:
+    key = _mira_money_outlook_job_key(profile)
+    with _mira_money_outlook_job_lock:
+        existing = dict(_mira_money_outlook_jobs.get(key) or {"status": "idle"})
+        if existing.get("status") in {"queued", "running"}:
+            return False, existing
+        _mira_money_outlook_jobs[key] = dict(payload)
+        return True, dict(payload)
+
+
+def _run_mira_money_outlook_refresh_task(profile: str | None, reason: str = "manual_refresh") -> None:
+    from database import get_db
+    from mira.money_outlook import store_money_outlook_snapshot
+
+    started_at = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    _set_mira_money_outlook_job(profile, {"status": "running", "started_at": started_at, "reason": reason})
+    try:
+        with get_db() as conn:
+            effective_profile = _money_outlook_effective_profile(conn, profile)
+            snapshot = store_money_outlook_snapshot(conn, profile=effective_profile)
+        finished_at = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+        _set_mira_money_outlook_job(
+            profile,
+            {
+                "status": "completed",
+                "started_at": started_at,
+                "finished_at": finished_at,
+                "reason": reason,
+                "month_key": snapshot.get("month_key"),
+                "snapshot_id": snapshot.get("id"),
+                "confidence": snapshot.get("confidence"),
+                "fingerprint": snapshot.get("fingerprint"),
+            },
+        )
+    except Exception as exc:
+        logger.exception("Mira money outlook refresh failed")
+        _set_mira_money_outlook_job(
+            profile,
+            {
+                "status": "failed",
+                "started_at": started_at,
+                "finished_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                "reason": reason,
+                "error": f"{type(exc).__name__}: {exc}",
+            },
+        )
+
+
+def _maybe_queue_mira_money_outlook_refresh(
+    *,
+    background_tasks: BackgroundTasks | None,
+    conn,
+    profile: str | None,
+    reason: str,
+) -> dict:
+    from mira.money_outlook import money_outlook_enabled, money_outlook_needs_refresh
+
+    if not money_outlook_enabled():
+        return {"queued": False, "reason": "money_outlook_disabled", "job": _mira_money_outlook_job_snapshot(profile)}
+    effective_profile = _money_outlook_effective_profile(conn, profile)
+    if not money_outlook_needs_refresh(conn, profile=effective_profile):
+        return {"queued": False, "reason": "fresh_snapshot_exists", "job": _mira_money_outlook_job_snapshot(effective_profile)}
+    queued_at = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    queued, job = _mark_mira_money_outlook_job_queued(
+        effective_profile,
+        {
+            "status": "queued",
+            "queued_at": queued_at,
+            "reason": reason,
+        },
+    )
+    if queued:
+        if background_tasks is not None:
+            background_tasks.add_task(_run_mira_money_outlook_refresh_task, effective_profile, reason)
+        else:
+            _run_mira_money_outlook_refresh_task(effective_profile, reason)
+            job = _mira_money_outlook_job_snapshot(effective_profile)
+    return {"queued": queued, "reason": reason if queued else "already_queued", "job": job}
+
+
+def _mark_mira_money_outlook_stale_after_write(
+    *,
+    conn,
+    profile: str | None = None,
+    tx_id: str | None = None,
+    all_profiles: bool = False,
+    as_of: str | None = None,
+    reason: str = "data_changed",
+) -> dict:
+    from mira.money_outlook import ensure_money_outlook_tables, mark_money_outlook_snapshots_stale, money_outlook_enabled
+
+    if not money_outlook_enabled():
+        return {"stale": False, "reason": "money_outlook_disabled", "profiles": []}
+
+    ensure_money_outlook_tables(conn)
+    profiles: list[str | None] = []
+    if all_profiles:
+        rows = conn.execute("SELECT DISTINCT profile_id FROM mira_outlook_snapshots").fetchall()
+        profiles = [row[0] for row in rows if row and row[0]]
+    else:
+        scoped_profile = profile
+        if tx_id:
+            row = conn.execute("SELECT profile_id FROM transactions WHERE id = ?", (tx_id,)).fetchone()
+            if row:
+                scoped_profile = row[0]
+        profiles = [_money_outlook_effective_profile(conn, scoped_profile)]
+
+    stale_count = 0
+    touched_profiles: list[str] = []
+    for item in dict.fromkeys(str(value or "household") for value in profiles):
+        changed = mark_money_outlook_snapshots_stale(conn, profile=item, as_of=as_of)
+        stale_count += changed
+        if changed:
+            touched_profiles.append(item)
+
+    if stale_count:
+        stale_at = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+        for item in touched_profiles:
+            _set_mira_money_outlook_job(
+                item,
+                {
+                    "status": "stale",
+                    "stale_at": stale_at,
+                    "reason": reason,
+                    "stale_count": stale_count,
+                },
+            )
+    return {"stale": stale_count > 0, "reason": reason, "profiles": touched_profiles, "stale_count": stale_count}
+
+
+@app.get("/api/mira/money-outlook")
+def mira_money_outlook_endpoint(
+    profile: str | None = Depends(validate_profile),
+    as_of: str | None = None,
+    db=Depends(get_db_session),
+):
+    from mira.money_outlook import load_latest_money_outlook_snapshot, money_outlook_enabled
+
+    enabled = money_outlook_enabled()
+    effective_profile = _money_outlook_effective_profile(db, profile)
+    job = _mira_money_outlook_job_snapshot(effective_profile)
+    if not enabled:
+        return {
+            "enabled": False,
+            "snapshot": None,
+            "empty_reason": "disabled",
+            "job": job,
+        }
+
+    snapshot = load_latest_money_outlook_snapshot(db, profile=effective_profile, as_of=as_of)
+    if not snapshot:
+        return {
+            "enabled": True,
+            "snapshot": None,
+            "empty_reason": "no_fresh_snapshot",
+            "job": job,
+        }
+    return {
+        "enabled": True,
+        "snapshot": _mira_money_outlook_public_snapshot(snapshot),
+        "empty_reason": None,
+        "job": job,
+    }
+
+
+@app.post("/api/mira/money-outlook/generate")
+def mira_money_outlook_generate_endpoint(
+    profile: str | None = Depends(validate_profile),
+    as_of: str | None = None,
+    db=Depends(get_db_session),
+):
+    from mira.money_outlook import money_outlook_enabled, store_money_outlook_snapshot
+
+    effective_profile = _money_outlook_effective_profile(db, profile)
+    if not money_outlook_enabled():
+        return {
+            "enabled": False,
+            "status": "disabled",
+            "snapshot": None,
+            "empty_reason": "disabled",
+            "job": _mira_money_outlook_job_snapshot(effective_profile),
+        }
+
+    generated_at = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    snapshot = store_money_outlook_snapshot(db, profile=effective_profile, as_of=as_of)
+    job = {
+        "status": "completed",
+        "finished_at": generated_at,
+        "reason": "manual_generate",
+        "month_key": snapshot.get("month_key"),
+        "snapshot_id": snapshot.get("id"),
+        "confidence": snapshot.get("confidence"),
+        "fingerprint": snapshot.get("fingerprint"),
+    }
+    _set_mira_money_outlook_job(effective_profile, job)
+    return {
+        "enabled": True,
+        "status": "ok",
+        "snapshot": _mira_money_outlook_public_snapshot(snapshot),
+        "empty_reason": None,
+        "job": job,
+    }
+
+
+@app.get("/api/mira/advisor-read")
+def mira_advisor_read_endpoint(
+    profile: str | None = Depends(validate_profile),
+    db=Depends(get_db_session),
+):
+    from mira.advisor_lens_synthesis import advisor_lens_context_enabled, advisor_lens_ui_enabled, list_lens_advisor_memos
+
+    enabled = advisor_lens_ui_enabled()
+    context_enabled = advisor_lens_context_enabled()
+    generation_enabled = _advisor_read_generation_enabled()
+    advisor_profile = _advisor_read_effective_profile(db, profile)
+    memo = None
+    if enabled:
+        memos = list_lens_advisor_memos(profile=advisor_profile, conn=db, limit=1)
+        if memos:
+            latest_delta = _latest_public_advisor_delta(conn=db, profile=advisor_profile, memo=memos[0])
+            memo = _public_advisor_read_payload(memos[0], delta=latest_delta)
+            memo = _attach_public_advisor_feedback(memo, conn=db, profile=advisor_profile)
+    return {
+        "enabled": enabled,
+        "context_enabled": context_enabled,
+        "generation_enabled": generation_enabled,
+        "memo": memo,
+        "job": _mira_advisor_read_job_snapshot(advisor_profile),
+        "empty_reason": None if memo else ("ui_disabled" if not enabled else "no_stored_memo"),
+    }
+
+
+@app.post("/api/mira/advisor-read/refresh")
+def mira_advisor_read_refresh_endpoint(
+    profile: str | None = Depends(validate_profile),
+    db=Depends(get_db_session),
+):
+    from mira.advisor_lens_synthesis import (
+        advisor_lens_context_enabled,
+        advisor_lens_ui_enabled,
+        list_lens_advisor_memos,
+        run_advisor_lens_portrait_delta,
+    )
+
+    enabled = advisor_lens_ui_enabled()
+    context_enabled = advisor_lens_context_enabled()
+    generation_enabled = _advisor_read_generation_enabled()
+    advisor_profile = _advisor_read_effective_profile(db, profile)
+    memo = None
+    preflight: dict | None = None
+    if enabled:
+        memos = list_lens_advisor_memos(profile=advisor_profile, conn=db, limit=1)
+        if memos:
+            try:
+                preflight = run_advisor_lens_portrait_delta(conn=db, profile=advisor_profile, store=True)
+            except Exception as exc:
+                logger.exception("Mira advisor read delta refresh failed")
+                preflight = {
+                    "status": "error",
+                    "decision": "delta_preflight_error",
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            latest_delta = _latest_public_advisor_delta(conn=db, profile=advisor_profile, memo=memos[0])
+            if not latest_delta and preflight and preflight.get("delta") and preflight.get("decision") == "queue_full_advisor_synthesis":
+                latest_delta = _public_advisor_delta_payload(
+                    {
+                        "generated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                        "source_memo_fingerprint": memos[0].get("fingerprint"),
+                        "delta_packet": preflight.get("delta"),
+                    },
+                    memo=memos[0],
+                )
+            memo = _public_advisor_read_payload(memos[0], delta=latest_delta)
+            memo = _attach_public_advisor_feedback(memo, conn=db, profile=advisor_profile)
+        else:
+            preflight = {
+                "status": "missing_memo",
+                "decision": "needs_full_rebuild",
+                "reason": "no_stored_advisor_memo",
+            }
+    return {
+        "status": (preflight or {}).get("status") or "loaded",
+        "enabled": enabled,
+        "context_enabled": context_enabled,
+        "generation_enabled": generation_enabled,
+        "memo": memo,
+        "job": _mira_advisor_read_job_snapshot(advisor_profile),
+        "empty_reason": None if memo else ("ui_disabled" if not enabled else "no_stored_memo"),
+        "preflight": {
+            "status": (preflight or {}).get("status"),
+            "decision": (preflight or {}).get("decision"),
+            "reason": (preflight or {}).get("reason"),
+            "stored_delta_count": (preflight or {}).get("stored_delta_count"),
+            "expired_delta_count": (preflight or {}).get("expired_delta_count"),
+            "duplicate_delta": bool((preflight or {}).get("duplicate_delta")),
+            "needs_full_rebuild": bool(((preflight or {}).get("delta") or {}).get("needs_full_rebuild")),
+        } if preflight else None,
+    }
+
+
+@app.post("/api/mira/advisor-read/generate")
+def mira_advisor_read_generate_endpoint(
+    background_tasks: BackgroundTasks,
+    force: bool = Query(True),
+    profile: str | None = Depends(validate_profile),
+    db=Depends(get_db_session),
+):
+    from mira.advisor_lens_synthesis import advisor_lens_context_enabled, advisor_lens_ui_enabled, list_lens_advisor_memos
+
+    enabled = advisor_lens_ui_enabled()
+    context_enabled = advisor_lens_context_enabled()
+    generation_enabled = _advisor_read_generation_enabled()
+    advisor_profile = _advisor_read_effective_profile(db, profile)
+    memos = list_lens_advisor_memos(profile=advisor_profile, conn=db, limit=1) if enabled else []
+    memo = None
+    if memos:
+        latest_delta = _latest_public_advisor_delta(conn=db, profile=advisor_profile, memo=memos[0])
+        memo = _public_advisor_read_payload(memos[0], delta=latest_delta)
+        memo = _attach_public_advisor_feedback(memo, conn=db, profile=advisor_profile)
+    if not enabled:
+        return {
+            "status": "disabled",
+            "reason": "ui_disabled",
+            "enabled": enabled,
+            "context_enabled": context_enabled,
+            "generation_enabled": generation_enabled,
+            "memo": memo,
+            "job": _mira_advisor_read_job_snapshot(advisor_profile),
+        }
+    if not generation_enabled:
+        return {
+            "status": "disabled",
+            "reason": "generation_disabled",
+            "enabled": enabled,
+            "context_enabled": context_enabled,
+            "generation_enabled": generation_enabled,
+            "memo": memo,
+            "job": _mira_advisor_read_job_snapshot(advisor_profile),
+        }
+
+    queued_at = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    queued_payload = {
+        "status": "queued",
+        "queued_at": queued_at,
+        "force": force,
+        "reason": "manual_ui_generate",
+    }
+    queued, job = _mark_mira_advisor_read_job_queued(advisor_profile, queued_payload)
+    if queued:
+        background_tasks.add_task(_run_mira_advisor_read_generation_task, advisor_profile, force)
+    return {
+        "status": "queued" if queued else (job.get("status") or "queued"),
+        "enabled": enabled,
+        "context_enabled": context_enabled,
+        "generation_enabled": generation_enabled,
+        "memo": memo,
+        "job": job,
+    }
+
+
+@app.post("/api/mira/advisor-read/followup")
+def mira_advisor_read_followup_endpoint(
+    body: AdvisorReadFollowupRequest,
+    profile: str | None = Depends(validate_profile),
+    db=Depends(get_db_session),
+):
+    from mira.advisor_lens_synthesis import advisor_lens_context_enabled, advisor_lens_ui_enabled, list_lens_advisor_memos
+
+    if not advisor_lens_ui_enabled() or not advisor_lens_context_enabled():
+        return {
+            "status": "disabled",
+            "reason": "advisor_read_context_disabled",
+            "answer": "Mira's financial read follow-ups are disabled right now.",
+        }
+    advisor_profile = _advisor_read_effective_profile(db, profile)
+    memos = list_lens_advisor_memos(profile=advisor_profile, conn=db, limit=1)
+    if not memos:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "advisor_read_missing", "message": "Mira has not stored a validated financial read yet."},
+        )
+    question = str(body.question or "").strip() or "What should I understand from Mira's read?"
+    latest_delta = _latest_public_advisor_delta(conn=db, profile=advisor_profile, memo=memos[0])
+    result = _compose_advisor_read_followup(
+        memo=memos[0],
+        question=question,
+        followup_type=body.followup_type,
+        history=body.history,
+        delta=latest_delta,
+    )
+    return {
+        "status": "ok" if not result["final_reject_reasons"] else "guarded",
+        "operation": "advisor_read_followup",
+        "answer": result["answer"],
+        "memo_id": result["memo_id"],
+        "memo_generated_at": result["memo_generated_at"],
+        "delta": result.get("delta"),
+        "answer_context": {
+            "used": True,
+            "reason": "advisor_read_followup",
+            "count": 1,
+            "items": [
+                {
+                    "id": result["memo_id"],
+                    "generated_at": result["memo_generated_at"],
+                }
+            ],
+        },
+        "answer_guard": {
+            "path": "advisor_read_followup",
+            "used_fallback": result["used_fallback"],
+            "reject_reasons": result["reject_reasons"],
+            "final_reject_reasons": result["final_reject_reasons"],
+            "error": result["llm_error"] or "",
+        },
+    }
+
+
+@app.get("/api/mira/financial-feedback")
+def mira_financial_feedback_endpoint(
+    target_type: str | None = Query(None),
+    target_id: str | None = Query(None),
+    subject_type: str | None = Query(None),
+    subject_key: str | None = Query(None),
+    include_cleared: bool = Query(False),
+    profile: str | None = Depends(validate_profile),
+    db=Depends(get_db_session),
+):
+    from mira.financial_feedback import financial_feedback_loop_enabled, list_financial_feedback
+
+    advisor_profile = _advisor_read_effective_profile(db, profile)
+    if not financial_feedback_loop_enabled():
+        return {
+            "enabled": False,
+            "status": "disabled",
+            "feedback": [],
+            "summary": {"count": 0},
+        }
+    feedback = list_financial_feedback(
+        conn=db,
+        profile=advisor_profile,
+        target_type=target_type,
+        target_id=target_id,
+        subject_type=subject_type,
+        subject_key=subject_key,
+        include_cleared=include_cleared,
+        limit=100,
+    )
+    return {
+        "enabled": True,
+        "status": "ok",
+        "feedback": feedback,
+        "summary": {"count": len(feedback)},
+    }
+
+
+@app.post("/api/mira/financial-feedback")
+def mira_financial_feedback_create_endpoint(
+    body: MiraFinancialFeedbackRequest,
+    profile: str | None = Depends(validate_profile),
+    db=Depends(get_db_session),
+):
+    from mira.financial_feedback import financial_feedback_loop_enabled, record_financial_feedback
+
+    advisor_profile = _advisor_read_effective_profile(db, profile)
+    if not financial_feedback_loop_enabled():
+        return {
+            "enabled": False,
+            "status": "disabled",
+            "reason": "financial_feedback_loop_disabled",
+        }
+    payload = body.model_dump() if hasattr(body, "model_dump") else body.dict()
+    try:
+        feedback = record_financial_feedback(conn=db, profile=advisor_profile, feedback=payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {
+        "enabled": True,
+        "status": "stored",
+        "feedback": feedback,
+    }
+
+
+@app.delete("/api/mira/financial-feedback/{feedback_id}")
+def mira_financial_feedback_clear_endpoint(
+    feedback_id: int,
+    profile: str | None = Depends(validate_profile),
+    db=Depends(get_db_session),
+):
+    from mira.financial_feedback import clear_financial_feedback, financial_feedback_loop_enabled
+
+    advisor_profile = _advisor_read_effective_profile(db, profile)
+    if not financial_feedback_loop_enabled():
+        return {
+            "enabled": False,
+            "status": "disabled",
+            "reason": "financial_feedback_loop_disabled",
+        }
+    feedback = clear_financial_feedback(conn=db, profile=advisor_profile, feedback_id=feedback_id)
+    if not feedback:
+        raise HTTPException(status_code=404, detail="Financial feedback not found.")
+    return {
+        "enabled": True,
+        "status": "cleared",
+        "feedback": feedback,
+    }
+
+
+@app.post("/api/mira/financial-feedback/{feedback_id}/promote-memory")
+def mira_financial_feedback_promote_memory_endpoint(
+    feedback_id: int,
+    profile: str | None = Depends(validate_profile),
+    db=Depends(get_db_session),
+):
+    import memory as _mem
+    from mira.financial_feedback import feedback_memory_candidate, financial_feedback_loop_enabled, get_financial_feedback
+
+    advisor_profile = _advisor_read_effective_profile(db, profile)
+    if not financial_feedback_loop_enabled():
+        return {
+            "enabled": False,
+            "status": "disabled",
+            "reason": "financial_feedback_loop_disabled",
+        }
+    feedback = get_financial_feedback(conn=db, profile=advisor_profile, feedback_id=feedback_id)
+    if not feedback:
+        raise HTTPException(status_code=404, detail="Financial feedback not found.")
+    candidate = feedback_memory_candidate(feedback)
+    if not candidate:
+        raise HTTPException(status_code=400, detail="Feedback cannot be promoted to memory.")
+    existing_id = _mem.find_active_entry_id(
+        profile=advisor_profile,
+        section=candidate["section"],
+        body=candidate["body"],
+        conn=db,
+    )
+    if existing_id:
+        row = db.execute(
+            "SELECT id, profile_id, section, body, confidence, evidence, theme, created_at "
+            "FROM memory_entries WHERE id = ?",
+            (existing_id,),
+        ).fetchone()
+        return {
+            "enabled": True,
+            "status": "already_stored",
+            "entry": dict(row),
+            "feedback": feedback,
+        }
+    try:
+        entry_id = _mem.insert_entry(profile=advisor_profile, conn=db, **candidate)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    db.commit()
+    row = db.execute(
+        "SELECT id, profile_id, section, body, confidence, evidence, theme, created_at "
+        "FROM memory_entries WHERE id = ?",
+        (entry_id,),
+    ).fetchone()
+    _invalidate_copilot_cache()
+    return {
+        "enabled": True,
+        "status": "stored",
+        "entry": dict(row),
+        "feedback": feedback,
+    }
+
+
+@app.get("/api/mira/advisor-cases")
+def mira_advisor_cases_endpoint(
+    include_dismissed: bool = Query(False),
+    profile: str | None = Depends(validate_profile),
+    db=Depends(get_db_session),
+):
+    from mira.advisor_cases import list_advisor_cases, list_or_refresh_advisor_cases
+
+    if include_dismissed:
+        items = list_advisor_cases(profile=profile, include_dismissed=True, conn=db)
+    else:
+        items = list_or_refresh_advisor_cases(profile=profile, conn=db)
+    return {
+        "items": items,
+        "job": _mira_background_job_snapshot(profile),
+    }
+
+
+@app.post("/api/mira/advisor-cases/refresh")
+def mira_advisor_cases_refresh_endpoint(
+    force: bool = Query(False),
+    profile: str | None = Depends(validate_profile),
+    db=Depends(get_db_session),
+):
+    from mira.advisor_cases import list_advisor_cases, refresh_advisor_cases
+
+    run = refresh_advisor_cases(profile=profile, conn=db, force=force)
+    return {
+        "status": run.get("status") or "ok",
+        "run": run,
+        "items": list_advisor_cases(profile=profile, conn=db),
+    }
+
+
+@app.post("/api/mira/advisor-cases/{case_id}/dismiss")
+def dismiss_mira_advisor_case_endpoint(
+    case_id: int,
+    profile: str | None = Depends(validate_profile),
+    db=Depends(get_db_session),
+):
+    from mira.advisor_cases import dismiss_advisor_case
+
+    if not dismiss_advisor_case(case_id=case_id, profile=profile, conn=db):
+        raise HTTPException(status_code=404, detail="Advisor case not found.")
+    return {"status": "dismissed", "id": case_id}
 
 
 @app.post("/api/proactive-insights/{insight_id}/dismiss")
@@ -2586,7 +5168,7 @@ def teller_config():
 
 
 @app.post("/api/enroll")
-def enroll_account(req: EnrollRequest):
+def enroll_account(req: EnrollRequest, background_tasks: BackgroundTasks):
     _require_live_mode("Bank enrollment is disabled in demo mode.")
     """
     Handle a new Teller Connect enrollment.
@@ -2656,6 +5238,11 @@ def enroll_account(req: EnrollRequest):
             "transactions": len(data.get("transactions", [])),
         }
         finish_sync(job_id, status="completed")
+        sync_result["background_analyst_refresh"] = _maybe_queue_mira_background_refresh(
+            background_tasks=background_tasks,
+            profile=profile_record["id"],
+            reason="enrollment_sync_completed",
+        )
     except Exception as e:
         finish_sync(job_id, status="failed", error=str(e))
         logger.warning("Post-enrollment sync failed (non-fatal): %s", e)
@@ -2834,6 +5421,11 @@ def simplefin_claim(req: SimpleFINClaimRequest, background_tasks: BackgroundTask
             update_phase(job_id, "starting", "Starting SimpleFIN initial sync")
             fetch_simplefin_data(sync_job_id=job_id)
             finish_sync(job_id, status="completed")
+            _maybe_queue_mira_background_refresh(
+                background_tasks=None,
+                profile=profile_record["id"],
+                reason="simplefin_initial_sync_completed",
+            )
         except Exception as e:
             finish_sync(job_id, status="failed", error=str(e))
             logger.warning("Post-claim SimpleFIN background sync failed: %s", e)
@@ -2877,7 +5469,7 @@ def simplefin_deactivate(body: SimpleFINDeactivate):
 
 
 @app.post("/api/simplefin/sync")
-def simplefin_sync():
+def simplefin_sync(background_tasks: BackgroundTasks):
     """Trigger a SimpleFIN-only sync (does not touch Teller)."""
     _require_live_mode("SimpleFIN sync is disabled in demo mode.")
     job_id = start_sync("simplefin", phase="starting", detail="Starting SimpleFIN sync")
@@ -2885,11 +5477,25 @@ def simplefin_sync():
         data = fetch_simplefin_data(sync_job_id=job_id)
         finish_sync(job_id, status="completed")
         _invalidate_copilot_cache()
+        background_refresh = _maybe_queue_mira_background_refresh(
+            background_tasks=background_tasks,
+            profile=None,
+            reason="simplefin_sync_completed",
+        )
+        with get_db() as conn:
+            money_outlook_refresh = _maybe_queue_mira_money_outlook_refresh(
+                background_tasks=background_tasks,
+                conn=conn,
+                profile=None,
+                reason="simplefin_sync_completed",
+            )
         return {
             "status": "synced",
             "accounts": len(data.get("accounts", [])),
             "transactions": len(data.get("transactions", [])),
             "last_updated": data.get("last_updated"),
+            "background_analyst_refresh": background_refresh,
+            "money_outlook_refresh": money_outlook_refresh,
         }
     except Exception as exc:
         finish_sync(job_id, status="failed", error=str(exc))

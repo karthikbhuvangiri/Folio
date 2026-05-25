@@ -164,6 +164,7 @@ class EvidencePacket:
     tool_results: list[dict[str, Any]] = field(default_factory=list)
     facts: list[dict[str, Any]] = field(default_factory=list)
     rows: list[dict[str, Any]] = field(default_factory=list)
+    display_rows: list[dict[str, Any]] = field(default_factory=list)
     charts: list[dict[str, Any]] = field(default_factory=list)
     caveats: list[str] = field(default_factory=list)
     provenance: dict[str, Any] = field(default_factory=dict)

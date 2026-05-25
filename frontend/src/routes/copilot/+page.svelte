@@ -2,7 +2,7 @@
     import '$lib/styles/copilot.css';
     import { goto } from '$app/navigation';
     import { page } from '$app/stores';
-    import { onMount, tick } from 'svelte';
+    import { onDestroy, onMount, tick } from 'svelte';
     import { api, invalidateCache } from '$lib/api.js';
     import { activeProfile, profiles } from '$lib/stores/profileStore.js';
     import { formatCurrency, formatDate } from '$lib/utils.js';
@@ -27,7 +27,30 @@
     let copilotModel = '';
     let copilotModelSaving = false;
     let copilotModelInstalling = false;
-    let appConfig = { receiptIntelligenceEnabled: false, miraAgenticRuntime: 'current' };
+    let modelDropdownOpen = false;
+    let appConfig = {
+        receiptIntelligenceEnabled: false,
+        miraAgenticRuntime: 'current',
+        miraAdvisorReadUiEnabled: false,
+        miraAdvisorReadContextEnabled: false,
+        miraAdvisorReadGenerationEnabled: false,
+        miraFinancialFeedbackLoopEnabled: false,
+    };
+    let advisorRead = null;
+    let advisorReadEnabled = false;
+    let advisorReadContextEnabled = false;
+    let advisorReadGenerationEnabled = false;
+    let advisorReadJob = { status: 'idle' };
+    let advisorReadLoading = false;
+    let advisorReadGenerating = false;
+    let advisorReadExpanded = false;
+    let advisorReadPanelExpanded = true;
+    let advisorReadSelectedCardId = '';
+    let advisorReadPollTimer = null;
+    let advisorReadThreadActive = false;
+    let advisorReadThreadMemoId = null;
+    let advisorCorrectionCardId = null;
+    let advisorCorrectionText = '';
 
     let receiptsOpen = false;
     let receiptFile = null;
@@ -86,6 +109,21 @@
         return out;
     }
 
+    function combinePreviewAndFinalAnswer(preview, finalAnswer, answerGuard = null) {
+        const previewText = scrubMemoryTags(preview || '').trim();
+        const finalText = scrubMemoryTags(finalAnswer || '').trim();
+        if (!previewText) return finalText;
+        if (answerGuard?.preview_only) return previewText;
+        if (!finalText) return previewText;
+        const normalize = (value) => String(value || '').toLowerCase().replace(/\s+/g, ' ').trim();
+        const previewNorm = normalize(previewText);
+        const finalNorm = normalize(finalText);
+        if (previewNorm === finalNorm || finalNorm.includes(previewNorm) || previewNorm.includes(finalNorm)) {
+            return finalText.length >= previewText.length ? finalText : previewText;
+        }
+        return `${previewText}\n\n${finalText}`;
+    }
+
     function profileGreetingName(profileId) {
         const raw = String(profileId || '').trim();
         if (!raw || raw === 'household') return 'you';
@@ -99,10 +137,124 @@
         return `Hey ${name}. There you are.\n\nWhere do you want to start?`;
     }
 
-    function modelFamilyName(modelId, modelMeta) {
-        const raw = String(modelMeta?.display_name || modelMeta?.label || modelMeta?.name || modelId || '').trim();
-        const first = raw.split(/[\s:/_-]+/).filter(Boolean)[0] || 'local model';
-        return first.charAt(0).toUpperCase() + first.slice(1);
+    function advisorTableCells(line) {
+        return String(line || '')
+            .trim()
+            .replace(/^\|/, '')
+            .replace(/\|$/, '')
+            .split('|')
+            .map((cell) => cell.trim());
+    }
+
+    function advisorTableDivider(cells) {
+        return cells.length > 0 && cells.every((cell) => /^:?-{3,}:?$/.test(String(cell || '').replace(/\s/g, '')));
+    }
+
+    function advisorMemoHeadingText(line) {
+        const heading = String(line || '').replace(/^#+\s*/, '');
+        if (['Where The Money Is Going', 'Where Money Is Going', 'Where Money Goes', 'Where Your Money Actually Goes'].includes(heading)) {
+            return 'The Money Map';
+        }
+        return heading;
+    }
+
+    function advisorMemoBlocks(markdown) {
+        const lines = String(markdown || '')
+            .split(/\n+/)
+            .map((line) => line.trim())
+            .filter(Boolean);
+        const blocks = [];
+        for (let index = 0; index < lines.length; index += 1) {
+            const line = lines[index];
+            if (line.startsWith('|') && line.endsWith('|')) {
+                const tableLines = [];
+                while (index < lines.length && lines[index].startsWith('|') && lines[index].endsWith('|')) {
+                    tableLines.push(lines[index]);
+                    index += 1;
+                }
+                index -= 1;
+                const tableRows = tableLines.map(advisorTableCells).filter((row) => row.some(Boolean));
+                const headers = tableRows[0] || [];
+                const rows = tableRows.slice(1).filter((row) => !advisorTableDivider(row));
+                if (headers.length && rows.length) {
+                    blocks.push({
+                        type: 'table',
+                        headers,
+                        rows: rows.map((row) => headers.map((_, cellIndex) => row[cellIndex] || ''))
+                    });
+                    continue;
+                }
+                tableLines.forEach((rawLine) => blocks.push({ type: 'paragraph', text: rawLine }));
+                continue;
+            }
+            if (line.startsWith('## ')) blocks.push({ type: 'heading', text: advisorMemoHeadingText(line) });
+            else if (line.startsWith('# ')) blocks.push({ type: 'heading', text: advisorMemoHeadingText(line) });
+            else if (line.startsWith('- ')) blocks.push({ type: 'bullet', text: line.slice(2).trim() });
+            else blocks.push({ type: 'paragraph', text: line.replace(/^#+\s*/, '') });
+        }
+        return blocks.filter((block) => block.type === 'table' || block.text);
+    }
+
+    function advisorDeltaDetail(delta) {
+        if (!delta) return '';
+        const months = Array.isArray(delta.touched_months) ? delta.touched_months.filter(Boolean).join(', ') : '';
+        const sections = Array.isArray(delta.changed_sections) ? delta.changed_sections.filter(Boolean).slice(0, 2).join(', ') : '';
+        if (months && sections) return `${months} · ${sections}`;
+        if (months) return months;
+        if (sections) return sections;
+        return delta.action || 'Stored update available.';
+    }
+
+    function advisorCardRows(card) {
+        return Array.isArray(card?.rows) ? card.rows.filter((row) => row?.label) : [];
+    }
+
+    const advisorPriorityCardIds = ['first_move', 'event_noise', 'biggest_risk'];
+
+    function advisorCardById(cards, id) {
+        return (cards || []).find((card) => card?.id === id) || null;
+    }
+
+    function advisorPriorityCards(cards) {
+        const chosen = advisorPriorityCardIds
+            .map((id) => advisorCardById(cards, id))
+            .filter(Boolean);
+        if (chosen.length >= 3) return chosen.slice(0, 3);
+        const used = new Set(chosen.map((card) => card.id));
+        const fallback = (cards || []).filter((card) => (
+            card?.id
+            && !used.has(card.id)
+            && !['normal_month', 'money_map', 'what_changed'].includes(card.id)
+        ));
+        return [...chosen, ...fallback].slice(0, 3);
+    }
+
+    function advisorSummaryText(cards, blocks) {
+        const firstMove = advisorCardById(cards, 'first_move');
+        const risk = advisorCardById(cards, 'biggest_risk');
+        const eventNoise = advisorCardById(cards, 'event_noise');
+        return (
+            firstMove?.summary
+            || risk?.summary
+            || eventNoise?.summary
+            || blocks?.find((block) => block.type === 'paragraph')?.text
+            || 'Mira has a stored read on what matters most in your finances right now.'
+        );
+    }
+
+    function advisorPreviewRows(card, limit = 3) {
+        return advisorCardRows(card).slice(0, limit);
+    }
+
+    function advisorMoneyMapIcon(label) {
+        const value = String(label || '').toLowerCase();
+        if (value.includes('shop')) return 'shopping_bag';
+        if (value.includes('travel') || value.includes('flight')) return 'flight';
+        if (value.includes('tax')) return 'account_balance';
+        if (value.includes('subscription') || value.includes('recurring')) return 'credit_card';
+        if (value.includes('food') || value.includes('restaurant')) return 'restaurant';
+        if (value.includes('home') || value.includes('rent')) return 'home';
+        return 'category';
     }
 
     let messages = [
@@ -115,6 +267,7 @@
             preview_changes: [],
             needs_confirmation: false,
             rows_affected: 0,
+            rows_total: 0,
             is_welcome: true
         }
     ];
@@ -213,9 +366,33 @@
         ? localLlmCatalog.tiers.flatMap((tier) => tier.models.filter((model) => model.task_fit?.includes('copilot')))
         : [];
     $: selectedCopilotModelMeta = copilotModelOptions.find((model) => model.id === copilotModel) || null;
-    $: copilotModelFamily = modelFamilyName(copilotModel, selectedCopilotModelMeta);
+    $: copilotModelLabel = selectedCopilotModelMeta
+        ? `${selectedCopilotModelMeta.label}${selectedCopilotModelMeta.download_size_gb || selectedCopilotModelMeta.approx_size_gb ? ` · ${selectedCopilotModelMeta.download_size_gb || selectedCopilotModelMeta.approx_size_gb} GB` : ''}`
+        : (copilotModel || 'No model selected');
     $: showMiraDebug = ['1', 'true', 'mira', 'all'].includes(($page.url.searchParams.get('debugMira') || '').toLowerCase());
-
+    $: advisorReadVisible = advisorReadEnabled || appConfig.miraAdvisorReadUiEnabled;
+    $: advisorReadFollowupEnabled = advisorReadContextEnabled || appConfig.miraAdvisorReadContextEnabled;
+    $: advisorReadCanGenerate = advisorReadGenerationEnabled || appConfig.miraAdvisorReadGenerationEnabled;
+    $: advisorReadJobRunning = ['queued', 'running'].includes(advisorReadJob?.status);
+    $: advisorReadTitle = advisorRead
+        ? 'Your financial portrait'
+        : (advisorReadJobRunning || advisorReadGenerating ? 'Preparing your financial read' : 'Ready to generate your financial read');
+    $: advisorReadBlocks = advisorMemoBlocks(advisorRead?.memo_markdown);
+    $: advisorReadCards = Array.isArray(advisorRead?.cards)
+        ? advisorRead.cards.filter((card) => card && (card.summary || (Array.isArray(card.rows) && card.rows.length > 0)))
+        : [];
+    $: advisorReadHasCards = advisorReadCards.length > 0;
+    $: advisorReadPriorityCards = advisorPriorityCards(advisorReadCards);
+    $: advisorReadMoneyMapCard = advisorCardById(advisorReadCards, 'money_map');
+    $: advisorReadMoneyMapRows = advisorPreviewRows(advisorReadMoneyMapCard, 4);
+    $: advisorReadSelectedCard = advisorCardById(advisorReadCards, advisorReadSelectedCardId);
+    $: advisorReadSelectedRows = advisorCardRows(advisorReadSelectedCard);
+    $: advisorReadSummary = advisorSummaryText(advisorReadCards, advisorReadBlocks);
+    $: visibleAdvisorReadBlocks = advisorReadExpanded ? advisorReadBlocks : advisorReadBlocks.slice(0, 5);
+    $: advisorReadPreparedLabel = advisorRead?.generated_at ? `Prepared ${formatDate(advisorRead.generated_at)}` : 'Stored local read';
+    $: advisorReadDelta = advisorRead?.delta || null;
+    $: advisorReadDeltaHeadline = advisorReadDelta?.headline || 'This read is current';
+    $: advisorReadDeltaDetail = advisorReadDelta ? advisorDeltaDetail(advisorReadDelta) : 'No stored fact changes since this read.';
     $: if (messages.length === 1 && messages[0]?.is_welcome) {
         const nextWelcome = miraWelcome(activeProfileId);
         if (messages[0].content !== nextWelcome) {
@@ -236,8 +413,14 @@
         } catch (e) { categories = []; }
     });
 
+    onDestroy(() => {
+        if (advisorReadPollTimer) clearTimeout(advisorReadPollTimer);
+    });
+
     $: if (activeProfileId && lastLoadedProfile !== undefined && activeProfileId !== lastLoadedProfile) {
         lastLoadedProfile = activeProfileId;
+        advisorReadThreadActive = false;
+        advisorReadThreadMemoId = null;
         refreshSidebar();
         if (receiptsOpen && appConfig.receiptIntelligenceEnabled) {
             receiptDraft = null;
@@ -312,6 +495,7 @@
         if (typeof value === 'boolean') return value ? 'Yes' : 'No';
         if (typeof value === 'number') {
             const currencyKeys = ['amount', 'total', 'balance', 'sum', 'avg', 'spent', 'income', 'expense', 'net', 'owed', 'assets', 'budget'];
+            currencyKeys.push('remaining', 'monthly', 'annual', 'safe_to_spend', 'cash', 'flow');
             if (currencyKeys.some((token) => key.toLowerCase().includes(token))) return formatCurrency(value, 2);
             return Number.isInteger(value) ? value.toString() : value.toFixed(2);
         }
@@ -326,7 +510,131 @@
 
     function getColumns(data) {
         if (!data || data.length === 0) return [];
-        return Object.keys(data[0]);
+        const columns = [];
+        for (const row of data) {
+            if (!row || typeof row !== 'object' || Array.isArray(row)) continue;
+            for (const key of Object.keys(row)) {
+                if (!columns.includes(key)) columns.push(key);
+            }
+        }
+        return columns;
+    }
+
+    const RECEIPT_INTERNAL_KEYS = new Set([
+        'step_id', 'tool', 'tool_name', 'execution_tool', 'execution_tool_name',
+        'metric_id', 'metric_definition_summary', 'calculation_basis',
+        'source_step_id', 'selector_call_id', 'raw_sql', 'sql'
+    ]);
+
+    const RECEIPT_LABELS = {
+        merchant_query: 'Merchant',
+        merchant: 'Merchant',
+        merchant_name: 'Merchant',
+        category: 'Category',
+        range: 'Period',
+        month: 'Month',
+        start: 'Start',
+        end: 'End',
+        total: 'Total',
+        amount: 'Amount',
+        balance: 'Balance',
+        income: 'Income',
+        expenses: 'Expenses',
+        net: 'Net',
+        net_flow: 'Net flow',
+        count: 'Count',
+        txn_count: 'Transactions',
+        row_count: 'Rows',
+        total_matching_transactions: 'Matches',
+        confidence: 'Confidence'
+    };
+
+    function compactReceiptLabel(key) {
+        return RECEIPT_LABELS[key] || key.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+    }
+
+    function receiptValue(key, value) {
+        if (value === null || value === undefined || value === '') return '';
+        if (Array.isArray(value) || (typeof value === 'object' && value !== null)) return '';
+        if (typeof value === 'number') {
+            const k = key.toLowerCase();
+            if (/(amount|total|balance|income|expenses|expense|net|flow|budget|remaining|spent|owed)/.test(k)) {
+                return formatCurrency(value, 2);
+            }
+            return Number.isInteger(value) ? String(value) : value.toFixed(2);
+        }
+        if (typeof value === 'string' && /^\d{4}-\d{2}-\d{2}/.test(value)) return formatDate(value);
+        return String(value);
+    }
+
+    function addReceiptLine(lines, line) {
+        const clean = String(line || '').trim();
+        if (!clean || lines.includes(clean)) return;
+        lines.push(clean);
+    }
+
+    function firstEvidenceFact(msg) {
+        const facts = Array.isArray(msg?.evidence?.facts) ? msg.evidence.facts : [];
+        return facts.find(f => f && typeof f === 'object') || null;
+    }
+
+    function evidenceCaveats(msg) {
+        const fact = firstEvidenceFact(msg) || {};
+        const caveats = [];
+        const direct = Array.isArray(msg?.evidence?.caveats) ? msg.evidence.caveats : [];
+        const factCaveats = Array.isArray(fact.caveats) ? fact.caveats : [];
+        const confidenceCaveat = fact?.confidence_summary?.caveat;
+        for (const caveat of [...direct, ...factCaveats, confidenceCaveat]) {
+            const clean = String(caveat || '').trim();
+            if (clean && !caveats.includes(clean)) caveats.push(clean);
+        }
+        return caveats;
+    }
+
+    function chatReceipt(msg) {
+        if (!msg || msg.role !== 'assistant' || msg.operation === 'streaming' || msg.operation === 'error') return null;
+        if (msg.needs_confirmation) return null;
+
+        const evidence = msg.evidence && typeof msg.evidence === 'object' ? msg.evidence : null;
+        const fact = firstEvidenceFact(msg);
+        const hasGrounding =
+            evidence ||
+            (Array.isArray(msg.data) && msg.data.length > 0) ||
+            (msg.chart && Array.isArray(msg.chart.labels) && msg.chart.labels.length > 0);
+        if (!hasGrounding) return null;
+
+        const lines = [];
+        const record = fact || (Array.isArray(msg.data) && msg.data.length > 0 ? msg.data[0] : {});
+        const subject = record.merchant_query || record.merchant || record.merchant_name || record.category || record.summary;
+        const range = record.range || record.month || (record.start && record.end ? `${record.start} to ${record.end}` : '');
+        if (subject || range) {
+            addReceiptLine(lines, [subject, range].filter(Boolean).map(String).join(' · '));
+        }
+
+        const totalRows = Number(msg.rows_total || evidence?.display_row_count || evidence?.row_count || 0);
+        const shownRows = Array.isArray(msg.data) ? msg.data.length : 0;
+        if (totalRows > 0 && shownRows > 0 && totalRows > shownRows) {
+            addReceiptLine(lines, `Showing ${shownRows} of ${totalRows} matching rows.`);
+        } else if (totalRows > 0) {
+            addReceiptLine(lines, `Counted ${totalRows} matching row${totalRows === 1 ? '' : 's'}.`);
+        } else if (shownRows > 0) {
+            addReceiptLine(lines, `Showing ${shownRows} row${shownRows === 1 ? '' : 's'} from Folio data.`);
+        }
+
+        for (const key of ['total', 'amount', 'balance', 'income', 'expenses', 'net', 'net_flow', 'count', 'txn_count', 'total_matching_transactions', 'confidence']) {
+            if (!record || !(key in record) || RECEIPT_INTERNAL_KEYS.has(key)) continue;
+            const value = receiptValue(key, record[key]);
+            if (value) addReceiptLine(lines, `${compactReceiptLabel(key)}: ${value}`);
+            if (lines.length >= 5) break;
+        }
+
+        if (msg.chart && Array.isArray(msg.chart.labels) && msg.chart.labels.length > 0) {
+            addReceiptLine(lines, `Chart uses ${msg.chart.labels.length} plotted point${msg.chart.labels.length === 1 ? '' : 's'}.`);
+        }
+
+        const caveats = evidenceCaveats(msg);
+        if (lines.length === 0 && caveats.length === 0) return null;
+        return { lines: lines.slice(0, 5), caveats: caveats.slice(0, 2) };
     }
 
     function pushAssistantMessage(content, operation = null, extras = {}) {
@@ -335,26 +643,39 @@
             content,
             operation,
             data: extras.data || null,
+            evidence: extras.evidence || null,
             sql: extras.sql || null,
             preview_changes: extras.preview_changes || [],
             confirmation_id: extras.confirmation_id || null,
             needs_confirmation: extras.needs_confirmation || false,
             rows_affected: extras.rows_affected || 0,
-            original_question: extras.original_question || null
+            rows_total: extras.rows_total || 0,
+            original_question: extras.original_question || null,
+            answer_context: extras.answer_context || null,
+            answer_guard: extras.answer_guard || null,
+            trace: extras.trace || null,
         }];
     }
 
     async function refreshSidebar() {
         sidebarLoading = true;
+        advisorReadLoading = true;
         try {
-            const [recurringResult, historyResult] = await Promise.all([
+            const [recurringResult, historyResult, advisorResult] = await Promise.all([
                 api.getRecurring().catch(() => null),
                 api.getCopilotHistory(20, activeProfileId).catch(() => ({ items: [] })),
+                api.getMiraAdvisorRead(activeProfileId).catch(() => ({ enabled: false, memo: null })),
             ]);
             recurringData = recurringResult;
             historyItems = historyResult?.items || [];
+            advisorReadEnabled = Boolean(advisorResult?.enabled);
+            advisorReadContextEnabled = Boolean(advisorResult?.context_enabled);
+            advisorReadGenerationEnabled = Boolean(advisorResult?.generation_enabled);
+            advisorReadJob = advisorResult?.job || { status: 'idle' };
+            advisorRead = advisorResult?.memo || null;
         } finally {
             sidebarLoading = false;
+            advisorReadLoading = false;
         }
     }
 
@@ -377,12 +698,20 @@
         try {
             appConfig = { ...appConfig, ...(await api.getAppConfig()) };
         } catch (error) {
-            appConfig = { ...appConfig, receiptIntelligenceEnabled: false };
+            appConfig = {
+                ...appConfig,
+                receiptIntelligenceEnabled: false,
+                miraAdvisorReadUiEnabled: false,
+                miraAdvisorReadContextEnabled: false,
+                miraAdvisorReadGenerationEnabled: false,
+                miraFinancialFeedbackLoopEnabled: false,
+            };
         }
     }
 
     async function updateCopilotModelSelection(nextModel) {
-        if (!nextModel || nextModel === localLlmStatus?.selectedCopilotModel || copilotModelSaving) return;
+        if (!localLlmStatus?.expertMode || !nextModel || nextModel === localLlmStatus?.selectedCopilotModel || copilotModelSaving) return;
+        modelDropdownOpen = false;
         copilotModelSaving = true;
         try {
             const result = await api.updateLocalLlmSettings({ copilot_model: nextModel });
@@ -399,6 +728,19 @@
         } finally {
             copilotModelSaving = false;
         }
+    }
+
+    function selectCopilotModel(model) {
+        if (!model || !localLlmStatus?.expertMode || modelRequiresAdvanced(model) && !localLlmStatus?.expertMode || copilotModelSaving) return;
+        if (model.id === copilotModel) {
+            modelDropdownOpen = false;
+            return;
+        }
+        updateCopilotModelSelection(model.id);
+    }
+
+    function modelRequiresAdvanced(model) {
+        return !!(model?.expert_only || model?.advanced_only || model?.validated_for_mira !== true);
     }
 
     async function installCopilotModel() {
@@ -483,9 +825,109 @@
         loading = false;
     }
 
+    function advisorReadFollowupHistory() {
+        let start = Math.max(0, messages.length - 8);
+        for (let i = messages.length - 1; i >= 0; i--) {
+            if (messages[i]?.role === 'assistant' && messages[i]?.operation === 'advisor_read_followup') {
+                start = Math.max(0, i - 1);
+                break;
+            }
+        }
+        return messages
+            .slice(start)
+            .filter((m) => m && m.content && (m.role === 'user' || m.role === 'assistant'))
+            .slice(-6)
+            .map((m) => ({
+                role: m.role,
+                content: String(m.content || '').slice(0, 1200),
+                operation: m.operation || null,
+            }));
+    }
+
+    function latestAssistantWasAdvisorReadFollowup() {
+        for (let i = messages.length - 1; i >= 0; i--) {
+            const msg = messages[i];
+            if (!msg || msg.role !== 'assistant' || msg.operation === 'streaming') continue;
+            return msg.operation === 'advisor_read_followup';
+        }
+        return false;
+    }
+
+    function looksLikeLiveFolioRequest(question) {
+        const text = String(question || '').trim().toLowerCase();
+        if (!text || text.startsWith('/')) return true;
+        const commandStarts = [
+            'show me ', 'list ', 'plot ', 'chart ', 'graph ', 'open ', 'create ',
+            'update ', 'change ', 'rename ', 'categorize ', 'recategorize ', 'mark ',
+            'sync ', 'refresh ', 'save ', 'remember ',
+        ];
+        if (commandStarts.some((prefix) => text.startsWith(prefix))) return true;
+        const liveTerms = ['transactions', 'transaction list', 'receipt', 'receipts', 'chart', 'plot', 'graph'];
+        if (liveTerms.some((term) => text.includes(term))) return true;
+        const exactTerms = ['how much', 'exact', 'total', 'sum ', 'spent at ', 'spend at ', 'budget'];
+        return exactTerms.some((term) => text.includes(term));
+    }
+
+    function shouldRouteTypedAdvisorReadFollowup(question) {
+        if (!advisorRead || !advisorReadFollowupEnabled || advisorReadJobRunning || advisorReadGenerating) return false;
+        if (advisorReadThreadMemoId && advisorRead?.id && advisorReadThreadMemoId !== advisorRead.id) return false;
+        if (!(advisorReadThreadActive || latestAssistantWasAdvisorReadFollowup())) return false;
+        return !looksLikeLiveFolioRequest(question);
+    }
+
+    async function sendAdvisorReadFollowup(followupType, question) {
+        const trimmed = String(question || '').trim();
+        if (!trimmed) return;
+        if (loading) stopStream();
+        const history = advisorReadFollowupHistory();
+        messages = [...messages, {
+            role: 'user',
+            content: trimmed,
+            operation: null,
+            data: null,
+            evidence: null,
+            sql: null,
+            preview_changes: [],
+            needs_confirmation: false,
+            rows_affected: 0
+        }];
+        input = '';
+        loading = true;
+        await tick();
+        scrollToBottom();
+        try {
+            const result = await api.askMiraAdvisorReadFollowup(followupType, trimmed, activeProfileId, history);
+            pushAssistantMessage(result.answer || "Mira couldn't answer from the stored read cleanly.", result.operation || 'advisor_read_followup', {
+                original_question: trimmed,
+                answer_context: result.answer_context || null,
+                answer_guard: result.answer_guard || null,
+                trace: { runtime: 'advisor_read_followup', answer_path: result.answer_guard?.path || 'advisor_read_followup' },
+            });
+            advisorReadThreadActive = true;
+            advisorReadThreadMemoId = result.memo_id || advisorRead?.id || null;
+        } catch (error) {
+            advisorReadThreadActive = false;
+            advisorReadThreadMemoId = null;
+            pushAssistantMessage(error?.message || "Mira couldn't answer from the stored read.", 'error', {
+                original_question: trimmed,
+            });
+        } finally {
+            loading = false;
+            await tick();
+            scrollToBottom();
+        }
+    }
+
     async function send() {
         const question = input.trim();
         if (!question) return;
+
+        if (shouldRouteTypedAdvisorReadFollowup(question)) {
+            await sendAdvisorReadFollowup('general', question);
+            return;
+        }
+        advisorReadThreadActive = false;
+        advisorReadThreadMemoId = null;
 
         // Cancel any in-flight request (cancel-on-resubmit)
         if (loading) stopStream();
@@ -495,6 +937,7 @@
             content: question,
             operation: null,
             data: null,
+            evidence: null,
             sql: null,
             preview_changes: [],
             needs_confirmation: false,
@@ -557,6 +1000,7 @@
             preview_changes: [],
             needs_confirmation: false,
             rows_affected: 0,
+            rows_total: 0,
             original_question: question,
             tool_trace: [],
             trace: null,
@@ -570,6 +1014,8 @@
         scrollToBottom();
 
         let currentContent = '';
+        let evidencePreviewShown = false;
+        let previewAnswer = '';
         cancelStream = api.askCopilotStream(question, activeProfileId, history, (ev) => {
             const msg = { ...messages[streamIdx] };
             switch (ev.type) {
@@ -596,12 +1042,18 @@
                     break;
                 case 'reset_text':
                     currentContent = '';
-                    msg.content = '';
+                    if (!evidencePreviewShown) {
+                        msg.content = '';
+                    }
                     break;
                 case 'token':
                     currentContent += ev.text || '';
-                    msg.content = scrubMemoryTags(currentContent);
-                    msg.progress = null;
+                    if (evidencePreviewShown) {
+                        msg.progress = previewAnswer ? null : 'Reading the evidence';
+                    } else {
+                        msg.content = scrubMemoryTags(currentContent);
+                        msg.progress = null;
+                    }
                     break;
                 case 'tool_call':
                     msg.active_tool = ev.name;
@@ -610,6 +1062,25 @@
                     break;
                 case 'chart':
                     msg.chart = ev.chart;
+                    break;
+                case 'evidence_preview':
+                    evidencePreviewShown = true;
+                    if (ev.data) msg.data = ev.data;
+                    if (ev.data_source) msg.data_source = ev.data_source;
+                    if (ev.evidence) msg.evidence = ev.evidence;
+                    if (ev.chart) msg.chart = ev.chart;
+                    if (ev.tool_trace && ev.tool_trace.length > 0) msg.tool_trace = ev.tool_trace;
+                    msg.operation = 'read';
+                    msg.rows_affected = Array.isArray(ev.data) ? ev.data.length : (ev.rows_affected || msg.rows_affected || 0);
+                    msg.rows_total = ev.rows_total || msg.rows_total || msg.rows_affected || 0;
+                    msg.progress = msg.content?.trim() ? null : 'Reading the evidence';
+                    break;
+                case 'preview_answer':
+                    previewAnswer = scrubMemoryTags(ev.text || '').trim();
+                    if (previewAnswer) {
+                        msg.content = previewAnswer;
+                        msg.progress = null;
+                    }
                     break;
                 case 'tool_result': {
                     msg.active_tool = null;
@@ -625,19 +1096,26 @@
                     break;
                 }
                 case 'done':
-                    msg.content = (ev.answer || currentContent || '').trim();
+                    if (evidencePreviewShown) {
+                        msg.content = combinePreviewAndFinalAnswer(previewAnswer, ev.answer || currentContent || '', ev.answer_guard);
+                    } else if (!(ev.evidence_attach_only || ev.answer_guard?.evidence_attach_only) || !msg.content?.trim()) {
+                        msg.content = (ev.answer || currentContent || '').trim();
+                    }
                     msg.data = ev.data || null;
                     msg.data_source = ev.data_source || null;
+                    msg.evidence = ev.evidence || msg.evidence || null;
                     msg.tool_trace = (ev.tool_trace && ev.tool_trace.length > 0)
                         ? ev.tool_trace
                         : (msg.tool_trace || []);
                     msg.active_tool = null;
                     msg.progress = null;
                     msg.memory_proposals = ev.memory_proposals || [];
+                    msg.suggested_memory = ev.suggested_memory || null;
                     msg.dialogue_state = ev.dialogue_state || ev.route?.dialogue_state || null;
                     msg.answer_context = ev.answer_context || null;
                     msg.trace = ev.trace || ev.route?.trace || msg.trace || null;
                     msg.answer_guard = ev.answer_guard || null;
+                    msg.rows_total = ev.rows_total || msg.rows_total || (Array.isArray(ev.data) ? ev.data.length : 0);
                     msg.runtime = ev.trace?.runtime || ev.route?.mira_planner || ev.route?.trace?.runtime || msg.runtime || null;
                     if (ev.chart) msg.chart = ev.chart;
                     if (ev.pending_write) {
@@ -647,9 +1125,11 @@
                         msg.preview_changes = ev.pending_write.preview_changes || [];
                         msg.needs_confirmation = true;
                         msg.rows_affected = ev.pending_write.rows_affected || 0;
+                        msg.rows_total = msg.rows_affected;
                     } else {
                         msg.operation = 'read';
                         msg.rows_affected = Array.isArray(ev.data) ? ev.data.length : 0;
+                        msg.rows_total = ev.rows_total || msg.rows_total || msg.rows_affected;
                     }
                     loading = false;
                     cancelStream = null;
@@ -667,6 +1147,9 @@
                             if (!seen.has(p.id)) merged.push(p);
                         }
                         msg.memory_proposals = merged;
+                        if (ev.suggested_memory) {
+                            msg.suggested_memory = ev.suggested_memory;
+                        }
                     }
                     break;
                 case 'error':
@@ -743,6 +1226,50 @@
         } catch (error) {
             setNotice(error?.message || 'Failed to reject proposal.');
         }
+    }
+
+    async function acceptSuggestedMemory(msgIndex) {
+        const msg = messages[msgIndex];
+        const suggestion = msg?.suggested_memory;
+        if (!suggestion || suggestion.saving) return;
+
+        messages[msgIndex] = {
+            ...msg,
+            suggested_memory: { ...suggestion, saving: true }
+        };
+        messages = [...messages];
+
+        try {
+            const result = await api.createMiraMemory({
+                text: suggestion.text,
+                memory_type: suggestion.memory_type || suggestion.type,
+                topic: suggestion.topic,
+                source_summary: suggestion.reason || suggestion.evidence || ''
+            }, activeProfileId);
+            const next = { ...messages[msgIndex], suggested_memory: null };
+            messages[msgIndex] = next;
+            messages = [...messages];
+            if (result?.saved) {
+                setNotice(`Remembered: ${result.memory?.normalized_text || suggestion.text}`);
+            } else {
+                setNotice(result?.reason || 'I did not save that as memory.');
+            }
+        } catch (error) {
+            const latest = messages[msgIndex] || msg;
+            messages[msgIndex] = {
+                ...latest,
+                suggested_memory: { ...suggestion, saving: false }
+            };
+            messages = [...messages];
+            setNotice(error?.message || 'Failed to save memory.');
+        }
+    }
+
+    function dismissSuggestedMemory(msgIndex) {
+        const msg = messages[msgIndex];
+        if (!msg?.suggested_memory) return;
+        messages[msgIndex] = { ...msg, suggested_memory: null };
+        messages = [...messages];
     }
 
     async function confirmWrite(msgIndex) {
@@ -894,6 +1421,179 @@
         } else {
             activeChip = chip.id;
             chipFormValues = {};
+        }
+    }
+
+    async function askAboutAdvisorRead(followupType, seed) {
+        await sendAdvisorReadFollowup(followupType, seed);
+    }
+
+    function toggleAdvisorReadFull() {
+        if (!advisorRead) return;
+        advisorReadPanelExpanded = true;
+        advisorReadExpanded = !advisorReadExpanded;
+    }
+
+    function handleAdvisorReadHeroKeydown(event) {
+        if (!advisorRead || !['Enter', ' '].includes(event.key)) return;
+        event.preventDefault();
+        toggleAdvisorReadFull();
+    }
+
+    async function askAboutAdvisorCard(card) {
+        if (!card) return;
+        const followupType = card.followup_type || 'general';
+        const question = card.question || `Tell me more about ${card.title || "Mira's read"}.`;
+        await sendAdvisorReadFollowup(followupType, question);
+    }
+
+    function advisorCardFeedbackSummary(card) {
+        const feedback = card?.feedback || {};
+        const types = feedback.feedback_types || {};
+        if (types.too_sensitive) return 'Marked sensitive';
+        if (types.corrected) return 'Corrected';
+        if (types.more_like_this) return 'More like this';
+        if (types.less_like_this || types.dismissed) return 'Less often';
+        if (types.snoozed) return 'Snoozed';
+        return '';
+    }
+
+    async function sendAdvisorCardFeedback(card, feedbackType, extra = {}) {
+        if (!card?.id || !appConfig.miraFinancialFeedbackLoopEnabled) return;
+        try {
+            const result = await api.createMiraFinancialFeedback({
+                feedback_type: feedbackType,
+                target_type: 'advisor_card',
+                target_id: card.id,
+                subject_type: 'advisor_read',
+                subject_key: card.id,
+                source: 'advisor_read',
+                metadata: {
+                    card_title: card.title || '',
+                    card_kicker: card.kicker || '',
+                },
+                ...extra,
+            }, activeProfileId);
+            if (result?.status === 'stored') {
+                setNotice('Got it. Mira will use that when shaping future reads.');
+                await refreshAdvisorRead();
+            } else if (result?.status === 'disabled') {
+                setNotice('Financial read feedback is disabled right now.');
+            }
+        } catch (error) {
+            setNotice(error?.message || "Mira couldn't save that feedback.");
+        }
+    }
+
+    function startAdvisorCardCorrection(card) {
+        if (!card?.id || !appConfig.miraFinancialFeedbackLoopEnabled) return;
+        advisorCorrectionCardId = card.id;
+        advisorCorrectionText = '';
+    }
+
+    function cancelAdvisorCardCorrection() {
+        advisorCorrectionCardId = null;
+        advisorCorrectionText = '';
+    }
+
+    async function submitAdvisorCardCorrection(card) {
+        if (!card?.id || advisorCorrectionCardId !== card.id || !advisorCorrectionText.trim()) return;
+        const title = card.title || "Mira's read";
+        await sendAdvisorCardFeedback(card, 'corrected', {
+            correction_text: advisorCorrectionText.trim(),
+            safe_summary: `User corrected Mira's framing for ${title}.`,
+        });
+        cancelAdvisorCardCorrection();
+    }
+
+    async function refreshAdvisorRead() {
+        if (advisorReadLoading) return;
+        advisorReadLoading = true;
+        try {
+            const result = await api.refreshMiraAdvisorRead(activeProfileId);
+            advisorReadEnabled = Boolean(result?.enabled);
+            advisorReadContextEnabled = Boolean(result?.context_enabled);
+            advisorReadGenerationEnabled = Boolean(result?.generation_enabled);
+            advisorReadJob = result?.job || { status: 'idle' };
+            advisorRead = result?.memo || null;
+            const preflight = result?.preflight || {};
+            if (preflight?.decision === 'keep_existing_delta') {
+                setNotice("Mira's stored read still has the same update.");
+            } else if (preflight?.decision === 'store_targeted_delta') {
+                setNotice("Mira noticed the stored read has a targeted update.");
+            } else if (preflight?.decision === 'queue_full_advisor_synthesis') {
+                setNotice("Mira thinks this read needs a fresh rebuild.");
+            } else {
+                setNotice(advisorRead ? "Mira's stored read is loaded." : "Mira hasn't stored a financial read yet.");
+            }
+        } catch (error) {
+            setNotice(error?.message || "Mira couldn't load her stored read.");
+        } finally {
+            advisorReadLoading = false;
+        }
+    }
+
+    function scheduleAdvisorReadPoll(profile = activeProfileId) {
+        if (advisorReadPollTimer) clearTimeout(advisorReadPollTimer);
+        advisorReadPollTimer = setTimeout(() => {
+            pollAdvisorRead(profile);
+        }, 5000);
+    }
+
+    async function pollAdvisorRead(profile = activeProfileId) {
+        try {
+            const result = await api.getMiraAdvisorRead(profile);
+            advisorReadEnabled = Boolean(result?.enabled);
+            advisorReadContextEnabled = Boolean(result?.context_enabled);
+            advisorReadGenerationEnabled = Boolean(result?.generation_enabled);
+            advisorReadJob = result?.job || { status: 'idle' };
+            advisorRead = result?.memo || advisorRead;
+            const status = advisorReadJob?.status;
+            if (['queued', 'running'].includes(status)) {
+                scheduleAdvisorReadPoll(profile);
+                return;
+            }
+            advisorReadGenerating = false;
+            if (status === 'completed') {
+                advisorRead = result?.memo || advisorRead;
+                setNotice("Mira's new financial read is ready.");
+            } else if (status === 'no_valid_memo') {
+                setNotice("Mira finished, but the read did not pass validation.");
+            } else if (status === 'error') {
+                setNotice("Mira couldn't generate the read. Check backend logs.");
+            }
+        } catch (error) {
+            advisorReadGenerating = false;
+            setNotice(error?.message || "Mira couldn't check advisor read status.");
+        }
+    }
+
+    async function generateAdvisorRead(force = true) {
+        if (advisorReadGenerating || advisorReadJobRunning) return;
+        if (!advisorReadCanGenerate) {
+            setNotice("Advisor read generation is disabled.");
+            return;
+        }
+        advisorReadGenerating = true;
+        try {
+            const result = await api.generateMiraAdvisorRead(force, activeProfileId);
+            advisorReadEnabled = Boolean(result?.enabled);
+            advisorReadContextEnabled = Boolean(result?.context_enabled);
+            advisorReadGenerationEnabled = Boolean(result?.generation_enabled);
+            advisorReadJob = result?.job || { status: result?.status || 'idle' };
+            advisorRead = result?.memo || advisorRead;
+            if (result?.status === 'disabled') {
+                advisorReadGenerating = false;
+                setNotice(result?.reason === 'generation_disabled'
+                    ? 'Advisor read generation is disabled.'
+                    : "Mira's read UI is disabled.");
+                return;
+            }
+            setNotice("Mira started generating a fresh financial read locally. This can take a few minutes.");
+            scheduleAdvisorReadPoll(activeProfileId);
+        } catch (error) {
+            advisorReadGenerating = false;
+            setNotice(error?.message || "Mira couldn't start advisor read generation.");
         }
     }
 
@@ -1092,6 +1792,10 @@
             await loadReceiptDraft(receiptId, receiptProfile);
             return;
         }
+        if ($page.url.searchParams.get('view') === 'receipts') {
+            openReceipts();
+            return;
+        }
         if (typeof sessionStorage === 'undefined') return;
         try {
             const saved = JSON.parse(sessionStorage.getItem(receiptReadyStorageKey) || 'null');
@@ -1228,40 +1932,44 @@
     }
 </script>
 
-<div class="flex flex-col gap-4">
-    <div class="flex items-start justify-between gap-4 flex-wrap fade-in">
-        <div class="flex items-center gap-3">
-            <div class="w-10 h-10 rounded-xl flex items-center justify-center copilot-hero-icon">
-                <span class="material-symbols-outlined text-white text-[18px]">auto_awesome</span>
+<div class="copilot-page">
+    <header class="copilot-identity-header fade-in">
+        <div class="copilot-brand-lockup">
+            <div class="copilot-brand-main">
+                <div class="copilot-brand-text">
+                    <h1 class="copilot-title">Mira</h1>
+                    <p class="copilot-subtitle">Your Folio companion, powered by Gemma.</p>
+                    <div class="copilot-identity-meta copilot-island-nav" aria-label="Mira sections">
+                        {#if appConfig.receiptIntelligenceEnabled}
+                            <button
+                                type="button"
+                                class="copilot-island-tab"
+                                class:copilot-island-tab-active={receiptsOpen}
+                                on:click={openReceipts}>
+                                <span class="material-symbols-outlined">receipt_long</span>
+                                Receipts
+                            </button>
+                        {/if}
+                        <a href="/copilot/memory" class="copilot-island-tab" data-sveltekit-preload-data="hover">
+                            <span class="material-symbols-outlined">bookmark</span>
+                            Memory
+                        </a>
+                        <button
+                            type="button"
+                            class="copilot-island-tab"
+                            class:copilot-island-tab-active={historyOpen}
+                            on:click={openHistory}>
+                            <span class="material-symbols-outlined">history</span>
+                            History
+                        </button>
+                    </div>
+                </div>
             </div>
-            <div>
-                <h2 class="folio-page-title" style="font-size: clamp(1.25rem, 0.8vw + 1rem, 1.7rem)">Mira</h2>
-                <p class="folio-page-subtitle">Your Folio companion, powered by {copilotModelFamily}.</p>
+            <div class="copilot-island-profile-row" aria-label="Mira profile scope">
+                <ProfileSwitcher />
             </div>
         </div>
-        <div class="copilot-header-actions">
-            {#if appConfig.receiptIntelligenceEnabled}
-                <button
-                    type="button"
-                    class="copilot-side-pill"
-                    class:copilot-side-pill-active={receiptsOpen}
-                    on:click={openReceipts}>
-                    Receipts
-                </button>
-            {/if}
-            <a href="/copilot/memory" class="copilot-side-pill" data-sveltekit-preload-data="hover">
-                Memory
-            </a>
-            <button
-                type="button"
-                class="copilot-side-pill"
-                class:copilot-side-pill-active={historyOpen}
-                on:click={openHistory}>
-                History
-            </button>
-            <ProfileSwitcher />
-        </div>
-    </div>
+    </header>
 
     {#if actionNotice}
         <div class="copilot-notice fade-in">{actionNotice}</div>
@@ -1547,17 +2255,370 @@
         </section>
     {/if}
 
-    <div class="copilot-chat-layout fade-in-up">
-        <section class="copilot-chat-shell">
-            <div bind:this={chatContainer} class="flex-1 overflow-y-auto space-y-3.5 pr-2 mb-4" style="scrollbar-width: thin">
+    <section class="copilot-briefing-surface fade-in-up" aria-label="Mira briefing">
+            {#if activeChip}
+                {@const chip = chipActions.find(c => c.id === activeChip)}
+                <div class="card p-4 fade-in-up">
+                    <div class="flex items-center justify-between mb-3">
+                        <p class="text-[11px] font-semibold" style="color: var(--text-primary)">{chip.label}</p>
+                        <button on:click={() => { activeChip = null; chipFormValues = {}; }}
+                            class="text-[11px] hover:underline" style="color: var(--text-muted)">Cancel</button>
+                    </div>
+                    <div class="flex flex-col gap-2.5">
+                        {#each chip.inputs as field, fieldIndex}
+                            {@const fieldId = `chip-${chip.id}-${field.key || fieldIndex}`}
+                            <div>
+                                <label for={fieldId} class="text-[10px] font-medium mb-1 block" style="color: var(--text-muted)">{field.label}</label>
+                                {#if field.type === 'select'}
+                                    <select id={fieldId} bind:value={chipFormValues[field.key]}
+                                        class="w-full px-3 py-2 rounded-lg text-[12px] focus:ring-2 focus:ring-accent/40 outline-none"
+                                        style="background: var(--card-bg); color: var(--text-primary); border: 1px solid var(--card-border)">
+                                        <option value="">Select category…</option>
+                                        {#each categories as cat}
+                                            <option value={cat.name ?? cat}>{cat.name ?? cat}</option>
+                                        {/each}
+                                    </select>
+                                {:else}
+                                    <input id={fieldId} type="text" bind:value={chipFormValues[field.key]}
+                                        placeholder={field.placeholder}
+                                        on:keydown={(e) => { if (e.key === 'Enter' && chip.inputs.filter(f => f.required).every(f => chipFormValues[f.key]?.trim())) submitChipForm(); }}
+                                        class="w-full px-3 py-2 rounded-lg text-[12px] focus:ring-2 focus:ring-accent/40 outline-none"
+                                        style="background: var(--card-bg); color: var(--text-primary); border: 1px solid var(--card-border)" />
+                                {/if}
+                            </div>
+                        {/each}
+                        <button on:click={submitChipForm}
+                            disabled={!chip.inputs.filter(f => f.required).every(f => chipFormValues[f.key]?.trim())}
+                            class="mt-1 px-4 py-2 rounded-lg text-[12px] font-semibold transition-opacity disabled:opacity-30 disabled:cursor-not-allowed"
+                            style="background: var(--accent); color: white">
+                            Run
+                        </button>
+                    </div>
+                </div>
+            {:else}
+                {#if advisorReadVisible}
+                    <section class:copilot-advisor-read-collapsed={!advisorReadPanelExpanded} class="copilot-advisor-read copilot-advisor-read-featured" aria-label="Mira's read">
+                        <div class="copilot-advisor-read-shell-header">
+                            <h3>Mira's Read</h3>
+                            <button
+                                type="button"
+                                class="copilot-advisor-shell-toggle"
+                                aria-controls="mira-read-body"
+                                aria-expanded={advisorReadPanelExpanded}
+                                aria-label={advisorReadPanelExpanded ? "Collapse Mira's Read" : "Expand Mira's Read"}
+                                on:click={() => advisorReadPanelExpanded = !advisorReadPanelExpanded}
+                            >
+                                <span class="material-symbols-outlined">{advisorReadPanelExpanded ? 'expand_less' : 'expand_more'}</span>
+                            </button>
+                        </div>
+                        {#if advisorReadPanelExpanded}
+                        <div id="mira-read-body" class="copilot-advisor-read-body">
+                            {#if advisorReadVisible}
+                        <div
+                            class="copilot-advisor-read-header copilot-advisor-hero-header"
+                            class:copilot-advisor-hero-clickable={advisorRead}
+                            role="button"
+                            tabindex="0"
+                            aria-disabled={!advisorRead}
+                            aria-expanded={advisorRead ? advisorReadExpanded : undefined}
+                            aria-controls={advisorRead ? 'mira-full-read' : undefined}
+                            on:click={toggleAdvisorReadFull}
+                            on:keydown={handleAdvisorReadHeroKeydown}
+                        >
+                            <div class="copilot-advisor-hero-icon" aria-hidden="true">
+                                <span class="material-symbols-outlined">receipt_long</span>
+                            </div>
+                            <div class="copilot-advisor-hero-copy">
+                                <div class="copilot-advisor-hero-label">Read focus</div>
+                                <h3>
+                                    {#if advisorRead}
+                                        {advisorReadSummary}
+                                    {:else}
+                                        {advisorReadTitle}
+                                    {/if}
+                                </h3>
+                                {#if advisorRead}
+                                    <span>{advisorReadPreparedLabel}</span>
+                                    <small>{advisorReadTitle}</small>
+                                {/if}
+                            </div>
+                            <div class="copilot-advisor-hero-actions">
+                                {#if advisorRead}
+                                    <div class:copilot-advisor-status-active={advisorReadDelta} class="copilot-advisor-status-chip">
+                                        <span class="material-symbols-outlined">{advisorReadDelta ? 'published_with_changes' : 'check_circle'}</span>
+                                        <strong>{advisorReadDeltaHeadline}</strong>
+                                        <small>{advisorReadDeltaDetail}</small>
+                                        {#if advisorReadDelta && advisorReadFollowupEnabled}
+                                            <button type="button" disabled={loading} on:click|stopPropagation={() => askAboutAdvisorRead('changes', "What changed since Mira's read?")}>
+                                                What changed?
+                                            </button>
+                                        {/if}
+                                    </div>
+                                    <button type="button" class="copilot-advisor-open-read" on:click|stopPropagation={toggleAdvisorReadFull}>
+                                        {advisorReadExpanded ? 'Close full read' : 'Open full read'}
+                                        <span class="material-symbols-outlined">{advisorReadExpanded ? 'unfold_less' : 'unfold_more'}</span>
+                                    </button>
+                                {/if}
+                                <button
+                                    type="button"
+                                    class="copilot-advisor-refresh"
+                                    on:click|stopPropagation={refreshAdvisorRead}
+                                    disabled={advisorReadLoading}
+                                    aria-label="Check stored Mira read"
+                                >
+                                    <span class="material-symbols-outlined" class:copilot-spin={advisorReadLoading}>refresh</span>
+                                </button>
+                            </div>
+                        </div>
+                            {#if advisorReadLoading}
+                                <div class="copilot-advisor-loading">Mira is checking for a stored read.</div>
+                            {:else if advisorRead}
+                            {#if advisorReadJobRunning || advisorReadGenerating}
+                                <div class="copilot-advisor-loading">Mira is generating a fresh read locally. This can take a few minutes.</div>
+                            {/if}
+                            {#if advisorReadHasCards}
+                                <div class="copilot-advisor-priority-grid">
+                                    {#each advisorReadPriorityCards as card}
+                                        <button
+                                            type="button"
+                                            class:copilot-advisor-priority-active={advisorReadSelectedCardId === card.id}
+                                            class="copilot-advisor-priority-card"
+                                            on:click={() => advisorReadSelectedCardId = advisorReadSelectedCardId === card.id ? '' : card.id}
+                                        >
+                                            <span class="material-symbols-outlined">{card.icon || 'auto_awesome'}</span>
+                                            <small>{card.kicker || "Mira's read"}</small>
+                                            <strong>{card.title}</strong>
+                                            {#if card.summary}
+                                                <p>{card.summary}</p>
+                                            {/if}
+                                            {#if advisorPreviewRows(card, 1)[0]}
+                                                <em>{advisorPreviewRows(card, 1)[0].label}{advisorPreviewRows(card, 1)[0].value ? ` · ${advisorPreviewRows(card, 1)[0].value}` : ''}</em>
+                                            {/if}
+                                        </button>
+                                    {/each}
+                                </div>
+                                {#if advisorReadMoneyMapCard}
+                                    <button
+                                        type="button"
+                                        class:copilot-advisor-money-preview-active={advisorReadSelectedCardId === advisorReadMoneyMapCard.id}
+                                        class="copilot-advisor-money-preview"
+                                        on:click={() => advisorReadSelectedCardId = advisorReadSelectedCardId === advisorReadMoneyMapCard.id ? '' : advisorReadMoneyMapCard.id}
+                                    >
+                                        <div>
+                                            <span class="material-symbols-outlined">{advisorReadMoneyMapCard.icon || 'route'}</span>
+                                            <strong>{advisorReadMoneyMapCard.title || 'Money map'}</strong>
+                                            <small>{advisorReadMoneyMapCard.summary}</small>
+                                        </div>
+                                        {#if advisorReadMoneyMapRows.length}
+                                            <div class="copilot-money-map-bar" aria-hidden="true">
+                                                {#each advisorReadMoneyMapRows as _}
+                                                    <span></span>
+                                                {/each}
+                                            </div>
+                                            <div class="copilot-advisor-money-preview-rows">
+                                                {#each advisorReadMoneyMapRows as row}
+                                                    <span>
+                                                        <i class="material-symbols-outlined">{advisorMoneyMapIcon(row.label)}</i>
+                                                        <strong>{row.label}</strong>
+                                                        {#if row.value}<em>{row.value}</em>{/if}
+                                                    </span>
+                                                {/each}
+                                            </div>
+                                        {/if}
+                                    </button>
+                                {/if}
+                                {#if advisorReadSelectedCard}
+                                    <article class="copilot-advisor-detail-panel">
+                                        <div class="copilot-advisor-card-head">
+                                            <span class="material-symbols-outlined">{advisorReadSelectedCard.icon || 'auto_awesome'}</span>
+                                            <div>
+                                                <small>{advisorReadSelectedCard.kicker || "Mira's read"}</small>
+                                                <h4>{advisorReadSelectedCard.title}</h4>
+                                            </div>
+                                            <button type="button" aria-label="Close read detail" on:click={() => advisorReadSelectedCardId = ''}>
+                                                <span class="material-symbols-outlined">close</span>
+                                            </button>
+                                        </div>
+                                        {#if advisorReadSelectedCard.summary}
+                                            <p>{advisorReadSelectedCard.summary}</p>
+                                        {/if}
+                                        {#if advisorReadSelectedRows.length}
+                                            <div class="copilot-advisor-card-rows">
+                                                {#each advisorReadSelectedRows as row}
+                                                    <div>
+                                                        <strong>{row.label}</strong>
+                                                        {#if row.value}<span>{row.value}</span>{/if}
+                                                        {#if row.detail}<small>{row.detail}</small>{/if}
+                                                    </div>
+                                                {/each}
+                                            </div>
+                                        {/if}
+                                        {#if advisorReadSelectedCard.detail}
+                                            <p class="copilot-advisor-card-detail">{advisorReadSelectedCard.detail}</p>
+                                        {/if}
+                                        {#if advisorReadSelectedCard.tradeoff}
+                                            <p class="copilot-advisor-card-tradeoff">{advisorReadSelectedCard.tradeoff}</p>
+                                        {/if}
+                                        <div class="copilot-advisor-detail-actions">
+                                            {#if advisorReadFollowupEnabled && advisorReadSelectedCard.followup_type}
+                                                <button type="button" disabled={loading} on:click={() => askAboutAdvisorCard(advisorReadSelectedCard)}>
+                                                    {advisorReadSelectedCard.action_label || 'Ask Mira'}
+                                                </button>
+                                            {/if}
+                                        </div>
+                                        {#if appConfig.miraFinancialFeedbackLoopEnabled}
+                                            <div class="copilot-advisor-card-feedback" aria-label={`Feedback for ${advisorReadSelectedCard.title || "Mira's read"}`}>
+                                                {#if advisorCardFeedbackSummary(advisorReadSelectedCard)}
+                                                    <small>{advisorCardFeedbackSummary(advisorReadSelectedCard)}</small>
+                                                {/if}
+                                                <button type="button" title="More like this" aria-label="More like this" on:click={() => sendAdvisorCardFeedback(advisorReadSelectedCard, 'more_like_this')}>
+                                                    <span class="material-symbols-outlined">thumb_up</span>
+                                                </button>
+                                                <button type="button" title="Less like this" aria-label="Less like this" on:click={() => sendAdvisorCardFeedback(advisorReadSelectedCard, 'less_like_this')}>
+                                                    <span class="material-symbols-outlined">thumb_down</span>
+                                                </button>
+                                                <button type="button" title="Snooze this" aria-label="Snooze this" on:click={() => sendAdvisorCardFeedback(advisorReadSelectedCard, 'snoozed')}>
+                                                    <span class="material-symbols-outlined">schedule</span>
+                                                </button>
+                                                <button type="button" title="Too sensitive" aria-label="Too sensitive" on:click={() => sendAdvisorCardFeedback(advisorReadSelectedCard, 'too_sensitive')}>
+                                                    <span class="material-symbols-outlined">visibility_off</span>
+                                                </button>
+                                                <button type="button" title="Correct this" aria-label="Correct this" on:click={() => startAdvisorCardCorrection(advisorReadSelectedCard)}>
+                                                    <span class="material-symbols-outlined">edit_note</span>
+                                                </button>
+                                            </div>
+                                            {#if advisorCorrectionCardId === advisorReadSelectedCard.id}
+                                                <div class="copilot-advisor-card-correction">
+                                                    <textarea bind:value={advisorCorrectionText} rows="2" placeholder="What should Mira correct?" />
+                                                    <div>
+                                                        <button type="button" disabled={!advisorCorrectionText.trim()} on:click={() => submitAdvisorCardCorrection(advisorReadSelectedCard)}>
+                                                            Save
+                                                        </button>
+                                                        <button type="button" on:click={cancelAdvisorCardCorrection}>
+                                                            Cancel
+                                                        </button>
+                                                    </div>
+                                                </div>
+                                            {/if}
+                                        {/if}
+                                    </article>
+                                {/if}
+                            {/if}
+                            {#if !advisorReadHasCards || advisorReadExpanded}
+                                <div class="copilot-advisor-memo" id="mira-full-read">
+                                    {#each visibleAdvisorReadBlocks as block}
+                                        {#if block.type === 'heading'}
+                                            <h4>{block.text}</h4>
+                                        {:else if block.type === 'bullet'}
+                                            <p class="copilot-advisor-bullet">{block.text}</p>
+                                        {:else if block.type === 'table'}
+                                            <div class="copilot-advisor-table-wrap">
+                                                <table class="copilot-advisor-table">
+                                                    <thead>
+                                                        <tr>
+                                                            {#each block.headers as header}
+                                                                <th>{header}</th>
+                                                            {/each}
+                                                        </tr>
+                                                    </thead>
+                                                    <tbody>
+                                                        {#each block.rows as row}
+                                                            <tr>
+                                                                {#each row as cell}
+                                                                    <td>{cell}</td>
+                                                                {/each}
+                                                            </tr>
+                                                        {/each}
+                                                    </tbody>
+                                                </table>
+                                            </div>
+                                        {:else}
+                                            <p>{block.text}</p>
+                                        {/if}
+                                    {/each}
+                                </div>
+                            {/if}
+                            <div class="copilot-advisor-actions">
+                                {#if advisorReadFollowupEnabled && !advisorReadHasCards}
+                                    <button type="button" disabled={loading} on:click={() => askAboutAdvisorRead('focus', "What should I focus on from Mira's read, and what should I not overreact to?")}>
+                                        <span class="material-symbols-outlined">psychology</span>
+                                        Focus
+                                    </button>
+                                    <button type="button" disabled={loading} on:click={() => askAboutAdvisorRead('levers', "What can I reduce a little without pain from Mira's read?")}>
+                                        <span class="material-symbols-outlined">tune</span>
+                                        Levers
+                                    </button>
+                                    <button type="button" disabled={loading} on:click={() => askAboutAdvisorRead('risk', "What is the biggest risk to my goals from Mira's read?")}>
+                                        <span class="material-symbols-outlined">flag</span>
+                                        Risk
+                                    </button>
+                                {/if}
+                                {#if advisorReadBlocks.length > visibleAdvisorReadBlocks.length || advisorReadExpanded || advisorReadHasCards}
+                                    <button type="button" on:click={() => advisorReadExpanded = !advisorReadExpanded}>
+                                        <span class="material-symbols-outlined">{advisorReadExpanded ? 'unfold_less' : 'unfold_more'}</span>
+                                        {advisorReadExpanded ? 'Less' : 'Full read'}
+                                    </button>
+                                {/if}
+                                {#if advisorReadCanGenerate}
+                                    <button type="button" on:click={() => generateAdvisorRead(true)} disabled={advisorReadGenerating || advisorReadJobRunning}>
+                                        <span class="material-symbols-outlined">auto_awesome</span>
+                                        Fresh read
+                                    </button>
+                                {/if}
+                            </div>
+                            {:else}
+                                <div class="copilot-advisor-empty">
+                                    <span class="material-symbols-outlined">hourglass_empty</span>
+                                    <div>
+                                        <p>Mira can prepare your financial read locally. It can take a few minutes, and this chat will only show it after a validated memo is stored.</p>
+                                        {#if advisorReadJobRunning || advisorReadGenerating}
+                                            <small>Mira is generating it now.</small>
+                                        {:else if advisorReadCanGenerate}
+                                            <button type="button" on:click={() => generateAdvisorRead(true)}>
+                                                <span class="material-symbols-outlined">auto_awesome</span>
+                                                Generate read
+                                            </button>
+                                        {/if}
+                                    </div>
+                                </div>
+                            {/if}
+                            {/if}
+                        </div>
+                        {/if}
+                    </section>
+                {/if}
+                <p class="copilot-starter-label">Start here</p>
+                <div class="copilot-starter-row">
+                    {#each starterChips as chip}
+                        <button on:click={() => activateChip(chip)} class="copilot-suggestion-btn">
+                            {chip.label}
+                        </button>
+                    {/each}
+                </div>
+            {/if}
+    </section>
+
+    <div class="copilot-chat-layout fade-in-up" class:copilot-chat-layout-empty={messages.length <= 1}>
+        <section class="copilot-chat-shell" class:copilot-chat-shell-empty={messages.length <= 1}>
+            <div class="copilot-chat-panel-header">
+                <div>
+                    <h3>Ask Mira</h3>
+                    <span>
+                        <span class="material-symbols-outlined">hub</span>
+                        {selectedCopilotModelMeta?.label || copilotModel || 'Gemma'} · local · private
+                    </span>
+                </div>
+                <small>Briefing stays above while chatting</small>
+            </div>
+            <div bind:this={chatContainer} class="copilot-chat-feed flex-1 overflow-y-auto space-y-3.5" style="scrollbar-width: thin">
                 {#each messages as msg, i}
                     <div class="flex {msg.role === 'user' ? 'justify-end' : 'justify-start'} fade-in" style="animation-delay: {Math.min(i * 40, 240)}ms">
                         <div class="max-w-[90%] {msg.role === 'user' ? 'order-2' : ''}" class:w-full={msg.role === 'assistant' && (msg.chart || (msg.data && msg.data.length > 0))}>
                             {#if msg.role === 'assistant'}
-                                <div class="flex items-start gap-2.5" class:copilot-wide-row={msg.chart || (msg.data && msg.data.length > 0)}>
-                                    <div class="w-6 h-6 rounded-lg flex items-center justify-center flex-shrink-0 mt-0.5" style="background: var(--accent-soft)">
-                                        <span class="material-symbols-outlined text-[14px]" style="color: var(--accent)">auto_awesome</span>
-                                    </div>
+                                    <div class="flex items-start gap-2.5" class:copilot-wide-row={msg.chart || (msg.data && msg.data.length > 0)} class:copilot-welcome-message={msg.is_welcome}>
+                                    {#if !msg.is_welcome}
+                                        <span class="mira-mark mira-mark--avatar mt-0.5" aria-hidden="true"></span>
+                                    {/if}
                                     <div class="copilot-msg-container" class:copilot-wide-content={msg.chart || (msg.data && msg.data.length > 0)}>
                                         {#if msg.operation === 'write_preview'}
                                             <div class="copilot-op-badge copilot-op-write">
@@ -1572,7 +2633,7 @@
                                         {:else if msg.operation === 'read' && msg.rows_affected > 0}
                                             <div class="copilot-op-badge copilot-op-read">
                                                 <span class="material-symbols-outlined text-[12px]">search</span>
-                                                Query · {msg.rows_affected} result{msg.rows_affected !== 1 ? 's' : ''}
+                                                Query · {msg.rows_total > msg.rows_affected ? `${msg.rows_affected} of ${msg.rows_total}` : msg.rows_affected} result{(msg.rows_total || msg.rows_affected) !== 1 ? 's' : ''}
                                             </div>
                                         {:else if msg.operation === 'error'}
                                             <div class="copilot-op-badge copilot-op-error">
@@ -1594,8 +2655,8 @@
                                         {/if}
 
                                         {#if msg.content?.trim() || msg.operation === 'streaming'}
-                                            <div class="card" style="padding: 0.75rem 1rem">
-                                                <p class="text-[13px] leading-relaxed whitespace-pre-wrap" style="color: var(--text-primary)">{msg.content}{#if msg.operation === 'streaming' && loading}<span class="copilot-cursor">▌</span>{/if}</p>
+                                            <div class:card={!msg.is_welcome} class:copilot-welcome-card={msg.is_welcome} class="copilot-message-card">
+                                                <p class="text-[13px] leading-relaxed whitespace-pre-wrap">{msg.content}{#if msg.operation === 'streaming' && loading}<span class="copilot-cursor">▌</span>{/if}</p>
                                             </div>
                                         {/if}
 
@@ -1625,7 +2686,7 @@
                                                         </tr>
                                                     </thead>
                                                     <tbody>
-                                                        {#each msg.data.slice(0, 20) as row}
+                                                        {#each msg.data as row}
                                                             <tr>
                                                                 {#each columns as col}
                                                                     <td>{formatTableValue(col, row[col])}</td>
@@ -1660,7 +2721,7 @@
                                             </div>
                                         {/if}
 
-                                        {#if msg.sql}
+                                        {#if showMiraDebug && msg.sql}
                                             <button class="copilot-sql-toggle" on:click={() => toggleSql(i)}>
                                                 <span class="material-symbols-outlined text-[12px]">code</span>
                                                 {showSqlForMsg[i] ? 'Hide SQL' : 'Show SQL'}
@@ -1670,10 +2731,27 @@
                                             {/if}
                                         {/if}
 
-                                        {#if ((msg.tool_trace && msg.tool_trace.length > 0) || (showMiraDebug && msg.trace)) && msg.operation !== 'streaming'}
+                                        {#if chatReceipt(msg)}
+                                            <button class="copilot-sql-toggle" on:click={() => showSqlForMsg = { ...showSqlForMsg, ['receipt_' + i]: !showSqlForMsg['receipt_' + i] }}>
+                                                <span class="material-symbols-outlined text-[12px]">receipt_long</span>
+                                                {showSqlForMsg['receipt_' + i] ? 'Hide receipts' : 'Receipts'}
+                                            </button>
+                                            {#if showSqlForMsg['receipt_' + i]}
+                                                <div class="copilot-sql-block" style="font-size: 11px; line-height: 1.6;">
+                                                    {#each chatReceipt(msg).lines as line}
+                                                        <div>{line}</div>
+                                                    {/each}
+                                                    {#each chatReceipt(msg).caveats as caveat}
+                                                        <div><strong>Caveat</strong>: {caveat}</div>
+                                                    {/each}
+                                                </div>
+                                            {/if}
+                                        {/if}
+
+                                        {#if showMiraDebug && ((msg.tool_trace && msg.tool_trace.length > 0) || msg.trace) && msg.operation !== 'streaming'}
                                             <button class="copilot-sql-toggle" on:click={() => showSqlForMsg = { ...showSqlForMsg, ['trace_' + i]: !showSqlForMsg['trace_' + i] }}>
                                                 <span class="material-symbols-outlined text-[12px]">manage_search</span>
-                                                {showSqlForMsg['trace_' + i] ? 'Hide' : 'How I answered'}{#if msg.tool_trace && msg.tool_trace.length > 0} ({msg.tool_trace.length} tool{msg.tool_trace.length !== 1 ? 's' : ''}){/if}
+                                                {showSqlForMsg['trace_' + i] ? 'Hide debug trace' : 'Debug trace'}{#if msg.tool_trace && msg.tool_trace.length > 0} ({msg.tool_trace.length} tool{msg.tool_trace.length !== 1 ? 's' : ''}){/if}
                                             </button>
                                             {#if showSqlForMsg['trace_' + i]}
                                                 <div class="copilot-sql-block" style="font-size: 11px; line-height: 1.6;">
@@ -1736,6 +2814,38 @@
                                                 {/each}
                                             </div>
                                         {/if}
+
+                                        {#if msg.suggested_memory}
+                                            <div class="copilot-memory-proposals">
+                                                <div class="copilot-memory-proposal">
+                                                    <div class="copilot-memory-proposal-head">
+                                                        <span class="material-symbols-outlined text-[14px]">bookmark_add</span>
+                                                        <span>Remember this?</span>
+                                                    </div>
+                                                    <div class="copilot-memory-proposal-body">{msg.suggested_memory.text}</div>
+                                                    {#if msg.suggested_memory.reason}
+                                                        <div class="copilot-memory-proposal-evidence">↳ {msg.suggested_memory.reason}</div>
+                                                    {/if}
+                                                    <div class="copilot-memory-proposal-actions">
+                                                        <button
+                                                            class="copilot-sql-toggle"
+                                                            on:click={() => acceptSuggestedMemory(i)}
+                                                            disabled={msg.suggested_memory.saving}
+                                                        >
+                                                            <span class="material-symbols-outlined text-[12px]">check</span>
+                                                            {msg.suggested_memory.saving ? 'Adding…' : 'Remember'}
+                                                        </button>
+                                                        <button
+                                                            class="copilot-sql-toggle"
+                                                            on:click={() => dismissSuggestedMemory(i)}
+                                                            disabled={msg.suggested_memory.saving}
+                                                        >
+                                                            <span class="material-symbols-outlined text-[12px]">close</span>Skip
+                                                        </button>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        {/if}
                                     </div>
                                 </div>
                             {:else}
@@ -1764,86 +2874,61 @@
             </div>
 
             {#if messages.length <= 1}
-                <div class="flex-shrink-0 mb-4 fade-in-up" style="animation-delay: 100ms">
-                    {#if activeChip}
-                        {@const chip = chipActions.find(c => c.id === activeChip)}
-                        <div class="card p-4 fade-in-up">
-                            <div class="flex items-center justify-between mb-3">
-                                <p class="text-[11px] font-semibold" style="color: var(--text-primary)">{chip.label}</p>
-                                <button on:click={() => { activeChip = null; chipFormValues = {}; }}
-                                    class="text-[11px] hover:underline" style="color: var(--text-muted)">Cancel</button>
-                            </div>
-                            <div class="flex flex-col gap-2.5">
-                                {#each chip.inputs as field, fieldIndex}
-                                    {@const fieldId = `chip-${chip.id}-${field.key || fieldIndex}`}
-                                    <div>
-                                        <label for={fieldId} class="text-[10px] font-medium mb-1 block" style="color: var(--text-muted)">{field.label}</label>
-                                        {#if field.type === 'select'}
-                                            <select id={fieldId} bind:value={chipFormValues[field.key]}
-                                                class="w-full px-3 py-2 rounded-lg text-[12px] focus:ring-2 focus:ring-accent/40 outline-none"
-                                                style="background: var(--card-bg); color: var(--text-primary); border: 1px solid var(--card-border)">
-                                                <option value="">Select category…</option>
-                                                {#each categories as cat}
-                                                    <option value={cat.name ?? cat}>{cat.name ?? cat}</option>
-                                                {/each}
-                                            </select>
-                                        {:else}
-                                            <input id={fieldId} type="text" bind:value={chipFormValues[field.key]}
-                                                placeholder={field.placeholder}
-                                                on:keydown={(e) => { if (e.key === 'Enter' && chip.inputs.filter(f => f.required).every(f => chipFormValues[f.key]?.trim())) submitChipForm(); }}
-                                                class="w-full px-3 py-2 rounded-lg text-[12px] focus:ring-2 focus:ring-accent/40 outline-none"
-                                                style="background: var(--card-bg); color: var(--text-primary); border: 1px solid var(--card-border)" />
-                                        {/if}
-                                    </div>
-                                {/each}
-                                <button on:click={submitChipForm}
-                                    disabled={!chip.inputs.filter(f => f.required).every(f => chipFormValues[f.key]?.trim())}
-                                    class="mt-1 px-4 py-2 rounded-lg text-[12px] font-semibold transition-opacity disabled:opacity-30 disabled:cursor-not-allowed"
-                                    style="background: var(--accent); color: white">
-                                    Run
-                                </button>
-                            </div>
-                        </div>
-                    {:else}
-                        <p class="text-[9px] font-bold tracking-[0.2em] uppercase mb-2.5" style="color: var(--text-muted)">Start here</p>
-                        <div class="flex flex-wrap gap-2">
-                            {#each starterChips as chip}
-                                <button on:click={() => activateChip(chip)} class="copilot-suggestion-btn">
-                                    {chip.label}
-                                </button>
-                            {/each}
-                        </div>
-                    {/if}
-                </div>
+                <div class="copilot-empty-chat-spacer" aria-hidden="true"></div>
             {/if}
 
-            <div class="flex-shrink-0">
-                <div class="flex items-end gap-2.5">
+            <div class="copilot-composer-wrap flex-shrink-0">
+                <div class="copilot-composer-row">
                     <div class="flex-1 relative">
                         <textarea bind:value={input} on:keydown={handleKeydown}
                             placeholder="Ask Mira about your money, code, ideas, or changes to your app data…"
                             rows="1"
-                            class="w-full px-4 py-3 rounded-2xl text-[13px] resize-none focus:ring-2 focus:ring-accent/50 transition-all copilot-composer-textarea"
-                            style="background: var(--card-bg); color: var(--text-primary); border: 1px solid var(--card-border); min-height: 48px; max-height: 120px; box-shadow: var(--card-shadow)"></textarea>
+                            class="w-full px-4 py-3 text-[13px] resize-none transition-all copilot-composer-textarea"></textarea>
                         {#if localLlmStatus?.provider === 'ollama'}
                             <div class="copilot-model-inline">
                                 <span class="copilot-mini-badge">Model</span>
-                                <select
-                                    class="copilot-model-select"
-                                    bind:value={copilotModel}
-                                    on:change={(event) => updateCopilotModelSelection(event.currentTarget.value)}
-                                    disabled={copilotModelSaving}
-                                >
-                                    {#each localLlmCatalog?.tiers || [] as tier}
-                                        <optgroup label={tier.label}>
-                                            {#each tier.models.filter((model) => model.task_fit?.includes('copilot')) as model}
-                                                <option value={model.id} disabled={model.expert_only && !localLlmStatus?.expertMode}>
-                                                    {model.label} · {model.approx_size_gb} GB{model.installed ? ' · installed' : ''}
-                                                </option>
-                                            {/each}
-                                        </optgroup>
-                                    {/each}
-                                </select>
+                                <div class="copilot-model-dropdown-wrapper">
+                                    {#if localLlmStatus?.expertMode}
+                                        <button
+                                            type="button"
+                                            class="copilot-model-trigger"
+                                            aria-haspopup="listbox"
+                                            aria-expanded={modelDropdownOpen}
+                                            on:click|stopPropagation={() => modelDropdownOpen = !modelDropdownOpen}
+                                            disabled={copilotModelSaving}
+                                        >
+                                            <span>{copilotModelLabel}</span>
+                                            <span class="material-symbols-outlined">expand_more</span>
+                                        </button>
+                                        {#if modelDropdownOpen}
+                                            <button type="button" class="month-dropdown-backdrop" aria-label="Close model picker" on:click={() => modelDropdownOpen = false}></button>
+                                            <div class="copilot-model-menu" role="listbox" tabindex="-1">
+                                                {#each localLlmCatalog?.tiers || [] as tier}
+                                                    <div class="copilot-model-group">{tier.label}</div>
+                                                    {#each tier.models.filter((model) => model.task_fit?.includes('copilot')) as model}
+                                                        <button
+                                                            type="button"
+                                                            class="copilot-model-option"
+                                                            class:copilot-model-option-active={copilotModel === model.id}
+                                                            role="option"
+                                                            aria-selected={copilotModel === model.id}
+                                                            on:click={() => selectCopilotModel(model)}
+                                                        >
+                                                            <span>{model.label} · {model.download_size_gb || model.approx_size_gb} GB{model.quantization ? ` · ${model.quantization}` : ''}{model.installed ? ' · installed' : ''}</span>
+                                                            {#if copilotModel === model.id}
+                                                                <span class="material-symbols-outlined">check</span>
+                                                            {/if}
+                                                        </button>
+                                                    {/each}
+                                                {/each}
+                                            </div>
+                                        {/if}
+                                    {:else}
+                                        <div class="copilot-model-trigger" aria-label="Current Mira model">
+                                            <span>{copilotModelLabel}</span>
+                                        </div>
+                                    {/if}
+                                </div>
                                 <span class="copilot-model-meta">
                                     {selectedCopilotModelMeta?.installed ? 'Installed' : 'Not installed'}
                                 </span>
@@ -1861,11 +2946,11 @@
                         {/if}
                     </div>
                     {#if loading}
-                        <button on:click={stopStream} class="w-11 h-11 rounded-2xl flex items-center justify-center transition-all hover:scale-105 active:scale-95 copilot-send-btn" title="Stop (Esc)">
+                        <button on:click={stopStream} class="copilot-send-btn" title="Stop (Esc)">
                             <span class="material-symbols-outlined text-white text-[18px]">stop</span>
                         </button>
                     {:else}
-                        <button on:click={send} disabled={!input.trim()} class="w-11 h-11 rounded-2xl flex items-center justify-center transition-all hover:scale-105 active:scale-95 disabled:opacity-30 disabled:cursor-not-allowed copilot-send-btn">
+                        <button on:click={send} disabled={!input.trim()} class="copilot-send-btn">
                             <span class="material-symbols-outlined text-white text-[18px]">arrow_upward</span>
                         </button>
                     {/if}

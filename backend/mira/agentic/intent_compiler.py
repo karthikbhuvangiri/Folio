@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import copy
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from mira.agentic.temporal_parser import bounded_range_token, is_bounded_range_token
+
+from mira.agentic.financial_context_policy import maybe_append_financial_context_call
 from mira.agentic.intent_frame import ConversationFrame, MiraSubject
 
 
@@ -71,12 +75,13 @@ def _compile_frame(frame: ConversationFrame, hints: _CompilerHints) -> list[dict
     elif route == "write_preview":
         calls = _compile_write_preview_frame(frame, hints)
     elif route == "memory":
-        calls = _compile_memory_frame(hints)
+        calls = _compile_memory_frame(frame, hints)
     else:
         return []
 
     if calls and calls[0].get("validation_error"):
         return calls
+    calls = maybe_append_financial_context_call(calls, frame=frame)
     if calls and frame.output == "chart" and not any(call.get("name") == "make_chart" for call in calls):
         calls = _append_chart_call(calls, frame)
     return calls
@@ -156,6 +161,8 @@ def _spending_top_call(frame: ConversationFrame, hints: _CompilerHints) -> dict[
     subject = _subject(frame)
     subject_filters = _subject_filters(subject)
     group_by = _group_by(hints, default="category")
+    if not subject_filters and subject.kind == "merchant" and group_by == "category":
+        group_by = "merchant"
     if subject_filters:
         if frame.output in {"list", "table"}:
             return _transaction_lookup_call(frame, hints)
@@ -177,10 +184,13 @@ def _spending_top_call(frame: ConversationFrame, hints: _CompilerHints) -> dict[
 def _spending_trend_call(frame: ConversationFrame, hints: _CompilerHints) -> dict[str, Any]:
     filters = _subject_filters(_subject(frame))
     filters.pop("merchant", None)
+    metric = _spending_metric(frame, hints, entity_total=False)
+    if metric == "summary":
+        metric = "expenses"
     args: dict[str, Any] = {
         "view": "trend",
         "range": _trend_range(frame, hints),
-        "payload": {"metric": _spending_metric(frame, hints, entity_total=False), "group_by": "month"},
+        "payload": {"metric": metric, "group_by": "month"},
     }
     if filters:
         args["filters"] = filters
@@ -381,10 +391,19 @@ def _compile_write_preview_frame(frame: ConversationFrame, hints: _CompilerHints
             payload["change_type"] = hinted_change
     if payload.get("change_type"):
         payload["change_type"] = _preview_change_alias(payload.get("change_type"))
+    if payload.get("change_type") == "create_rule" and payload.get("merchant") and not payload.get("pattern"):
+        payload["pattern"] = payload.pop("merchant")
     return [_call("selector_call_1", "preview_finance_change", {"view": "preview", "payload": payload})]
 
 
-def _compile_memory_frame(hints: _CompilerHints) -> list[dict[str, Any]]:
+def _compile_memory_frame(frame: ConversationFrame, hints: _CompilerHints) -> list[dict[str, Any]]:
+    if not frame.memory.is_empty:
+        return [_compile_memory_operation_call(frame)]
+    if frame.output == "list":
+        return [_call("selector_call_1", "manage_memory", {"view": "list"})]
+    if not _memory_compiler_compat_enabled():
+        return []
+
     payload = copy.deepcopy(hints.payload or {})
     view = str(hints.view or "").strip().lower()
     action = str(
@@ -422,6 +441,41 @@ def _compile_memory_frame(hints: _CompilerHints) -> list[dict[str, Any]]:
     if hints.limit not in MISSING_VALUES:
         args["limit"] = hints.limit
     return [_call("selector_call_1", "manage_memory", args)]
+
+
+def _compile_memory_operation_call(frame: ConversationFrame) -> dict[str, Any]:
+    memory = frame.memory
+    view = str(memory.action or "none").strip().lower()
+    if view == "none":
+        view = "list" if frame.output == "list" else ""
+    if view not in {"remember", "retrieve", "list", "update", "forget"}:
+        return _validation_error_call("I need one more memory detail before I can do that.")
+
+    payload: dict[str, Any] = {}
+    for key, value in (
+        ("text", memory.text),
+        ("question", memory.question),
+        ("topic", memory.topic),
+        ("memory_id", memory.memory_id),
+        ("memory_type", memory.memory_type),
+    ):
+        if value not in MISSING_VALUES:
+            payload[key] = value
+    if view == "retrieve" and payload.get("topic") and not payload.get("question") and not payload.get("text"):
+        payload["question"] = payload.pop("topic")
+    if view == "list":
+        payload = _copy_allowed(payload, {"memory_type"})
+
+    args: dict[str, Any] = {"view": view}
+    if payload:
+        args["payload"] = payload
+    if memory.limit not in MISSING_VALUES:
+        args["limit"] = memory.limit
+    return _call("selector_call_1", "manage_memory", args)
+
+
+def _memory_compiler_compat_enabled() -> bool:
+    return str(os.getenv("MIRA_MEMORY_COMPILER_COMPAT_ENABLED", "true")).strip().lower() not in {"0", "false", "no", "off"}
 
 
 def _append_chart_call(calls: list[dict[str, Any]], frame: ConversationFrame) -> list[dict[str, Any]]:
@@ -702,6 +756,8 @@ def _range_from_time(time_value: str, time_a: str | None, time_b: str | None) ->
         month = time_a[:7]
         if not time_b or str(time_b).startswith(month):
             return month
+        if _looks_like_date(str(time_b)):
+            return bounded_range_token(time_a, str(time_b))
     return aliases.get(token, "")
 
 
@@ -715,12 +771,17 @@ def _time_range_issue(frame: ConversationFrame) -> str:
         return "I need a supported time range before I can answer that."
     if not _looks_like_date(frame.time_a):
         return "I need the time range as an ISO date."
-    if frame.time_b and not str(frame.time_b).startswith(frame.time_a[:7]):
-        return "I can handle one month or a supported rolling window here, but not a custom multi-month date range yet."
+    if frame.time_b:
+        if not _looks_like_date(str(frame.time_b)):
+            return "I need the end of the time range as an ISO date."
+        if str(frame.time_b) < str(frame.time_a):
+            return "I need the end of the time range to be after the start."
     return ""
 
 
 def _is_dynamic_range_token(token: str) -> bool:
+    if is_bounded_range_token(token):
+        return True
     month_match = re.match(r"^last_(\d{1,2})_months$", token)
     if month_match:
         return 1 <= int(month_match.group(1)) <= 36
@@ -763,6 +824,10 @@ def _preview_change_alias(value: Any) -> str:
         "category": "bulk_recategorize",
         "change_category": "bulk_recategorize",
         "move_category": "bulk_recategorize",
+        "rule": "create_rule",
+        "rule_creation": "create_rule",
+        "budget": "set_budget",
+        "set_budget": "set_budget",
     }
     return aliases.get(text, text)
 

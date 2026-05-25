@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import calendar
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -17,6 +18,30 @@ MONTH_LOOKUP = {
     "oct": 10, "october": 10,
     "nov": 11, "november": 11,
     "dec": 12, "december": 12,
+}
+
+NUMBER_WORDS = {
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+    "eleven": 11,
+    "twelve": 12,
+    "thirteen": 13,
+    "fourteen": 14,
+    "fifteen": 15,
+    "sixteen": 16,
+    "seventeen": 17,
+    "eighteen": 18,
+    "nineteen": 19,
+    "twenty": 20,
+    "thirty": 30,
 }
 
 
@@ -56,7 +81,22 @@ def _int_token(token: str) -> int | None:
             return int(token)
         except ValueError:
             return None
+    if token in NUMBER_WORDS:
+        return NUMBER_WORDS[token]
     return None
+
+
+def _amount_at(tokens: list[str], idx: int) -> tuple[int, int] | None:
+    if idx >= len(tokens):
+        return None
+    first = _int_token(tokens[idx])
+    if first is None:
+        return None
+    if idx + 1 < len(tokens) and first in {20, 30}:
+        second = _int_token(tokens[idx + 1])
+        if second and 1 <= second <= 9:
+            return first + second, idx + 2
+    return first, idx + 1
 
 
 def _month_count_since(tokens: list[str], now: datetime) -> int | None:
@@ -91,6 +131,16 @@ def _explicit_month(tokens: list[str]) -> str | None:
 
 def _month_token(year: int, month: int) -> str:
     return f"{year:04d}-{month:02d}"
+
+
+def _month_bounds_token(year: int, month: int) -> str:
+    last_day = calendar.monthrange(year, month)[1]
+    return f"{year:04d}-{month:02d}-01..{year:04d}-{month:02d}-{last_day:02d}"
+
+
+def _bounded_range_token(start_year: int, start_month: int, end_year: int, end_month: int) -> str:
+    last_day = calendar.monthrange(end_year, end_month)[1]
+    return f"{start_year:04d}-{start_month:02d}-01..{end_year:04d}-{end_month:02d}-{last_day:02d}"
 
 
 def _shift_month(year: int, month: int, delta: int) -> tuple[int, int]:
@@ -141,6 +191,89 @@ def _unsupported_bounded_range(tokens: list[str]) -> str:
     if _has_quarter_phrase(tokens):
         return "quarter ranges are not supported yet"
     return ""
+
+
+def _year_near(tokens: list[str], idx: int) -> int | None:
+    for pos in (idx + 1, idx - 1):
+        if 0 <= pos < len(tokens):
+            year = _int_token(tokens[pos])
+            if year and 2000 <= year <= 2099:
+                return year
+    return None
+
+
+def _between_months_range(tokens: list[str], now: datetime) -> str | None:
+    connectors = {"and", "to", "through", "thru", "until"}
+    month_positions = [idx for idx, item in enumerate(tokens) if MONTH_LOOKUP.get(item)]
+    for left, right in zip(month_positions, month_positions[1:]):
+        if not connectors & set(tokens[left + 1 : right]):
+            continue
+        start_month = MONTH_LOOKUP[tokens[left]]
+        end_month = MONTH_LOOKUP[tokens[right]]
+        if start_month is None or end_month is None:
+            continue
+
+        shared_year = next(
+            (
+                year
+                for year in (_int_token(token) for token in tokens)
+                if year and 2000 <= year <= 2099
+            ),
+            None,
+        )
+        start_year = _year_near(tokens, left) or shared_year
+        end_year = _year_near(tokens, right) or shared_year
+        if start_year is None and end_year is None:
+            if start_month > now.month and end_month > now.month:
+                start_year = now.year - 1
+            else:
+                start_year = now.year
+        if start_year is None:
+            start_year = end_year
+        if end_year is None:
+            end_year = start_year
+        if end_month < start_month and end_year <= start_year:
+            end_year = start_year + 1
+        return _bounded_range_token(start_year, start_month, end_year, end_month)
+    return None
+
+
+def _quarter_range(tokens: list[str], now: datetime) -> str | None:
+    token_set = set(tokens)
+    quarter: int | None = None
+    year = next(
+        (
+            value
+            for value in (_int_token(token) for token in tokens)
+            if value and 2000 <= value <= 2099
+        ),
+        None,
+    )
+    for token in tokens:
+        if token in {"q1", "q2", "q3", "q4"}:
+            quarter = int(token[1])
+            break
+    if quarter is None:
+        if not ({"quarter", "qtr"} & token_set):
+            return None
+        current_quarter = ((now.month - 1) // 3) + 1
+        if {"previous", "prior", "last"} & token_set:
+            quarter = current_quarter - 1
+            year = year or now.year
+            if quarter < 1:
+                quarter = 4
+                year -= 1
+        elif {"this", "current"} & token_set:
+            quarter = current_quarter
+            year = year or now.year
+        else:
+            return None
+    year = year or now.year
+    start_month = (quarter - 1) * 3 + 1
+    end_month = start_month + 2
+    if {"this", "current"} & token_set and quarter == ((now.month - 1) // 3) + 1 and year == now.year:
+        return f"{year:04d}-{start_month:02d}-01..{now.year:04d}-{now.month:02d}-{now.day:02d}"
+    return _bounded_range_token(year, start_month, year, end_month)
 
 
 def _has_between_months(tokens: list[str]) -> bool:
@@ -195,6 +328,10 @@ def parse_range(question: str, *, default: str = "current_month", now: datetime 
     now = now or datetime.now()
     tokens = words(question)
     token_set = set(tokens)
+
+    bounded = _between_months_range(tokens, now) or _quarter_range(tokens, now)
+    if bounded:
+        return RangeParse(bounded, True)
 
     unsupported = _unsupported_bounded_range(tokens)
     if unsupported:
@@ -252,10 +389,11 @@ def parse_range(question: str, *, default: str = "current_month", now: datetime 
         number_idx = idx + 1 if token != "over" else idx + 3
         if number_idx >= len(tokens):
             continue
-        amount = _int_token(tokens[number_idx])
-        unit = tokens[number_idx + 1] if number_idx + 1 < len(tokens) else ""
-        if amount is None:
+        amount_span = _amount_at(tokens, number_idx)
+        if amount_span is None:
             continue
+        amount, unit_idx = amount_span
+        unit = tokens[unit_idx] if unit_idx < len(tokens) else ""
         if unit in {"month", "months"}:
             months = max(1, min(amount, 36))
             return RangeParse(f"last_{months}_months", True, chart_months=months)

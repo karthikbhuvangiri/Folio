@@ -283,6 +283,15 @@ def _ground_across_types(
                 candidates.append({**candidate, "entity_type": candidate.get("entity_type") or entity_type})
     candidates.sort(key=lambda item: _confidence(item.get("confidence")), reverse=True)
 
+    ambiguous = [result for result in results if result.get("kind") == "ambiguous"]
+    if ambiguous:
+        ambiguous.sort(key=lambda result: _confidence(result.get("confidence")), reverse=True)
+        top = ambiguous[0]
+        return {
+            **copy.deepcopy(top),
+            "candidates": candidates[:6],
+        }
+
     usable = [result for result in results if result.get("kind") in {"exact", "approximate"} and result.get("value")]
     if not usable:
         return {

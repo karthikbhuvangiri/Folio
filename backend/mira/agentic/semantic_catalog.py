@@ -114,6 +114,11 @@ SEMANTIC_TOOL_CATALOG: dict[str, SemanticToolSpec] = {
         description="Data health and enrichment quality. Views: health, enrichment_summary, low_confidence, explain_transaction.",
         risk_level=APP,
     ),
+    "review_financial_context": SemanticToolSpec(
+        name="review_financial_context",
+        description="Read-only Mira financial understanding facts. Views: relevant, lifestyle_profile, friction_map, operating_plan.",
+        selector_visible=False,
+    ),
     "manage_memory": SemanticToolSpec(
         name="manage_memory",
         description="Mira memory. Views: remember, retrieve, list, update, forget.",
@@ -141,7 +146,7 @@ SEMANTIC_TOOL_FAMILIES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     ("overview", "dashboard, priorities, metric explanations", ("finance_overview",)),
     ("budget_cashflow", "budgets, savings, cashflow, affordability", ("review_budget", "review_cashflow", "check_affordability")),
     ("recurring_net_worth", "recurring charges, balances, net worth", ("review_recurring", "review_net_worth")),
-    ("quality_memory", "data quality and memory", ("review_data_quality", "manage_memory")),
+    ("quality_memory", "data quality, financial context, and memory", ("review_data_quality", "review_financial_context", "manage_memory")),
     ("writes_charts", "write previews and charts", ("preview_finance_change", "make_chart")),
 )
 

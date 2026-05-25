@@ -8,6 +8,13 @@
     let entries = [];
     let sections = [];
     let proposals = [];
+    let sessionSummaries = [];
+    let financialFeedback = [];
+    let statedIntents = [];
+    let appConfig = {
+        miraFinancialFeedbackLoopEnabled: false,
+        miraStatedIntentMemoryEnabled: false,
+    };
     let markdown = '';
     let tokenEstimate = 0;
     let charCount = 0;
@@ -19,6 +26,10 @@
 
     let editingId = null;
     let editBuffer = '';
+    let editingSummaryId = null;
+    let summaryEditBuffer = '';
+    let editingIntentId = null;
+    let intentEditBuffer = '';
     let consolidating = false;
 
     let newSection = 'preferences';
@@ -28,11 +39,16 @@
     async function refresh() {
         loading = true;
         try {
-            const [entriesResp, mdResp, propsResp] = await Promise.all([
+            const [entriesResp, mdResp, propsResp, summariesResp, configResp, feedbackResp, statedResp] = await Promise.all([
                 api.getMemoryEntries(activeProfileId),
                 api.getMemoryMarkdown(activeProfileId),
                 api.getMemoryProposals(activeProfileId),
+                api.getMiraSessionSummaries(activeProfileId),
+                api.getAppConfig(),
+                api.getMiraFinancialFeedback(activeProfileId),
+                api.getMiraStatedIntents(activeProfileId, true),
             ]);
+            appConfig = { ...appConfig, ...(configResp || {}) };
             entries = entriesResp.items || [];
             sections = entriesResp.sections || [];
             markdown = mdResp.markdown || '';
@@ -40,6 +56,9 @@
             charCount = mdResp.char_count || 0;
             budget = mdResp.budget || 4000;
             proposals = propsResp.items || [];
+            sessionSummaries = summariesResp.items || [];
+            financialFeedback = appConfig.miraFinancialFeedbackLoopEnabled ? (feedbackResp.feedback || []) : [];
+            statedIntents = appConfig.miraStatedIntentMemoryEnabled ? (statedResp.items || []) : [];
         } catch (e) {
             actionNotice = e?.message || 'Failed to load memory.';
         } finally {
@@ -99,6 +118,93 @@
         editBuffer = '';
     }
 
+    function startSummaryEdit(summary) {
+        editingSummaryId = summary.id;
+        summaryEditBuffer = summary.summary_text || '';
+    }
+
+    async function commitSummaryEdit() {
+        if (!editingSummaryId || !summaryEditBuffer.trim()) return;
+        try {
+            const updated = await api.updateMiraSessionSummary(editingSummaryId, summaryEditBuffer.trim(), activeProfileId);
+            sessionSummaries = sessionSummaries.map((summary) => summary.id === editingSummaryId ? updated : summary);
+            editingSummaryId = null;
+            summaryEditBuffer = '';
+            setNotice('Updated session summary.');
+        } catch (e) {
+            setNotice(e?.message || 'Failed to update session summary.');
+        }
+    }
+
+    function cancelSummaryEdit() {
+        editingSummaryId = null;
+        summaryEditBuffer = '';
+    }
+
+    function startIntentEdit(intent) {
+        editingIntentId = intent.id;
+        intentEditBuffer = intent.target_text || '';
+    }
+
+    function cancelIntentEdit() {
+        editingIntentId = null;
+        intentEditBuffer = '';
+    }
+
+    function upsertStatedIntent(intent) {
+        if (!intent?.id) return;
+        statedIntents = statedIntents.map((item) => item.id === intent.id ? intent : item);
+        if (!statedIntents.some((item) => item.id === intent.id)) {
+            statedIntents = [intent, ...statedIntents];
+        }
+    }
+
+    async function commitIntentEdit() {
+        if (!editingIntentId || !intentEditBuffer.trim()) return;
+        try {
+            const result = await api.updateMiraStatedIntent(editingIntentId, { target_text: intentEditBuffer.trim() }, activeProfileId);
+            upsertStatedIntent(result?.intent);
+            editingIntentId = null;
+            intentEditBuffer = '';
+            setNotice('Updated money commitment.');
+        } catch (e) {
+            setNotice(e?.message || 'Failed to update money commitment.');
+        }
+    }
+
+    async function setIntentStatus(intent, status) {
+        if (!intent?.id) return;
+        try {
+            const result = await api.updateMiraStatedIntent(intent.id, { status }, activeProfileId);
+            upsertStatedIntent(result?.intent);
+            setNotice(status === 'active' ? 'Resumed money commitment.' : 'Paused money commitment.');
+        } catch (e) {
+            setNotice(e?.message || 'Failed to update money commitment.');
+        }
+    }
+
+    async function clearStatedIntent(intent) {
+        if (!intent?.id || !confirm('Clear this money commitment?')) return;
+        try {
+            const result = await api.clearMiraStatedIntent(intent.id, activeProfileId);
+            upsertStatedIntent(result?.intent);
+            setNotice('Cleared money commitment.');
+        } catch (e) {
+            setNotice(e?.message || 'Failed to clear money commitment.');
+        }
+    }
+
+    async function refreshStatedIntent(intent) {
+        if (!intent?.id) return;
+        try {
+            const result = await api.evaluateMiraStatedIntent(intent.id, activeProfileId);
+            upsertStatedIntent(result?.intent);
+            setNotice('Refreshed money commitment.');
+        } catch (e) {
+            setNotice(e?.message || 'Failed to refresh money commitment.');
+        }
+    }
+
     async function deleteEntry(id) {
         if (!confirm('Remove this entry from memory?')) return;
         try {
@@ -108,6 +214,42 @@
             setNotice('Removed from memory.');
         } catch (e) {
             setNotice(e?.message || 'Failed to delete entry.');
+        }
+    }
+
+    async function deleteSessionSummary(id) {
+        if (!confirm('Remove this session summary from Mira memory?')) return;
+        try {
+            await api.deleteMiraSessionSummary(id, activeProfileId);
+            sessionSummaries = sessionSummaries.filter((summary) => summary.id !== id);
+            setNotice('Removed session summary.');
+        } catch (e) {
+            setNotice(e?.message || 'Failed to delete session summary.');
+        }
+    }
+
+    async function clearFinancialFeedback(item) {
+        if (!item?.id || !confirm('Clear this Mira financial feedback?')) return;
+        try {
+            await api.clearMiraFinancialFeedback(item.id, activeProfileId);
+            financialFeedback = financialFeedback.filter((feedback) => feedback.id !== item.id);
+            setNotice('Cleared Mira financial feedback.');
+        } catch (e) {
+            setNotice(e?.message || 'Failed to clear financial feedback.');
+        }
+    }
+
+    async function rememberFinancialFeedback(item) {
+        if (!item?.id) return;
+        try {
+            const result = await api.promoteMiraFinancialFeedbackToMemory(item.id, activeProfileId);
+            if (result?.entry) {
+                upsertEntry(result.entry);
+                await refreshMemoryStats();
+            }
+            setNotice(result?.status === 'already_stored' ? 'Already remembered.' : 'Remembered financial feedback.');
+        } catch (e) {
+            setNotice(e?.message || 'Failed to remember financial feedback.');
         }
     }
 
@@ -179,7 +321,7 @@
 
     function sourceLabel(source) {
         const labels = {
-            agent: 'Suggested by Copilot',
+            agent: 'Suggested by Mira',
             observation_threshold: 'Repeated pattern',
             consolidation: 'Memory review',
             save_to_memory: 'Saved from chat',
@@ -196,6 +338,71 @@
         return labels[confidence] || confidence;
     }
 
+    function feedbackTypeLabel(type) {
+        const labels = {
+            accepted: 'Accepted',
+            dismissed: 'Dismissed',
+            corrected: 'Corrected',
+            snoozed: 'Snoozed',
+            too_sensitive: 'Too sensitive',
+            more_like_this: 'More like this',
+            less_like_this: 'Less like this',
+        };
+        return labels[type] || type?.replaceAll('_', ' ') || 'Feedback';
+    }
+
+    function feedbackEffectLabel(effect) {
+        const labels = {
+            acknowledge: 'Acknowledge',
+            suppress: 'Suppress',
+            downrank: 'Down-rank',
+            uprank: 'Up-rank',
+            reframe: 'Reframe',
+            promote_to_memory: 'Memory',
+            update_operating_preference: 'Preference',
+        };
+        return labels[effect] || effect?.replaceAll('_', ' ') || 'Active';
+    }
+
+    function feedbackTitle(item) {
+        return item?.safe_summary
+            || item?.subject_key
+            || item?.target_id
+            || item?.target_type
+            || 'Mira financial feedback';
+    }
+
+    function feedbackMeta(item) {
+        const parts = [item?.subject_type, item?.target_type, item?.source].filter(Boolean);
+        return parts.join(' · ');
+    }
+
+    function intentKindLabel(kind) {
+        const labels = {
+            cut: 'Reduce',
+            hold: 'Hold',
+            grow: 'Grow',
+            monitor: 'Monitor',
+            avoid: 'Avoid',
+            increase: 'Increase',
+        };
+        return labels[kind] || kind?.replaceAll('_', ' ') || 'Intent';
+    }
+
+    function intentStatusLabel(status) {
+        const labels = {
+            active: 'Active',
+            paused: 'Paused',
+            completed: 'Done',
+            dismissed: 'Cleared',
+        };
+        return labels[status] || status;
+    }
+
+    function intentEvaluationLabel(intent) {
+        return intent?.evaluation?.summary || 'Stored; not evaluated yet.';
+    }
+
     onMount(refresh);
 
     $: budgetPct = Math.min(100, Math.round((tokenEstimate / budget) * 100));
@@ -204,32 +411,62 @@
         .map((section) => ({ ...section, entries: entriesForSection(section.key) }))
         .filter((section) => section.entries.length > 0);
     $: memoryState = tokenEstimate > budget ? 'Over budget' : tokenEstimate > budget * 0.7 ? 'Getting full' : 'Healthy';
+    $: financialFeedbackEnabled = Boolean(appConfig.miraFinancialFeedbackLoopEnabled);
+    $: statedIntentEnabled = Boolean(appConfig.miraStatedIntentMemoryEnabled);
 </script>
 
 <div class="folio-page-shell memory-page">
-    <div class="memory-hero fade-in">
-        <div class="memory-hero-copy">
-            <div class="memory-hero-icon">
-                <span class="material-symbols-outlined">psychology_alt</span>
-            </div>
-            <div>
-                <p class="memory-eyebrow">Copilot Memory</p>
-                <h2 class="folio-page-title memory-title">What Copilot remembers</h2>
-                <p class="folio-page-subtitle memory-subtitle">Preferences, goals, and context you have approved for future conversations.</p>
-            </div>
-        </div>
-        <div class="copilot-header-actions">
-            <a href="/copilot" class="copilot-side-pill">
-                <span class="material-symbols-outlined text-[14px]">arrow_back</span>
-                Copilot
-            </a>
-            <button class="copilot-side-pill" disabled={consolidating} on:click={reviewMyMemory}>
-                <span class="material-symbols-outlined text-[14px]" class:animate-spin={consolidating}>auto_fix_high</span>
-                {consolidating ? 'Reviewing' : 'Review'}
-            </button>
+    <header class="copilot-identity-header fade-in">
+        <div class="copilot-profile-row">
             <ProfileSwitcher />
         </div>
-    </div>
+        <div class="copilot-brand-lockup">
+            <div class="copilot-brand-main">
+                <div class="copilot-brand-text">
+                    <h1 class="copilot-title">Mira</h1>
+                    <p class="copilot-subtitle">Memory keeps approved preferences, goals, and context ready for future conversations.</p>
+                    <div class="copilot-identity-meta" aria-label="Mira memory status">
+                        <span class="copilot-identity-pill">
+                            <span class="material-symbols-outlined">bookmark</span>
+                            {entries.length} remembered
+                        </span>
+                        <span class="copilot-identity-pill">
+                            <span class="material-symbols-outlined">rate_review</span>
+                            {proposals.length} to review
+                        </span>
+                        <span class="copilot-identity-pill">
+                            <span class="material-symbols-outlined">forum</span>
+                            {sessionSummaries.length} session summaries
+                        </span>
+                        <span class="copilot-identity-pill">
+                            <span class="material-symbols-outlined">speed</span>
+                            {memoryState}
+                        </span>
+                    </div>
+                </div>
+            </div>
+            <div class="copilot-island-side">
+                <div class="copilot-island-nav" aria-label="Mira sections">
+                    <a href="/copilot" class="copilot-island-tab">
+                        <span class="material-symbols-outlined">arrow_back</span>
+                        Mira
+                    </a>
+                    <a href="/copilot?view=receipts" class="copilot-island-tab">
+                        <span class="material-symbols-outlined">receipt_long</span>
+                        Receipts
+                    </a>
+                    <span class="copilot-island-tab copilot-island-tab-active">
+                        <span class="material-symbols-outlined">bookmark</span>
+                        Memory
+                    </span>
+                    <button class="copilot-island-tab" disabled={consolidating} on:click={reviewMyMemory}>
+                        <span class="material-symbols-outlined" class:animate-spin={consolidating}>auto_fix_high</span>
+                        {consolidating ? 'Reviewing' : 'Review'}
+                    </button>
+                </div>
+            </div>
+        </div>
+    </header>
 
     {#if actionNotice}
         <div class="copilot-notice fade-in">{actionNotice}</div>
@@ -326,6 +563,63 @@
             <section class="memory-panel memory-review-panel">
                 <div class="memory-panel-head">
                     <div>
+                        <p class="memory-eyebrow">Session Continuity</p>
+                        <h3>{sessionSummaries.length ? `${sessionSummaries.length} summar${sessionSummaries.length !== 1 ? 'ies' : 'y'}` : 'No summaries yet'}</h3>
+                    </div>
+                </div>
+
+                {#if sessionSummaries.length > 0}
+                    <div class="memory-proposal-list">
+                        {#each sessionSummaries as summary (summary.id)}
+                            <article class="memory-proposal">
+                                {#if editingSummaryId === summary.id}
+                                    <textarea bind:value={summaryEditBuffer} class="memory-input memory-edit" rows="3" />
+                                    <div class="memory-entry-actions">
+                                        <button class="memory-action memory-action-primary" on:click={commitSummaryEdit}>
+                                            <span class="material-symbols-outlined">check</span>
+                                            Save
+                                        </button>
+                                        <button class="memory-action" on:click={cancelSummaryEdit}>
+                                            <span class="material-symbols-outlined">close</span>
+                                            Cancel
+                                        </button>
+                                    </div>
+                                {:else}
+                                    <div class="memory-proposal-meta">
+                                        {#each (summary.topics || []).slice(0, 3) as topic}
+                                            <span class="memory-tag">{topic}</span>
+                                        {/each}
+                                        <span class="memory-tag memory-tag--inferred">Summary</span>
+                                    </div>
+                                    <div class="memory-proposal-body">{summary.summary_text}</div>
+                                    {#if summary.unresolved_followups?.length}
+                                        <div class="memory-proposal-evidence">Open: {summary.unresolved_followups[0]}</div>
+                                    {/if}
+                                    <div class="memory-proposal-actions">
+                                        <button class="memory-action memory-action-primary" on:click={() => startSummaryEdit(summary)}>
+                                            <span class="material-symbols-outlined">edit</span>
+                                            Edit
+                                        </button>
+                                        <button class="memory-action" on:click={() => deleteSessionSummary(summary.id)}>
+                                            <span class="material-symbols-outlined">delete</span>
+                                            Remove
+                                        </button>
+                                    </div>
+                                {/if}
+                            </article>
+                        {/each}
+                    </div>
+                {:else}
+                    <div class="memory-quiet-state">
+                        <span class="material-symbols-outlined">forum</span>
+                        <p>Idle conversation summaries will appear here after Phase 20 is enabled.</p>
+                    </div>
+                {/if}
+            </section>
+
+            <section class="memory-panel memory-review-panel">
+                <div class="memory-panel-head">
+                    <div>
                         <p class="memory-eyebrow">Review Queue</p>
                         <h3>{proposals.length ? `${proposals.length} suggestion${proposals.length !== 1 ? 's' : ''}` : 'All clear'}</h3>
                     </div>
@@ -364,6 +658,120 @@
                     </div>
                 {/if}
             </section>
+
+            {#if statedIntentEnabled}
+                <section class="memory-panel memory-review-panel">
+                    <div class="memory-panel-head">
+                        <div>
+                            <p class="memory-eyebrow">Money Commitments</p>
+                            <h3>{statedIntents.length ? `${statedIntents.length} saved` : 'None saved'}</h3>
+                        </div>
+                    </div>
+
+                    {#if statedIntents.length > 0}
+                        <div class="memory-proposal-list">
+                            {#each statedIntents as intent (intent.id)}
+                                <article class="memory-proposal">
+                                    <div class="memory-proposal-meta">
+                                        <span class="memory-tag">{intentKindLabel(intent.intent_kind)}</span>
+                                        <span class="memory-tag memory-tag--{intent.status === 'active' ? 'stated' : 'inferred'}">{intentStatusLabel(intent.status)}</span>
+                                    </div>
+                                    {#if editingIntentId === intent.id}
+                                        <textarea bind:value={intentEditBuffer} class="memory-input memory-edit" rows="3" />
+                                        <div class="memory-entry-actions">
+                                            <button class="memory-action memory-action-primary" on:click={commitIntentEdit}>
+                                                <span class="material-symbols-outlined">check</span>
+                                                Save
+                                            </button>
+                                            <button class="memory-action" on:click={cancelIntentEdit}>
+                                                <span class="material-symbols-outlined">close</span>
+                                                Cancel
+                                            </button>
+                                        </div>
+                                    {:else}
+                                        <div class="memory-proposal-body">{intent.subject_label || intent.subject_key}</div>
+                                        <div class="memory-proposal-evidence">{intent.target_text}</div>
+                                        <div class="memory-source">{intentEvaluationLabel(intent)}</div>
+                                        <div class="memory-proposal-actions">
+                                            <button class="memory-action memory-action-primary" on:click={() => startIntentEdit(intent)}>
+                                                <span class="material-symbols-outlined">edit</span>
+                                                Edit
+                                            </button>
+                                            {#if intent.status === 'active'}
+                                                <button class="memory-action" on:click={() => setIntentStatus(intent, 'paused')}>
+                                                    <span class="material-symbols-outlined">pause</span>
+                                                    Pause
+                                                </button>
+                                            {:else if intent.status === 'paused'}
+                                                <button class="memory-action" on:click={() => setIntentStatus(intent, 'active')}>
+                                                    <span class="material-symbols-outlined">play_arrow</span>
+                                                    Resume
+                                                </button>
+                                            {/if}
+                                            <button class="memory-action" on:click={() => refreshStatedIntent(intent)}>
+                                                <span class="material-symbols-outlined">refresh</span>
+                                                Refresh
+                                            </button>
+                                            <button class="memory-action" on:click={() => clearStatedIntent(intent)}>
+                                                <span class="material-symbols-outlined">delete</span>
+                                                Clear
+                                            </button>
+                                        </div>
+                                    {/if}
+                                </article>
+                            {/each}
+                        </div>
+                    {:else}
+                        <div class="memory-quiet-state">
+                            <span class="material-symbols-outlined">flag</span>
+                            <p>Approved money commitments will appear here after Mira can map them to a merchant or category.</p>
+                        </div>
+                    {/if}
+                </section>
+            {/if}
+
+            {#if financialFeedbackEnabled}
+                <section class="memory-panel memory-review-panel">
+                    <div class="memory-panel-head">
+                        <div>
+                            <p class="memory-eyebrow">Financial Feedback</p>
+                            <h3>{financialFeedback.length ? `${financialFeedback.length} active` : 'All clear'}</h3>
+                        </div>
+                    </div>
+
+                    {#if financialFeedback.length > 0}
+                        <div class="memory-proposal-list">
+                            {#each financialFeedback as item (item.id)}
+                                <article class="memory-proposal">
+                                    <div class="memory-proposal-meta">
+                                        <span class="memory-tag">{feedbackTypeLabel(item.feedback_type)}</span>
+                                        <span class="memory-tag">{feedbackEffectLabel(item.normalized_effect)}</span>
+                                    </div>
+                                    <div class="memory-proposal-body">{feedbackTitle(item)}</div>
+                                    {#if feedbackMeta(item)}
+                                        <div class="memory-proposal-evidence">{feedbackMeta(item)}</div>
+                                    {/if}
+                                    <div class="memory-proposal-actions">
+                                        <button class="memory-action memory-action-primary" on:click={() => rememberFinancialFeedback(item)}>
+                                            <span class="material-symbols-outlined">bookmark_add</span>
+                                            Remember
+                                        </button>
+                                        <button class="memory-action" on:click={() => clearFinancialFeedback(item)}>
+                                            <span class="material-symbols-outlined">delete</span>
+                                            Clear
+                                        </button>
+                                    </div>
+                                </article>
+                            {/each}
+                        </div>
+                    {:else}
+                        <div class="memory-quiet-state">
+                            <span class="material-symbols-outlined">rule_settings</span>
+                            <p>No active financial feedback.</p>
+                        </div>
+                    {/if}
+                </section>
+            {/if}
 
             <section class="memory-panel">
                 <div class="memory-panel-head">
@@ -407,47 +815,6 @@
         display: flex;
         flex-direction: column;
         gap: 16px;
-    }
-
-    .memory-hero {
-        display: flex;
-        align-items: flex-start;
-        justify-content: space-between;
-        gap: 1rem;
-        flex-wrap: wrap;
-    }
-
-    .memory-hero-copy {
-        display: flex;
-        align-items: center;
-        gap: 12px;
-        min-width: 0;
-    }
-
-    .memory-hero-icon {
-        width: 40px;
-        height: 40px;
-        border-radius: 12px;
-        display: inline-flex;
-        align-items: center;
-        justify-content: center;
-        flex: 0 0 auto;
-        color: #fff;
-        background: linear-gradient(135deg, var(--accent), color-mix(in srgb, var(--accent) 58%, #111827));
-        box-shadow: 0 10px 26px color-mix(in srgb, var(--accent) 22%, transparent);
-    }
-
-    .memory-hero-icon .material-symbols-outlined {
-        font-size: 20px;
-    }
-
-    .memory-title {
-        font-size: clamp(1.25rem, 0.8vw + 1rem, 1.7rem);
-        margin: 0;
-    }
-
-    .memory-subtitle {
-        max-width: 680px;
     }
 
     .memory-eyebrow {
@@ -835,10 +1202,6 @@
     }
 
     @media (max-width: 640px) {
-        .memory-hero-copy {
-            align-items: flex-start;
-        }
-
         .memory-entry {
             flex-direction: column;
         }

@@ -7,9 +7,10 @@ from datetime import datetime
 from typing import Any, Callable
 
 from range_parser import parse_range
+from mira.agentic.temporal_parser import is_bounded_range_token
 
 from mira.agentic.schemas import AgentDecision, ToolPlanStep, ValidationResult
-from mira.agentic.semantic_catalog import canonical_semantic_tool_name, is_semantic_tool
+from mira.agentic.semantic_catalog import SEMANTIC_TOOL_CATALOG, canonical_semantic_tool_name, is_semantic_tool
 from mira.agentic.semantic_frames import complete_semantic_frame
 from mira.agentic.semantic_tool_adapter import (
     contains_apply_key,
@@ -91,6 +92,10 @@ def validate_selector_calls(
             )
         if name == "run_sql":
             return _blocked(decision, "disallowed internal tool")
+        if name not in by_name and is_semantic_tool(name):
+            spec = SEMANTIC_TOOL_CATALOG.get(name)
+            if spec is not None:
+                by_name[name] = spec.for_selector()
         if name not in by_name:
             return _blocked(decision, f"unknown tool: {raw_name or '<empty>'}")
         if name in _DIRECT_MEMORY_MUTATION_TOOLS:
@@ -300,6 +305,8 @@ def _normalize_range(value: str, *, now: datetime | None) -> str:
             return "last_month"
         return token
     if re.match(r"^\d{4}-\d{2}$", token):
+        return token
+    if is_bounded_range_token(token):
         return token
     if re.match(r"^last_\d+d$", token):
         return token

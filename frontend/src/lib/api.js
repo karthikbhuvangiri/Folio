@@ -88,6 +88,12 @@ const PROFILE_EXEMPT_ENDPOINTS = new Set([
 
 const UNCACHED_ENDPOINTS = new Set([
     '/sync-status',
+    '/proactive-insights',
+    '/proactive-insights/background-refresh/status',
+    '/mira/advisor-read',
+    '/mira/financial-feedback',
+    '/mira/stated-intents',
+    '/mira/advisor-cases',
 ]);
 
 /**
@@ -210,6 +216,15 @@ export function createApi(fetchFn = fetch) {
 
     return {
         getAccounts: () => request('/accounts'),
+        updateAccountPaymentDetails: (id, payload, profile = null) => {
+            const params = new URLSearchParams();
+            if (profile && profile !== 'household') params.set('profile', profile);
+            const qs = params.toString();
+            return request(`/accounts/${encodeURIComponent(id)}/payment-details${qs ? '?' + qs : ''}`, {
+                method: 'PATCH',
+                body: JSON.stringify(payload)
+            });
+        },
 
         getTransactions: (params = {}) => {
             const query = new URLSearchParams();
@@ -391,14 +406,14 @@ export function createApi(fetchFn = fetch) {
         getDataHealth: () => request('/data-health'),
         getScheduledTransactions: (days = 45) => request(`/scheduled-transactions?days=${days}`),
         getCashFlowForecast: (days = 90) => request(`/analytics/cash-flow-forecast?days=${days}`),
-        explainMonth: (month, useLlm = true, profile = null) => {
+        explainMonth: (month, useLlm = true, profile = null, save = true) => {
             const params = new URLSearchParams();
             const activeProfile = profile || get(profileParam);
             if (activeProfile) params.set('profile', activeProfile);
             const qs = params.toString();
             return request(`/analytics/explain-month${qs ? '?' + qs : ''}`, {
                 method: 'POST',
-                body: JSON.stringify({ month, use_llm: useLlm })
+                body: JSON.stringify({ month, use_llm: useLlm, save })
             });
         },
         getInvestments: () => request('/investments'),
@@ -452,6 +467,8 @@ export function createApi(fetchFn = fetch) {
          *   { type: 'token', text }
          *   { type: 'tool_call', name, args }
          *   { type: 'tool_result', name, duration_ms }
+         *   { type: 'evidence_preview', data, data_source, chart, tool_trace }
+         *   { type: 'preview_answer', text }
          *   { type: 'done', answer, data, data_source, tool_trace, iterations }
          *   { type: 'error', message }
          */
@@ -578,6 +595,71 @@ export function createApi(fetchFn = fetch) {
             if (profile && profile !== 'household') params.set('profile', profile);
             const qs = params.toString();
             return request(`/memory/markdown${qs ? '?' + qs : ''}`);
+        },
+        createMiraMemory: (entry, profile = null) => {
+            const params = new URLSearchParams();
+            if (profile && profile !== 'household') params.set('profile', profile);
+            const qs = params.toString();
+            return request(`/mira/memories${qs ? '?' + qs : ''}`, {
+                method: 'POST',
+                body: JSON.stringify(entry),
+            });
+        },
+        getMiraSessionSummaries: (profile = null) => {
+            const params = new URLSearchParams();
+            if (profile && profile !== 'household') params.set('profile', profile);
+            const qs = params.toString();
+            return request(`/mira/session-summaries${qs ? '?' + qs : ''}`);
+        },
+        updateMiraSessionSummary: (summaryId, summaryText, profile = null) => {
+            const params = new URLSearchParams();
+            if (profile && profile !== 'household') params.set('profile', profile);
+            const qs = params.toString();
+            return request(`/mira/session-summaries/${summaryId}${qs ? '?' + qs : ''}`, {
+                method: 'PATCH',
+                body: JSON.stringify({ summary_text: summaryText }),
+            });
+        },
+        deleteMiraSessionSummary: (summaryId, profile = null) => {
+            const params = new URLSearchParams();
+            if (profile && profile !== 'household') params.set('profile', profile);
+            const qs = params.toString();
+            return request(`/mira/session-summaries/${summaryId}${qs ? '?' + qs : ''}`, { method: 'DELETE' });
+        },
+        getMiraStatedIntents: (profile = null, includeInactive = true) => {
+            const params = new URLSearchParams();
+            if (profile && profile !== 'household') params.set('profile', profile);
+            if (includeInactive) params.set('include_inactive', 'true');
+            const qs = params.toString();
+            return request(`/mira/stated-intents${qs ? '?' + qs : ''}`);
+        },
+        updateMiraStatedIntent: async (intentId, payload = {}, profile = null) => {
+            const params = new URLSearchParams();
+            if (profile && profile !== 'household') params.set('profile', profile);
+            const qs = params.toString();
+            const result = await request(`/mira/stated-intents/${intentId}${qs ? '?' + qs : ''}`, {
+                method: 'PATCH',
+                body: JSON.stringify(payload),
+            });
+            invalidateCacheByPrefix('/mira/stated-intents');
+            return result;
+        },
+        clearMiraStatedIntent: async (intentId, profile = null) => {
+            const params = new URLSearchParams();
+            if (profile && profile !== 'household') params.set('profile', profile);
+            const qs = params.toString();
+            const result = await request(`/mira/stated-intents/${intentId}${qs ? '?' + qs : ''}`, { method: 'DELETE' });
+            invalidateCacheByPrefix('/mira/stated-intents');
+            return result;
+        },
+        evaluateMiraStatedIntent: async (intentId, profile = null) => {
+            const params = new URLSearchParams();
+            if (profile && profile !== 'household') params.set('profile', profile);
+            params.set('as_of', getLocalDateKey());
+            const qs = params.toString();
+            const result = await request(`/mira/stated-intents/${intentId}/evaluate?${qs}`, { method: 'POST' });
+            invalidateCacheByPrefix('/mira/stated-intents');
+            return result;
         },
         getMemoryProposals: (profile = null) => {
             const params = new URLSearchParams();
@@ -708,11 +790,136 @@ export function createApi(fetchFn = fetch) {
         getProactiveInsights: (includeDismissed = false) =>
             request(`/proactive-insights${includeDismissed ? '?include_dismissed=true' : ''}`),
 
-        dismissProactiveInsight: (id) =>
-            request(`/proactive-insights/${encodeURIComponent(id)}/dismiss`, { method: 'POST' }),
+        refreshBackgroundProactiveInsights: (force = false, wait = false) => {
+            const params = new URLSearchParams();
+            if (force) params.set('force', 'true');
+            if (wait) params.set('wait', 'true');
+            const qs = params.toString();
+            return request(`/proactive-insights/background-refresh${qs ? '?' + qs : ''}`, { method: 'POST' });
+        },
 
-        restoreProactiveInsight: (id) =>
-            request(`/proactive-insights/${encodeURIComponent(id)}/restore`, { method: 'POST' }),
+        getBackgroundProactiveInsightStatus: () =>
+            request('/proactive-insights/background-refresh/status'),
+
+        dismissProactiveInsight: async (id) => {
+            const result = await request(`/proactive-insights/${encodeURIComponent(id)}/dismiss`, { method: 'POST' });
+            invalidateCacheByPrefix('/proactive-insights');
+            return result;
+        },
+
+        restoreProactiveInsight: async (id) => {
+            const result = await request(`/proactive-insights/${encodeURIComponent(id)}/restore`, { method: 'POST' });
+            invalidateCacheByPrefix('/proactive-insights');
+            return result;
+        },
+
+        getMiraAdvisorRead: (profile = null) => {
+            const params = new URLSearchParams();
+            if (profile && profile !== 'household') params.set('profile', profile);
+            const qs = params.toString();
+            return request(`/mira/advisor-read${qs ? '?' + qs : ''}`);
+        },
+
+        refreshMiraAdvisorRead: async (profile = null) => {
+            const params = new URLSearchParams();
+            if (profile && profile !== 'household') params.set('profile', profile);
+            const qs = params.toString();
+            const result = await request(`/mira/advisor-read/refresh${qs ? '?' + qs : ''}`, { method: 'POST' });
+            invalidateCacheByPrefix('/mira/advisor-read');
+            return result;
+        },
+
+        generateMiraAdvisorRead: async (force = true, profile = null) => {
+            const params = new URLSearchParams();
+            params.set('force', force ? 'true' : 'false');
+            if (profile && profile !== 'household') params.set('profile', profile);
+            const qs = params.toString();
+            const result = await request(`/mira/advisor-read/generate${qs ? '?' + qs : ''}`, { method: 'POST' });
+            invalidateCacheByPrefix('/mira/advisor-read');
+            return result;
+        },
+
+        askMiraAdvisorReadFollowup: (followupType, question, profile = null, history = []) => {
+            const params = new URLSearchParams();
+            if (profile && profile !== 'household') params.set('profile', profile);
+            const qs = params.toString();
+            return request(`/mira/advisor-read/followup${qs ? '?' + qs : ''}`, {
+                method: 'POST',
+                body: JSON.stringify({
+                    followup_type: followupType || 'general',
+                    question: question || '',
+                    history: Array.isArray(history) ? history : [],
+                }),
+            });
+        },
+
+        getMiraFinancialFeedback: (profile = null) => {
+            const params = new URLSearchParams();
+            if (profile && profile !== 'household') params.set('profile', profile);
+            const qs = params.toString();
+            return request(`/mira/financial-feedback${qs ? '?' + qs : ''}`);
+        },
+
+        createMiraFinancialFeedback: async (payload = {}, profile = null) => {
+            const params = new URLSearchParams();
+            if (profile && profile !== 'household') params.set('profile', profile);
+            const qs = params.toString();
+            const result = await request(`/mira/financial-feedback${qs ? '?' + qs : ''}`, {
+                method: 'POST',
+                body: JSON.stringify(payload),
+            });
+            invalidateCacheByPrefix('/mira/advisor-read');
+            invalidateCacheByPrefix('/mira/financial-feedback');
+            return result;
+        },
+
+        clearMiraFinancialFeedback: async (feedbackId, profile = null) => {
+            const params = new URLSearchParams();
+            if (profile && profile !== 'household') params.set('profile', profile);
+            const qs = params.toString();
+            const result = await request(`/mira/financial-feedback/${feedbackId}${qs ? '?' + qs : ''}`, { method: 'DELETE' });
+            invalidateCacheByPrefix('/mira/advisor-read');
+            invalidateCacheByPrefix('/mira/financial-feedback');
+            return result;
+        },
+
+        promoteMiraFinancialFeedbackToMemory: async (feedbackId, profile = null) => {
+            const params = new URLSearchParams();
+            if (profile && profile !== 'household') params.set('profile', profile);
+            const qs = params.toString();
+            const result = await request(`/mira/financial-feedback/${feedbackId}/promote-memory${qs ? '?' + qs : ''}`, { method: 'POST' });
+            invalidateCacheByPrefix('/memory/entries');
+            invalidateCacheByPrefix('/memory/markdown');
+            invalidateCacheByPrefix('/mira/financial-feedback');
+            return result;
+        },
+
+        getMiraAdvisorCases: (includeDismissed = false, profile = null) => {
+            const params = new URLSearchParams();
+            if (includeDismissed) params.set('include_dismissed', 'true');
+            if (profile && profile !== 'household') params.set('profile', profile);
+            const qs = params.toString();
+            return request(`/mira/advisor-cases${qs ? '?' + qs : ''}`);
+        },
+
+        refreshMiraAdvisorCases: async (force = false, profile = null) => {
+            const params = new URLSearchParams();
+            if (force) params.set('force', 'true');
+            if (profile && profile !== 'household') params.set('profile', profile);
+            const qs = params.toString();
+            const result = await request(`/mira/advisor-cases/refresh${qs ? '?' + qs : ''}`, { method: 'POST' });
+            invalidateCacheByPrefix('/mira/advisor-cases');
+            return result;
+        },
+
+        dismissMiraAdvisorCase: async (id, profile = null) => {
+            const params = new URLSearchParams();
+            if (profile && profile !== 'household') params.set('profile', profile);
+            const qs = params.toString();
+            const result = await request(`/mira/advisor-cases/${encodeURIComponent(id)}/dismiss${qs ? '?' + qs : ''}`, { method: 'POST' });
+            invalidateCacheByPrefix('/mira/advisor-cases');
+            return result;
+        },
 
         getSankeyData: (month) =>
             request(`/analytics/sankey${month ? '?month=' + month : ''}`),

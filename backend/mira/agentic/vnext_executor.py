@@ -5,6 +5,7 @@ import time
 from collections.abc import Iterator
 from typing import Any, Callable
 
+from mira.agentic.confidence import compact_confidence_summary
 from mira.agentic.schemas import EvidencePacket, ToolPlanStep, ValidationResult
 from mira.agentic.semantic_catalog import is_semantic_tool
 from mira.agentic.semantic_frames import semantic_frame_from_args
@@ -55,6 +56,7 @@ def iter_execute_vnext_events(
     records: list[dict[str, Any]] = []
     facts: list[dict[str, Any]] = []
     rows: list[dict[str, Any]] = []
+    display_rows: list[dict[str, Any]] = []
     charts: list[dict[str, Any]] = []
     caveats: list[str] = []
     previous_results: dict[str, dict[str, Any]] = {}
@@ -94,6 +96,7 @@ def iter_execute_vnext_events(
         previous_results[step.step_id] = record
         facts.extend(_facts_from_result(record))
         rows.extend(_rows_from_result(compact_result))
+        display_rows.extend(_display_rows_from_result(result))
         charts.extend(_charts_from_result(compact_result, step))
         caveats.extend(_caveats_from_result(compact_result))
         yield {
@@ -113,6 +116,7 @@ def iter_execute_vnext_events(
             tool_results=records,
             facts=facts,
             rows=rows[:100],
+            display_rows=display_rows[:100],
             charts=charts,
             caveats=_dedupe_text(caveats),
             provenance={
@@ -187,13 +191,17 @@ def compact_tool_result(tool_name: str, args: dict[str, Any], result: Any) -> di
         if isinstance(result.get(key), list):
             out[key] = [compact_value(item) for item in result[key][:8]]
 
-    for key in ("recent", "rows", "samples", "items", "transactions", "preview_changes", "categories", "merchants", "series", "memories"):
+    for key in ("recent", "rows", "samples", "items", "data", "transactions", "preview_changes", "categories", "merchants", "budgets", "series", "memories", "facts"):
         if isinstance(result.get(key), list):
             out[key] = [
-                compact_transaction_row(item) if key in {"recent", "rows", "transactions"} else compact_mapping(item, max_items=12)
+                compact_transaction_row(item) if key in {"recent", "rows", "data", "transactions"} else compact_mapping(item, max_items=12)
                 for item in result[key][:8]
                 if isinstance(item, dict)
             ]
+
+    confidence_summary = compact_confidence_summary(result)
+    if confidence_summary:
+        out["confidence_summary"] = confidence_summary
 
     for key in ("labels", "values"):
         if isinstance(result.get(key), list):
@@ -231,6 +239,37 @@ def compact_transaction_row(value: dict[str, Any]) -> dict[str, Any]:
         for key in keys
         if value.get(key) not in (None, "", [], {})
     }
+
+
+def compact_display_row(value: dict[str, Any]) -> dict[str, Any]:
+    transaction_markers = {
+        "id",
+        "transaction_id",
+        "date",
+        "description",
+        "merchant_name",
+        "merchant_key",
+        "account",
+    }
+    if any(key in value for key in transaction_markers):
+        return compact_transaction_row(value)
+    return compact_mapping(value, max_items=12)
+
+
+def _display_rows_from_result(result: Any) -> list[dict[str, Any]]:
+    if not isinstance(result, dict):
+        return []
+    rows: list[dict[str, Any]] = []
+    for key in ("transactions", "data", "recent", "rows", "items", "categories", "merchants", "budgets"):
+        values = result.get(key)
+        if isinstance(values, list):
+            rows.extend(
+                compact_display_row(item) if isinstance(item, dict) else {}
+                for item in values[:50]
+                if isinstance(item, dict)
+            )
+            break
+    return [row for row in rows if row]
 
 
 def compact_mapping(value: dict[str, Any], *, max_items: int) -> dict[str, Any]:
@@ -291,10 +330,10 @@ def tool_trace_from_evidence(evidence: EvidencePacket) -> list[dict]:
 def data_from_evidence(evidence: EvidencePacket, pending_write: dict | None) -> tuple[Any, str | None]:
     if pending_write:
         return pending_write.get("samples") or evidence.rows, "write_preview"
+    if evidence.display_rows:
+        return evidence.display_rows, "agentic_vnext_tools"
     if evidence.rows:
         return evidence.rows, "agentic_vnext_tools"
-    if evidence.facts:
-        return evidence.facts, "agentic_vnext_tools"
     return None, None
 
 
@@ -302,6 +341,7 @@ def evidence_summary(evidence: EvidencePacket) -> dict[str, Any]:
     return {
         "facts": copy.deepcopy(evidence.facts[:6]),
         "row_count": len(evidence.rows),
+        "display_row_count": len(evidence.display_rows),
         "chart_count": len(evidence.charts),
         "caveats": list(evidence.caveats or []),
         "provenance": copy.deepcopy(evidence.provenance),
@@ -447,6 +487,20 @@ def _facts_from_result(record: dict[str, Any]) -> list[dict[str, Any]]:
     result = record.get("result")
     if not isinstance(result, dict):
         return [{"tool": record.get("tool_name"), "value": result}]
+    result_facts = result.get("facts")
+    if isinstance(result_facts, list):
+        facts: list[dict[str, Any]] = []
+        for item in result_facts[:8]:
+            if not isinstance(item, dict):
+                continue
+            facts.append({
+                "step_id": record.get("step_id"),
+                "tool": record.get("tool_name"),
+                "execution_tool": record.get("execution_tool_name"),
+                **copy.deepcopy(item),
+            })
+        if facts:
+            return facts
     fact: dict[str, Any] = {
         "step_id": record.get("step_id"),
         "tool": record.get("tool_name"),
@@ -466,7 +520,7 @@ def _rows_from_result(result: Any) -> list[dict[str, Any]]:
     if not isinstance(result, dict):
         return []
     rows: list[dict[str, Any]] = []
-    for key in ("transactions", "recent", "rows", "items", "data", "merchants"):
+    for key in ("transactions", "recent", "rows", "items", "data", "merchants", "categories", "budgets"):
         values = result.get(key)
         if isinstance(values, list):
             rows.extend(copy.deepcopy([item for item in values if isinstance(item, dict)]))

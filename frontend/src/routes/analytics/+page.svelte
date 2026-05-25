@@ -25,7 +25,12 @@
     let pulseExpanded = false;
     let explainingMonth = false;
     let monthExplanation = null;
+    let monthExplanationOpen = false;
+    let monthExplanationSections = [];
+    let explainedMonth = '';
+    let explainedProfile = '';
     let explanationError = '';
+    let mounted = false;
     
     // iOS-style period toggle
     const analyticsPeriods = ['This Month', 'Last Month', 'Custom'];
@@ -199,6 +204,7 @@
        LIFECYCLE
        ═══════════════════════════════════════ */
     onMount(async () => {
+        mounted = true;
         // Fetch recurring detection (profile-aware, not month-specific)
         api.getRecurring().then(data => { recurringData = data; recurringLoading = false; }).catch(() => { recurringLoading = false; });
 
@@ -316,6 +322,20 @@
     })();
 
     $: currentMonthSummary = analyticsContext.currentMonthSummary;
+
+    $: monthBriefingProfile = $activeProfile || 'household';
+
+    $: if (mounted && selectedMonth && !explainingMonth && (explainedMonth !== selectedMonth || explainedProfile !== monthBriefingProfile)) {
+        loadSelectedMonthBriefing(selectedMonth, monthBriefingProfile);
+    }
+
+    $: if (monthExplanation && explainedMonth && selectedMonth && explainedMonth !== selectedMonth) {
+        monthExplanation = null;
+        monthExplanationOpen = false;
+        explainedMonth = '';
+        explainedProfile = '';
+        explanationError = '';
+    }
 
     /* ═══════════════════════════════════════
        S1: SPENDING PULSE — Anomaly Detection
@@ -547,6 +567,47 @@
         });
 
         return { items, maxValue: Math.max(income + creditsRefunds + incomingTransfers, income), minValue: Math.min(running, 0), netResult: running };
+    })();
+
+    $: analyticsHeroDrivers = (() => {
+        const drivers = [];
+        const flowItems = waterfallData?.items || [];
+        const drags = flowItems
+            .filter(item => item.value < 0 && item.type !== 'result')
+            .sort((a, b) => Math.abs(b.value) - Math.abs(a.value));
+        const offsets = flowItems
+            .filter(item => item.value > 0 && item.type !== 'result')
+            .sort((a, b) => Math.abs(b.value) - Math.abs(a.value));
+
+        if (drags[0]) {
+            drivers.push({
+                label: 'Largest drag',
+                value: drags[0].label,
+                detail: `-${formatCurrency(Math.abs(drags[0].value))}`,
+                tone: 'negative'
+            });
+        }
+
+        if (offsets[0]) {
+            drivers.push({
+                label: 'Biggest offset',
+                value: offsets[0].label,
+                detail: `+${formatCurrency(offsets[0].value)}`,
+                tone: 'positive'
+            });
+        }
+
+        const anomaly = spendingPulseCards.find(card => card.isAnomaly);
+        if (anomaly) {
+            drivers.push({
+                label: 'Unusual category',
+                value: anomaly.category,
+                detail: `${formatPercent(Math.abs(anomaly.deviation))} ${anomaly.isOver ? 'above' : 'below'} avg`,
+                tone: anomaly.isOver ? 'warning' : 'positive'
+            });
+        }
+
+        return drivers.slice(0, 3);
     })();
 
     /* Waterfall SVG geometry */
@@ -948,6 +1009,50 @@
     })();
 
     $: recurringReviewValue = inactiveTotalSpent;
+    const recurringFrequencyMultipliers = {
+        weekly: 52,
+        biweekly: 26,
+        monthly: 12,
+        quarterly: 4,
+        semi_annual: 2,
+        annual: 1
+    };
+
+    function recurringDisplayAmount(item) {
+        const amount = Number(item?.amount ?? item?.avg_amount ?? 0);
+        return Number.isFinite(amount) ? amount : 0;
+    }
+
+    function recurringAnnualCost(item) {
+        const annual = Number(item?.annual_cost);
+        if (Number.isFinite(annual) && annual > 0) return annual;
+        const freq = String(item?.frequency || 'monthly').toLowerCase().replace('-', '_');
+        return recurringDisplayAmount(item) * (recurringFrequencyMultipliers[freq] || 12);
+    }
+
+    function recurringAmountNote(item) {
+        const amount = recurringDisplayAmount(item);
+        const stored = Number(item?.stored_amount ?? 0);
+        if (stored > 0 && Math.abs(stored - amount) >= 0.01) {
+            return `was ${formatCurrency(stored)}`;
+        }
+        return '';
+    }
+
+    function subscriptionTimingText(item) {
+        const last = item?.last_charge || item?.evidence?.last_paid;
+        const next = item?.next_expected || item?.next_date;
+        const inactive = item?.cancelled || ['inactive', 'stale', 'cancelled'].includes(item?.state) || ['inactive', 'cancelled'].includes(item?.status);
+        const parts = [];
+        if (last) parts.push(`Last ${formatDateShort(last)}`);
+        if (next && !inactive) {
+            parts.push(`Next ${formatDateShort(next)}`);
+        } else if (inactive) {
+            parts.push('No next charge');
+        }
+        return parts.join(' · ');
+    }
+
     $: visibleRecurringTotals = (() => {
         const trustedActive = activeRecurring.filter((item) =>
             item.confirmed ||
@@ -955,7 +1060,7 @@
             item.confidence === 'high' ||
             Number(item.confidence_score || 0) >= 75
         );
-        const annual = trustedActive.reduce((sum, item) => sum + (item.annual_cost || 0), 0);
+        const annual = trustedActive.reduce((sum, item) => sum + recurringAnnualCost(item), 0);
         return {
             monthly: annual / 12,
             annual,
@@ -1077,19 +1182,173 @@
         // 'Custom' does nothing — user picks from dropdown
     }
 
-    async function explainSelectedMonth() {
-        if (!selectedMonth || explainingMonth) return;
+    async function loadSelectedMonthBriefing(month, profileKey) {
+        if (!month || explainingMonth) return;
         explainingMonth = true;
         explanationError = '';
         try {
-            const result = await api.explainMonth(selectedMonth, true);
-            monthExplanation = result;
+            const result = await api.explainMonth(month, false, null, false);
+            if (selectedMonth === month && monthBriefingProfile === profileKey) {
+                monthExplanation = result;
+                explainedMonth = month;
+                explainedProfile = profileKey;
+                monthExplanationOpen = true;
+            }
         } catch (e) {
-            console.error('Failed to explain month:', e);
-            explanationError = e?.message || 'Failed to explain this month';
+            console.error('Failed to load month briefing:', e);
+            if (selectedMonth === month) {
+                monthExplanation = null;
+                explainedMonth = month;
+                explainedProfile = profileKey;
+                explanationError = e?.message || 'Failed to load month briefing';
+            }
         } finally {
             explainingMonth = false;
         }
+    }
+
+    const MONTH_EXPLANATION_SECTION_META = [
+        { label: 'Takeaway', icon: 'auto_awesome', tone: 'accent' },
+        { label: 'Drivers', icon: 'query_stats', tone: 'spend' },
+        { label: 'Watch', icon: 'event_upcoming', tone: 'warning' },
+        { label: 'Facts', icon: 'fact_check', tone: 'muted' },
+    ];
+
+    function parseMonthExplanation(answer) {
+        const text = String(answer || '').trim();
+        if (!text) return [];
+
+        const lines = text.split(/\n+/).map(line => line.trim()).filter(Boolean);
+        const used = new Set();
+        const sections = [];
+
+        for (const meta of MONTH_EXPLANATION_SECTION_META) {
+            const pattern = new RegExp(`^[\\s\\-*]*\\*{0,2}${meta.label}\\*{0,2}\\s*[:\\-]\\s*`, 'i');
+            const idx = lines.findIndex((line, i) => !used.has(i) && pattern.test(line));
+            if (idx === -1) continue;
+            used.add(idx);
+            sections.push({
+                ...meta,
+                text: lines[idx].replace(pattern, '').trim(),
+            });
+        }
+
+        const extra = lines.filter((_, i) => !used.has(i)).join(' ');
+        if (extra) {
+            sections.push({ label: 'Mira', icon: 'notes', tone: 'muted', text: extra });
+        }
+
+        return sections.length
+            ? sections
+            : [{ label: 'Mira', icon: 'auto_awesome', tone: 'accent', text }];
+    }
+
+    $: monthExplanationSections = monthExplanation ? parseMonthExplanation(monthExplanation.answer) : [];
+    $: analyticsHeroBriefSections = (() => {
+        if (!currentMonthSummary) return [];
+
+        const creditsRefunds = currentMonthSummary.credits_refunds ?? currentMonthSummary.refunds ?? 0;
+        const incomingTransfers = currentMonthSummary.incoming_transfers || 0;
+        const extTransfers = currentMonthSummary.external_transfers || 0;
+        const netFlow = waterfallData?.netResult ?? ((currentMonthSummary.income || 0) - (currentMonthSummary.expenses || 0) + creditsRefunds + incomingTransfers - extTransfers);
+        const topDrag = analyticsHeroDrivers.find(driver => driver.label === 'Largest drag');
+        const topOffset = analyticsHeroDrivers.find(driver => driver.label === 'Biggest offset');
+        const anomaly = analyticsHeroDrivers.find(driver => driver.label === 'Unusual category');
+
+        return [
+            {
+                label: 'Takeaway',
+                icon: 'auto_awesome',
+                tone: 'accent',
+                text: `Net flow for ${formatMonth(selectedMonth)} is ${netFlow >= 0 ? '+' : ''}${formatCurrency(netFlow)} after ${formatCurrency(currentMonthSummary.expenses)} in expenses.`
+            },
+            {
+                label: 'Drivers',
+                icon: 'query_stats',
+                tone: 'spend',
+                text: topDrag
+                    ? `${topDrag.value} is the largest drag at ${topDrag.detail}.`
+                    : 'No material spending drag is showing for this month yet.'
+            },
+            {
+                label: 'Watch',
+                icon: 'event_upcoming',
+                tone: 'warning',
+                text: anomaly
+                    ? `${anomaly.value} is moving differently from its usual pattern: ${anomaly.detail.toLowerCase()}.`
+                    : 'No unusual category movement is standing out yet.'
+            },
+            {
+                label: 'Facts',
+                icon: 'fact_check',
+                tone: 'muted',
+                text: topOffset
+                    ? `${topOffset.value} is the biggest offset at ${topOffset.detail}.`
+                    : `Income is ${formatCurrency(currentMonthSummary.income || 0)} and credits are ${formatCurrency(creditsRefunds)}.`
+            }
+        ];
+    })();
+    $: analyticsHeroDisplayedSections = monthExplanation
+        ? monthExplanationSections
+        : analyticsHeroBriefSections;
+    $: analyticsHeroFactSummary = (() => {
+        const facts = monthExplanation?.facts;
+        if (!facts) return null;
+
+        const compactFact = (item, labelKey = 'category') => {
+            const label = item?.[labelKey] || item?.merchant || 'Item';
+            const amount = Number.isFinite(Number(item?.total)) ? formatCompact(Number(item.total)) : (item?.total_formatted || '$0');
+            return `${label} ${amount}`;
+        };
+        const recurring = facts.recurring || {};
+
+        return {
+            recurring: `${recurring.monthly_formatted || '$0'} recurring · ${recurring.active_count || 0} active`,
+            categories: (facts.top_categories || []).slice(0, 2).map(cat => compactFact(cat)).join(' · '),
+            merchants: (facts.top_merchants || []).slice(0, 2).map(merchant => compactFact(merchant, 'merchant')).join(' · ')
+        };
+    })();
+
+    function normalizeHeroBullet(text) {
+        return String(text || '')
+            .replace(/\s+/g, ' ')
+            .replace(/\(([^)]+)\)/g, '$1')
+            .replace(/\.$/, '')
+            .trim();
+    }
+
+    function analyticsHeroBulletRows(section) {
+        const text = normalizeHeroBullet(section?.text);
+        if (!text) return [];
+
+        if (section.label === 'Takeaway') {
+            const match = text.match(/ended at\s+(.+?)\s+net flow after\s+(.+?)\s+in spending and\s+(.+?)\s+in income/i);
+            if (match) return [`${match[1]} net flow`, `${match[2]} spent · ${match[3]} income`];
+        }
+
+        if (section.label === 'Drivers') {
+            const movementText = text.includes(' were ') ? text.split(' were ').pop() : text;
+            return movementText
+                .split(/,\s+/)
+                .map(normalizeHeroBullet)
+                .filter(Boolean)
+                .slice(0, 2);
+        }
+
+        if (section.label === 'Watch') {
+            const [lead, ledBy] = text.split(/,\s+led by\s+/i);
+            if (ledBy) {
+                const compactLead = normalizeHeroBullet(
+                    lead.replace(/(.+?)\s+is scheduled over the next\s+(\d+)\s+days/i, '$1 scheduled · $2 days')
+                );
+                return [
+                    compactLead,
+                    ledBy.split(/,\s+/).map(normalizeHeroBullet).filter(Boolean).slice(0, 2).join(' · ')
+                ].filter(Boolean);
+            }
+        }
+
+        return [text];
     }
 
     // ── Subscription feedback handlers ──────────────────────────────
@@ -1330,7 +1589,7 @@
 <div class="profile-transition" class:profile-loading={profileSwitching}>
 
     <!-- --- HEADER --- -->
-    <div class="flex items-start justify-between mb-8 fade-in" style="position: relative; z-index: 100;">
+    <div class="flex items-start justify-between mb-4 fade-in" style="position: relative; z-index: 100;">
         <div>
             <p class="folio-kicker mb-1.5" style="color: var(--accent)">Insights</p>
             <h2 class="folio-page-title">
@@ -1341,34 +1600,7 @@
         <ProfileSwitcher />
     </div>
 
-    <section class="analytics-mira-panel card fade-in-up" style="animation-delay: 40ms">
-        <div class="analytics-mira-main">
-            <div>
-                <p class="folio-kicker">Mira</p>
-                <h3>Explain {selectedMonth ? formatMonth(selectedMonth) : 'this month'}</h3>
-                <p>Uses structured analytics first, then asks the configured local model to write the narrative.</p>
-            </div>
-            <button class="analytics-mira-action" disabled={!selectedMonth || explainingMonth} on:click={explainSelectedMonth}>
-                <span class="material-symbols-outlined">{explainingMonth ? 'hourglass_top' : 'auto_awesome'}</span>
-                {explainingMonth ? 'Explaining...' : 'Explain month'}
-            </button>
-        </div>
-        {#if explanationError}
-            <div class="analytics-mira-error">{explanationError}</div>
-        {/if}
-        {#if monthExplanation}
-            <article class="analytics-mira-answer">
-                <div>
-                    <strong>{monthExplanation.question}</strong>
-                    <span>{monthExplanation.source ? (monthExplanation.source === 'deterministic' ? 'Deterministic fallback' : `Generated with ${monthExplanation.source}`) : 'Saved insight'}</span>
-                </div>
-                <p>{monthExplanation.answer}</p>
-            </article>
-        {/if}
-    </section>
-
-
-<!-- ═══════════════════════════════════════
+    <!-- ═══════════════════════════════════════
          S1: CASH FLOW WATERFALL (Hero)
          ═══════════════════════════════════════ -->
     <!-----------------------------------------
@@ -1379,30 +1611,126 @@
         {@const expVsAvgPct = allTimeAvgExpenses > 0 ? ((currentMonthSummary.expenses - allTimeAvgExpenses) / allTimeAvgExpenses) * 100 : 0}
         {@const extTransfers = currentMonthSummary.external_transfers || 0}
         {@const currentSavingsRate = currentMonthSummary.income > 0 ? Math.max(((currentMonthSummary.income - currentMonthSummary.expenses - extTransfers) / currentMonthSummary.income) * 100, 0) : 0}
+        {@const creditsRefunds = currentMonthSummary.credits_refunds ?? currentMonthSummary.refunds ?? 0}
+        {@const incomingTransfers = currentMonthSummary.incoming_transfers || 0}
+        {@const netFlow = waterfallData?.netResult ?? ((currentMonthSummary.income || 0) - (currentMonthSummary.expenses || 0) + creditsRefunds + incomingTransfers - extTransfers)}
+        <div class="analytics-period-row fade-in-up" style="animation-delay: 20ms">
+            <div class="period-toggle-track" style="--seg-count: {analyticsPeriods.length}; --active-idx: {activeAnalyticsPeriodIdx};">
+                <div class="period-toggle-thumb"></div>
+                {#each analyticsPeriods as period}
+                    <button class="period-toggle-label" class:active={selectedAnalyticsPeriod === period}
+                        on:click={() => selectAnalyticsPeriod(period)}>
+                        {period}
+                    </button>
+                {/each}
+            </div>
+
+            <div class="analytics-month-picker">
+                <button class="analytics-month-picker-btn"
+                    class:ring-2={selectedAnalyticsPeriod === 'Custom'}
+                    class:ring-accent={selectedAnalyticsPeriod === 'Custom'}
+                    on:click|stopPropagation={() => { monthPickerOpen = !monthPickerOpen; selectedAnalyticsPeriod = 'Custom'; }}>
+                    <span class="text-[12px] font-medium" style="color: var(--text-primary)">{formatMonth(selectedMonth)}</span>
+                    <span class="material-symbols-outlined text-[16px]" style="color: var(--text-muted); transition: transform 0.2s;"
+                        class:rotate-180={monthPickerOpen}>
+                        expand_more
+                    </span>
+                </button>
+                {#if monthPickerOpen}
+                    <!-- svelte-ignore a11y-click-events-have-key-events -->
+                    <div class="analytics-month-picker-dropdown" role="presentation" on:click|stopPropagation>
+                        {#each monthPickerMonths as m}
+                            <button
+                                class="analytics-month-picker-option"
+                                class:active={m.month === selectedMonth}
+                                on:click={() => { selectedMonth = m.month; monthPickerOpen = false; selectedAnalyticsPeriod = 'Custom'; }}>
+                                {formatMonth(m.month)}
+                                {#if m.month === selectedMonth}
+                                    <span class="material-symbols-outlined text-[14px]" style="color: var(--accent)">check</span>
+                                {/if}
+                            </button>
+                        {/each}
+                    </div>
+                {/if}
+            </div>
+        </div>
         <section class="mb-8 fade-in-up" style="animation-delay: 30ms">
             <div class="analytics-hero-strip">
-                <div class="analytics-hero-headline">
-                    <p>In <strong>{formatMonth(selectedMonth)}</strong>, you spent <strong>{formatCurrency(currentMonthSummary.expenses)}</strong>
-                        — <span style="color: {expVsAvgPct <= 0 ? 'var(--positive)' : 'var(--negative)'}; font-weight: 700;">{formatPercent(Math.abs(expVsAvgPct))}</span>
-                        {expVsAvgPct <= 0 ? 'below' : 'above'} your average.
-                    </p>
+                <div class="analytics-hero-summary-row">
+                    <div class="analytics-hero-headline">
+                        <span class="analytics-hero-kicker">{formatMonth(selectedMonth)} · Mira briefing</span>
+                        <h3>{monthExplanation ? monthExplanation.question : 'What your month is saying.'}</h3>
+                        {#if explainingMonth && !monthExplanation}
+                            <p>Loading month signals...</p>
+                        {/if}
+                    </div>
+                    <div class="analytics-hero-metrics">
+                        <div class="analytics-hero-metric">
+                            <span class="analytics-hero-metric-label">Total Expenses</span>
+                            <span class="analytics-hero-metric-value text-negative">{formatCurrency(currentMonthSummary.expenses)}</span>
+                        </div>
+                        <div class="analytics-hero-metric">
+                            <span class="analytics-hero-metric-label">vs Average</span>
+                            <span class="analytics-hero-metric-value" style="color: {expVsAvgPct <= 0 ? 'var(--positive)' : 'var(--negative)'}">
+                                {expVsAvgPct <= 0 ? '▼' : '▲'} {formatPercent(Math.abs(expVsAvgPct))}
+                            </span>
+                        </div>
+                        <div class="analytics-hero-metric">
+                            <span class="analytics-hero-metric-label">Savings Rate</span>
+                            <span class="analytics-hero-metric-value" style="color: var(--accent)">{formatPercent(currentSavingsRate)}</span>
+                        </div>
+                        <div class="analytics-hero-metric">
+                            <span class="analytics-hero-metric-label">Net Flow</span>
+                            <span class="analytics-hero-metric-value" class:analytics-positive={netFlow >= 0} class:analytics-negative={netFlow < 0}>
+                                {netFlow >= 0 ? '+' : ''}{formatCurrency(netFlow)}
+                            </span>
+                        </div>
+                    </div>
                 </div>
-                <div class="analytics-hero-metrics">
-                    <div class="analytics-hero-metric">
-                        <span class="analytics-hero-metric-label">Total Expenses</span>
-                        <span class="analytics-hero-metric-value text-negative">{formatCurrency(currentMonthSummary.expenses)}</span>
+                {#if analyticsHeroDisplayedSections.length > 0}
+                    <div class="analytics-hero-insights">
+                        {#each analyticsHeroDisplayedSections as section}
+                            <div class="analytics-mira-insight analytics-mira-insight-{section.tone}">
+                                <span class="material-symbols-outlined">{section.icon}</span>
+                                <div>
+                                    <strong>{section.label}</strong>
+                                    {#if section.label === 'Facts' && analyticsHeroFactSummary}
+                                        <div class="analytics-hero-facts-compact">
+                                            <div class="analytics-hero-fact-line analytics-hero-fact-line-primary">
+                                                <svg viewBox="0 0 8 8" aria-hidden="true"><path d="M2 1.25 6 4 2 6.75Z" /></svg>
+                                                <p>{analyticsHeroFactSummary.recurring}</p>
+                                            </div>
+                                            {#if analyticsHeroFactSummary.categories}
+                                                <div class="analytics-hero-fact-line">
+                                                    <svg viewBox="0 0 8 8" aria-hidden="true"><path d="M2 1.25 6 4 2 6.75Z" /></svg>
+                                                    <p>{analyticsHeroFactSummary.categories}</p>
+                                                </div>
+                                            {/if}
+                                            {#if analyticsHeroFactSummary.merchants}
+                                                <div class="analytics-hero-fact-line">
+                                                    <svg viewBox="0 0 8 8" aria-hidden="true"><path d="M2 1.25 6 4 2 6.75Z" /></svg>
+                                                    <p>{analyticsHeroFactSummary.merchants}</p>
+                                                </div>
+                                            {/if}
+                                        </div>
+                                    {:else}
+                                        <div class="analytics-hero-facts-compact">
+                                            {#each analyticsHeroBulletRows(section) as row, i}
+                                                <div class="analytics-hero-fact-line" class:analytics-hero-fact-line-primary={i === 0}>
+                                                    <svg viewBox="0 0 8 8" aria-hidden="true"><path d="M2 1.25 6 4 2 6.75Z" /></svg>
+                                                    <p>{row}</p>
+                                                </div>
+                                            {/each}
+                                        </div>
+                                    {/if}
+                                </div>
+                            </div>
+                        {/each}
                     </div>
-                    <div class="analytics-hero-metric">
-                        <span class="analytics-hero-metric-label">vs Average</span>
-                        <span class="analytics-hero-metric-value" style="color: {expVsAvgPct <= 0 ? 'var(--positive)' : 'var(--negative)'}">
-                            {expVsAvgPct <= 0 ? '▼' : '▲'} {formatPercent(Math.abs(expVsAvgPct))}
-                        </span>
-                    </div>
-                    <div class="analytics-hero-metric">
-                        <span class="analytics-hero-metric-label">Savings Rate</span>
-                        <span class="analytics-hero-metric-value" style="color: var(--accent)">{formatPercent(currentSavingsRate)}</span>
-                    </div>
-                </div>
+                {/if}
+                {#if explanationError}
+                    <div class="analytics-mira-error">{explanationError}</div>
+                {/if}
             </div>
         </section>
     {/if}
@@ -1412,48 +1740,6 @@
             <div class="flex flex-col gap-3 mb-1 sm:flex-row sm:items-center sm:justify-between" style="position: relative; z-index: 90;">
                 <div class="analytics-section-header" style="margin-bottom:0">
                     <h3 class="analytics-section-title">Cash Flow Waterfall</h3>
-                </div>
-                <div class="flex flex-col items-stretch gap-2 sm:flex-row sm:items-center sm:gap-3">
-                    <!-- iOS-style period toggle (relocated from header) -->
-                    <div class="period-toggle-track" style="--seg-count: {analyticsPeriods.length}; --active-idx: {activeAnalyticsPeriodIdx};">
-                        <div class="period-toggle-thumb"></div>
-                        {#each analyticsPeriods as period}
-                            <button class="period-toggle-label" class:active={selectedAnalyticsPeriod === period}
-                                on:click={() => selectAnalyticsPeriod(period)}>
-                                {period}
-                            </button>
-                        {/each}
-                    </div>
-
-                    <!-- Month dropdown -->
-                    <div class="analytics-month-picker">
-                        <button class="analytics-month-picker-btn"
-                            class:ring-2={selectedAnalyticsPeriod === 'Custom'}
-                            class:ring-accent={selectedAnalyticsPeriod === 'Custom'}
-                            on:click|stopPropagation={() => { monthPickerOpen = !monthPickerOpen; selectedAnalyticsPeriod = 'Custom'; }}>
-                            <span class="text-[12px] font-medium" style="color: var(--text-primary)">{formatMonth(selectedMonth)}</span>
-                            <span class="material-symbols-outlined text-[16px]" style="color: var(--text-muted); transition: transform 0.2s;"
-                                class:rotate-180={monthPickerOpen}>
-                                expand_more
-                            </span>
-                        </button>
-                        {#if monthPickerOpen}
-                            <!-- svelte-ignore a11y-click-events-have-key-events -->
-                            <div class="analytics-month-picker-dropdown" role="presentation" on:click|stopPropagation>
-                                {#each monthPickerMonths as m}
-                                    <button
-                                        class="analytics-month-picker-option"
-                                        class:active={m.month === selectedMonth}
-                                        on:click={() => { selectedMonth = m.month; monthPickerOpen = false; selectedAnalyticsPeriod = 'Custom'; }}>
-                                        {formatMonth(m.month)}
-                                        {#if m.month === selectedMonth}
-                                            <span class="material-symbols-outlined text-[14px]" style="color: var(--accent)">check</span>
-                                        {/if}
-                                    </button>
-                                {/each}
-                            </div>
-                        {/if}
-                    </div>
                 </div>
             </div>
             <p class="text-[11px] mb-4 ml-6" style="color: var(--text-muted)">
@@ -1517,12 +1803,14 @@
                                     x={bar.x} y={bar.y}
                                     width={bar.barWidth} height={bar.h}
                                     rx="4" fill={bar.color}
+                                    stroke="none"
                                     opacity={bar.type === 'result' ? 0.90 : 0.75}
                                     class="analytics-wf-bar"
                                     style="cursor: {isWaterfallBarClickable(bar) ? 'pointer' : 'default'}"
                                     role="button"
                                     tabindex="0"
                                     aria-label={`${bar.label}: ${formatCurrency(bar.value)}`}
+                                    on:mousedown|preventDefault={() => {}}
                                     on:mouseenter={(e) => handleWaterfallHover(bar, e)}
                                     on:mouseleave={handleWaterfallLeave}
                                     on:click|stopPropagation={() => handleWaterfallClick(bar)}
@@ -1872,15 +2160,23 @@
                                         <span class="analytics-recurring-price-change" class:price-up={item.price_change.change > 0} class:price-down={item.price_change.change < 0}
                                             title="{item.price_change.change > 0 ? 'Price increased' : 'Price decreased'}: {formatCurrency(item.price_change.previous)} → {formatCurrency(item.price_change.current)}">
                                             <span class="material-symbols-outlined text-[9px]">{item.price_change.change > 0 ? 'trending_up' : 'trending_down'}</span>
-                                            {item.price_change.change > 0 ? '+' : ''}{formatCurrency(item.price_change.change)}
-                                        </span>
-                                    </span>
+	                                            {item.price_change.change > 0 ? '+' : ''}{formatCurrency(item.price_change.change)}
+	                                        </span>
+	                                    </span>
+	                                {/if}
+                                    {#if subscriptionTimingText(item)}
+                                        <span class="analytics-sub-meta">{subscriptionTimingText(item)}</span>
+                                    {/if}
+	                            </div>
+	                        </div>
+	                        <span class="analytics-sub-col">{item.frequency}</span>
+	                        <span class="analytics-sub-col analytics-sub-col-stack">
+                                <strong>{formatCurrency(recurringDisplayAmount(item))}</strong>
+                                {#if recurringAmountNote(item)}
+                                    <small>{recurringAmountNote(item)}</small>
                                 {/if}
-                            </div>
-                        </div>
-                        <span class="analytics-sub-col">{item.frequency}</span>
-                        <span class="analytics-sub-col">{formatCurrency(item.amount || item.avg_amount)}</span>
-	                                    <span class="analytics-sub-col">{formatCurrency(item.annual_cost)}</span>
+                            </span>
+		                    <span class="analytics-sub-col">{formatCurrency(recurringAnnualCost(item))}</span>
                         <span class="analytics-sub-col analytics-sub-col-status">
                             {#if item.confidence === 'user'}
                                 <span class="analytics-sub-dot" style="background: #8b5cf6"></span> User
@@ -1889,13 +2185,14 @@
                             {:else}
                                 <span class="analytics-sub-dot" style="background: var(--warning)"></span> Low
                             {/if}
-                        </span>
-                        <div class="analytics-sub-actions">
-                            <button class="analytics-recurring-action-btn analytics-recurring-dismiss"
-                                title="Not a subscription — dismiss"
-                                on:click|stopPropagation={() => handleDismissSubscription(item)}>
-                                <span class="material-symbols-outlined text-[13px]">close</span>
-                            </button>
+	                        </span>
+	                        <div class="analytics-sub-actions">
+                                <button class="analytics-recurring-action-btn analytics-recurring-cancel-btn"
+                                    title="Mark cancelled"
+                                    aria-label="Mark cancelled"
+                                    on:click|stopPropagation={() => handleCancelSubscription(item)}>
+                                    <span class="material-symbols-outlined text-[13px]">close</span>
+                                </button>
                         </div>
                     </div>
                 {/each}
@@ -1936,16 +2233,24 @@
                                                 help
                                             </span>
                                         </div>
-                                        <div class="analytics-sub-body">
-                                            <span class="analytics-sub-name">{item.clean_name || item.merchant}</span>
-                                            {#if item.confidence_score}
-                                                <span class="analytics-sub-meta">Score {Math.round(item.confidence_score)}</span>
+	                                        <div class="analytics-sub-body">
+	                                            <span class="analytics-sub-name">{item.clean_name || item.merchant}</span>
+	                                            {#if item.confidence_score}
+	                                                <span class="analytics-sub-meta">Score {Math.round(item.confidence_score)}</span>
+	                                            {/if}
+                                                {#if subscriptionTimingText(item)}
+                                                    <span class="analytics-sub-meta">{subscriptionTimingText(item)}</span>
+                                                {/if}
+	                                        </div>
+	                                    </div>
+	                                    <span class="analytics-sub-col">{item.frequency}</span>
+	                                    <span class="analytics-sub-col analytics-sub-col-stack">
+                                            <strong>{formatCurrency(recurringDisplayAmount(item))}</strong>
+                                            {#if recurringAmountNote(item)}
+                                                <small>{recurringAmountNote(item)}</small>
                                             {/if}
-                                        </div>
-                                    </div>
-                                    <span class="analytics-sub-col">{item.frequency}</span>
-                                    <span class="analytics-sub-col">{formatCurrency(item.amount || item.avg_amount)}</span>
-	                                    <span class="analytics-sub-col">{formatCurrency(item.total_spent || ((item.amount || 0) * (item.charge_count || 0)))}</span>
+                                        </span>
+		                                    <span class="analytics-sub-col">{formatCurrency(item.total_spent || ((item.amount || 0) * (item.charge_count || 0)))}</span>
                                     <span class="analytics-sub-col analytics-sub-col-status">
                                         <span class="analytics-sub-dot" style="background: var(--warning)"></span> Candidate
                                     </span>
@@ -2004,27 +2309,31 @@
                                                 </span>
                                             {/if}
                                         </div>
-                                        <div class="analytics-sub-body">
-                                            <span class="analytics-sub-name" style="color: var(--text-muted)">{item.clean_name || item.merchant}</span>
-                                        </div>
-                                    </div>
-                                    <span class="analytics-sub-col">{item.frequency}</span>
-                                    <span class="analytics-sub-col">{formatCurrency(item.amount || item.avg_amount)}</span>
-	                                    <span class="analytics-sub-col">{formatCurrency(item.total_spent || ((item.amount || 0) * (item.charge_count || 0)))}</span>
+	                                        <div class="analytics-sub-body">
+	                                            <span class="analytics-sub-name" style="color: var(--text-muted)">{item.clean_name || item.merchant}</span>
+                                                {#if subscriptionTimingText(item)}
+                                                    <span class="analytics-sub-meta">{subscriptionTimingText(item)}</span>
+                                                {/if}
+	                                        </div>
+	                                    </div>
+	                                    <span class="analytics-sub-col">{item.frequency}</span>
+	                                    <span class="analytics-sub-col analytics-sub-col-stack">
+                                            <strong>{formatCurrency(recurringDisplayAmount(item))}</strong>
+                                            {#if recurringAmountNote(item)}
+                                                <small>{recurringAmountNote(item)}</small>
+                                            {/if}
+                                        </span>
+		                                    <span class="analytics-sub-col">{formatCurrency(item.total_spent || ((item.amount || 0) * (item.charge_count || 0)))}</span>
                                     <span class="analytics-sub-col analytics-sub-col-status">
                                         <span class="analytics-sub-dot" style="background: var(--warning)"></span> Inactive
                                     </span>
-                                    <div class="analytics-sub-actions">
-                                        <button class="analytics-recurring-action-btn analytics-recurring-cancel-btn"
-                                            title="Confirm cancelled"
-                                            on:click|stopPropagation={() => handleCancelSubscription(item)}>
-                                            <span class="text-[8px] font-bold whitespace-nowrap">Cancelled</span>
-                                        </button>
-                                        <button class="analytics-recurring-action-btn analytics-recurring-dismiss"
-                                            title="Not a subscription — dismiss"
-                                            on:click|stopPropagation={() => handleDismissSubscription(item)}>
-                                            <span class="material-symbols-outlined text-[13px]">close</span>
-                                        </button>
+	                                    <div class="analytics-sub-actions">
+	                                        <button class="analytics-recurring-action-btn analytics-recurring-cancel-btn"
+	                                            title="Confirm cancelled"
+                                                aria-label="Confirm cancelled"
+	                                            on:click|stopPropagation={() => handleCancelSubscription(item)}>
+	                                            <span class="material-symbols-outlined text-[13px]">close</span>
+	                                        </button>
                                     </div>
                                 </div>
                             {/each}
@@ -2064,12 +2373,20 @@
                                                 cancel
                                             </span>
                                         </div>
-                                        <div class="analytics-sub-body">
-                                            <span class="analytics-sub-name" style="color: var(--text-muted); text-decoration: line-through;">{item.clean_name || item.merchant}</span>
-                                        </div>
-                                    </div>
-                                    <span class="analytics-sub-col">{item.frequency}</span>
-                                    <span class="analytics-sub-col">{formatCurrency(item.amount || item.avg_amount)}</span>
+	                                        <div class="analytics-sub-body">
+	                                            <span class="analytics-sub-name" style="color: var(--text-muted); text-decoration: line-through;">{item.clean_name || item.merchant}</span>
+                                                {#if subscriptionTimingText(item)}
+                                                    <span class="analytics-sub-meta">{subscriptionTimingText(item)}</span>
+                                                {/if}
+	                                        </div>
+	                                    </div>
+	                                    <span class="analytics-sub-col">{item.frequency}</span>
+	                                    <span class="analytics-sub-col analytics-sub-col-stack">
+                                            <strong>{formatCurrency(recurringDisplayAmount(item))}</strong>
+                                            {#if recurringAmountNote(item)}
+                                                <small>{recurringAmountNote(item)}</small>
+                                            {/if}
+                                        </span>
                                     <span class="analytics-sub-col">{formatCurrency(item.total_spent || ((item.amount || 0) * (item.charge_count || 0)))}</span>
                                     <span class="analytics-sub-col analytics-sub-col-status">
                                         <span class="analytics-sub-dot" style="background: var(--negative)"></span> Cancelled

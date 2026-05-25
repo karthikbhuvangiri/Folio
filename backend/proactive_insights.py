@@ -7,8 +7,9 @@ category spend spikes, recurring/subscription changes, and safe-to-spend risk.
 
 from __future__ import annotations
 
-import json
 import calendar
+import json
+import os
 from datetime import date, datetime, timedelta
 from typing import Any
 
@@ -24,9 +25,68 @@ NON_SPENDING_CATEGORIES = {
     "Credit Card Payment",
 }
 
+DETECTOR_CONTRACT_VERSION = "deterministic_insights_v2"
+_ALLOWED_CONFIDENCE = {"high", "medium", "user"}
+_ALLOWED_SEVERITY = {"critical", "warning", "info"}
+_DEFAULT_REFRESH_MINUTES = 60
+
+DETECTOR_CONTRACTS = {
+    "cashflow_shortfall": {
+        "fact": "Projected cash may cross or approach the configured buffer.",
+        "required_evidence": ("warning", "projected_low_point"),
+    },
+    "recurring_change": {
+        "fact": "A recent recurring-event detector emitted a change signal.",
+        "required_evidence": ("merchant_key", "event_type", "period_bucket"),
+    },
+    "budget_pace": {
+        "fact": "Current-month spend is pacing above the configured monthly budget.",
+        "required_evidence": ("month", "category", "spent", "budget", "projected"),
+    },
+    "goal_followup": {
+        "fact": "Goal progress appears behind the expected pace or below early progress.",
+        "required_evidence": ("goal_id", "target_amount", "current_amount", "progress_ratio"),
+    },
+    "merchant_anomaly": {
+        "fact": "A current-month merchant charge is materially above its recent average.",
+        "required_evidence": ("transaction_id", "merchant", "amount", "prior_average", "sample_size", "date"),
+    },
+    "category_spike": {
+        "fact": "Current-month category spend is materially above recent monthly average.",
+        "required_evidence": ("month", "category", "current_total", "prior_average", "prior_months"),
+    },
+    "duplicate_subscription": {
+        "fact": "Multiple active or candidate recurring obligations appear similar.",
+        "required_evidence": ("category", "combined_amount", "items"),
+    },
+    "recurring_calendar": {
+        "fact": "An active recurring obligation has an expected date in the next week.",
+        "required_evidence": ("merchant_key", "next_expected_date", "expected_amount"),
+    },
+    "recurring_stopped": {
+        "fact": "An active recurring obligation has passed its expected date without a matching charge.",
+        "required_evidence": ("merchant_key", "next_expected_date", "last_seen_date"),
+    },
+    "safe_to_spend": {
+        "fact": "The current monthly plan shows low or negative safe-to-spend.",
+        "required_evidence": ("month", "safe_to_spend", "safe_to_spend_limit"),
+    },
+}
+
 
 def _scope_profile(profile: str | None) -> str:
     return profile if profile and profile != "household" else "household"
+
+
+def _insights_v2_enabled() -> bool:
+    return os.getenv("MIRA_DETERMINISTIC_INSIGHTS_V2_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _refresh_minutes() -> int:
+    try:
+        return max(5, int(os.getenv("MIRA_PROACTIVE_INSIGHTS_REFRESH_MINUTES", str(_DEFAULT_REFRESH_MINUTES))))
+    except (TypeError, ValueError):
+        return _DEFAULT_REFRESH_MINUTES
 
 
 def _profile_clause(profile: str | None, column: str = "profile_id") -> tuple[str, list[Any]]:
@@ -48,6 +108,19 @@ def _money(value: float | int | None) -> str:
     return f"${float(value or 0):,.0f}"
 
 
+def _money_exact(value: float | int | None) -> str:
+    return f"${float(value or 0):,.2f}"
+
+
+def _float_or_none(value: Any) -> float | None:
+    try:
+        if value is None or value == "":
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _json_dump(value: Any) -> str:
     return json.dumps(value or {}, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
@@ -61,6 +134,80 @@ def _json_load(value: str | None) -> Any:
         return {}
 
 
+def _has_value(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (list, tuple, set, dict)):
+        return bool(value)
+    return True
+
+
+def _with_contract(insight: dict) -> dict | None:
+    contract = DETECTOR_CONTRACTS.get(str(insight.get("kind") or ""))
+    if not contract:
+        return None
+    evidence = insight.get("evidence")
+    if not isinstance(evidence, dict):
+        return None
+    missing = [key for key in contract["required_evidence"] if not _has_value(evidence.get(key))]
+    if missing:
+        return None
+    confidence = str(insight.get("confidence") or "medium").lower()
+    if confidence not in _ALLOWED_CONFIDENCE:
+        return None
+    severity = str(insight.get("severity") or "info").lower()
+    if severity not in _ALLOWED_SEVERITY:
+        return None
+
+    stamped = {**insight, "confidence": confidence, "severity": severity}
+    stamped_evidence = dict(evidence)
+    stamped_evidence["detector_contract"] = {
+        "version": DETECTOR_CONTRACT_VERSION,
+        "fact": contract["fact"],
+        "required_evidence": list(contract["required_evidence"]),
+    }
+    stamped["evidence"] = stamped_evidence
+    return stamped
+
+
+def _filter_contract_candidates(candidates: list[dict]) -> list[dict]:
+    if not _insights_v2_enabled():
+        return [
+            item for item in candidates
+            if item.get("evidence") and str(item.get("confidence") or "medium").lower() != "low"
+        ]
+    filtered = []
+    for item in candidates:
+        stamped = _with_contract(item)
+        if stamped:
+            filtered.append(stamped)
+    return filtered
+
+
+def _has_fresh_cached_insights(conn, profile: str | None) -> bool:
+    if not _insights_v2_enabled():
+        return False
+    scope = _scope_profile(profile)
+    minutes = _refresh_minutes()
+    row = conn.execute(
+        """
+        SELECT COUNT(*) AS count
+          FROM proactive_insights
+         WHERE profile_id = ?
+           AND status = 'active'
+           AND (valid_until IS NULL OR date(valid_until) >= date('now'))
+           AND datetime(generated_at) >= datetime('now', ?)
+        """,
+        (scope, f"-{minutes} minutes"),
+    ).fetchone()
+    try:
+        return int(row[0] if row is not None else 0) > 0
+    except (TypeError, ValueError):
+        return False
+
+
 def _severity_rank(value: str) -> int:
     return {"critical": 0, "warning": 1, "info": 2}.get(value, 3)
 
@@ -70,6 +217,10 @@ def _priority(insight: dict) -> int:
         return int(insight.get("priority") or {"critical": 10, "warning": 30, "info": 60}.get(insight.get("severity"), 80))
     except (TypeError, ValueError):
         return 80
+
+
+def _compact_identity(value: Any) -> str:
+    return "".join(ch for ch in str(value or "").upper() if ch.isalnum())
 
 
 def _insert_or_refresh(conn, profile: str | None, insight: dict) -> None:
@@ -123,6 +274,15 @@ def _insert_or_refresh(conn, profile: str | None, insight: dict) -> None:
             insight.get("valid_until"),
         ),
     )
+
+
+def upsert_insight(profile: str | None, insight: dict, conn=None) -> None:
+    """Store one validated proactive insight."""
+    if conn is not None:
+        _insert_or_refresh(conn, profile, insight)
+        return
+    with get_db() as c:
+        _insert_or_refresh(c, profile, insight)
 
 
 def _list_rows(conn, profile: str | None, include_dismissed: bool = False) -> list[dict]:
@@ -190,7 +350,7 @@ def _category_spike_candidates(conn, profile: str | None, today: date) -> list[d
         current_total = month_totals.get(current, 0.0)
         priors = [month_totals.get(month, 0.0) for month in prior_months]
         nonzero_priors = [value for value in priors if value > 0]
-        if not nonzero_priors:
+        if len(nonzero_priors) < 2:
             continue
         avg = sum(nonzero_priors) / len(nonzero_priors)
         lift = current_total - avg
@@ -210,13 +370,14 @@ def _category_spike_candidates(conn, profile: str | None, today: date) -> list[d
                 "priority": 42,
                 "confidence": "medium",
                 "fingerprint": f"{scope}:category_spike:{current}:{category.lower()}",
-                "recommended_action": f"Check the recent {category} transactions before adding more discretionary spend.",
+                "recommended_action": f"Open recent {category} transactions and decide whether this is expected.",
                 "evidence": {
                     "month": current,
                     "category": category,
                     "current_total": round(current_total, 2),
                     "prior_average": round(avg, 2),
                     "prior_months": prior_months,
+                    "prior_sample_months": len(nonzero_priors),
                 },
             }
         )
@@ -232,14 +393,23 @@ def _recurring_candidates(conn, profile: str | None, today: date) -> list[dict]:
             f"""
             SELECT e.merchant_key, e.profile_id, e.event_type, e.period_bucket,
                    e.payload_json, e.created_at,
-                   o.display_name, o.amount_cents, o.state, o.next_expected_date, o.confidence_label
+                   o.display_name, o.amount_cents, o.state, o.next_expected_date,
+                   o.confidence_label, o.source, o.confidence_score, o.obligation_key
             FROM recurring_events_v2 e
             LEFT JOIN recurring_obligations o
               ON o.profile_id = e.profile_id
              AND o.merchant_key = e.merchant_key
+             AND COALESCE(o.source, '') != 'user'
             WHERE date(e.created_at) >= date(?)
               {profile_sql}
-            ORDER BY e.created_at DESC
+            ORDER BY e.created_at DESC,
+                     CASE COALESCE(o.source, '')
+                       WHEN 'seed' THEN 0
+                       WHEN 'algorithm' THEN 1
+                       WHEN 'category' THEN 2
+                       ELSE 3
+                     END,
+                     o.confidence_score DESC
             LIMIT 6
             """,
             [cutoff, *profile_params],
@@ -247,7 +417,12 @@ def _recurring_candidates(conn, profile: str | None, today: date) -> list[dict]:
     )
     scope = _scope_profile(profile)
     candidates = []
+    seen_events = set()
     for row in rows:
+        event_key = (row.get("merchant_key"), row.get("event_type"), row.get("period_bucket"))
+        if event_key in seen_events:
+            continue
+        seen_events.add(event_key)
         state = str(row.get("state") or "").lower()
         if state in {"inactive", "stale", "dismissed", "cancelled"}:
             continue
@@ -256,16 +431,26 @@ def _recurring_candidates(conn, profile: str | None, today: date) -> list[dict]:
         merchant = row.get("display_name") or row.get("merchant_key") or "A recurring charge"
         payload = _json_load(row.get("payload_json"))
         amount = float(row.get("amount_cents") or 0) / 100
-        if "amount" in event_words or "changed" in event_words:
+        old_amount = _float_or_none(payload.get("old_amount"))
+        new_amount = _float_or_none(payload.get("new_amount"))
+        if event_type == "price_decrease":
+            title = f"{merchant} recurring amount may be lower"
+            body = f"A recurring detector found a possible price decrease for {merchant}."
+        elif event_type == "price_increase":
+            title = f"{merchant} recurring amount may be higher"
+            body = f"A recurring detector found a possible price increase for {merchant}."
+        elif "amount" in event_words or "changed" in event_words:
             title = f"{merchant} may have changed"
-            body = f"Mira saw a recent recurring-charge change for {merchant}."
+            body = f"A recurring-charge change was found for {merchant}."
         elif "new" in event_words or "created" in event_words:
             title = f"New recurring charge: {merchant}"
             body = f"{merchant} looks like a new recurring charge."
         else:
             title = f"Recurring update: {merchant}"
-            body = f"Mira saw a recent recurring activity signal for {merchant}."
-        if amount > 0:
+            body = f"A recent recurring activity signal was found for {merchant}."
+        if old_amount is not None and new_amount is not None:
+            body = f"{body} Reported amount moved from {_money_exact(old_amount)} to {_money_exact(new_amount)}."
+        elif amount > 0:
             body = f"{body} Current expected amount is about {_money(amount)}."
         candidates.append(
             {
@@ -283,6 +468,8 @@ def _recurring_candidates(conn, profile: str | None, today: date) -> list[dict]:
                     "event_type": event_type,
                     "period_bucket": row.get("period_bucket"),
                     "payload": payload,
+                    "old_amount": round(old_amount, 2) if old_amount is not None else None,
+                    "new_amount": round(new_amount, 2) if new_amount is not None else None,
                     "expected_amount": round(amount, 2),
                     "next_expected_date": row.get("next_expected_date"),
                 },
@@ -316,9 +503,9 @@ def _safe_to_spend_candidate(conn, profile: str | None) -> dict | None:
     if safe_to_spend >= 0 and safe_to_spend > low_threshold:
         return None
     severity = "warning" if safe_to_spend < 0 else "info"
-    title = "Safe-to-spend is tight" if safe_to_spend >= 0 else "Safe-to-spend is negative"
+    title = "Safe-to-spend needs a check"
     body = (
-        f"You have {_money(safe_to_spend)} safe-to-spend remaining for {month}. "
+        f"The plan shows {_money(safe_to_spend)} safe-to-spend remaining for {month}. "
         f"Variable spending is {_money(plan.get('safe_to_spend_spent'))} against a limit of {_money(limit)}."
     )
     return {
@@ -330,7 +517,7 @@ def _safe_to_spend_candidate(conn, profile: str | None) -> dict | None:
         "priority": 45,
         "confidence": "medium",
         "fingerprint": f"{_scope_profile(profile)}:safe_to_spend:{month}",
-        "recommended_action": "Review flexible categories before adding new discretionary spend.",
+        "recommended_action": "Review flexible categories or adjust the plan if this is expected.",
         "evidence": plan,
     }
 
@@ -346,12 +533,12 @@ def _shortfall_candidate(conn, profile: str | None, today: date) -> dict | None:
         "kind": "cashflow_shortfall",
         "insight_type": "cashflow_shortfall",
         "title": "Cash-flow buffer may get tight",
-        "body": f"{warning.get('what') or 'Projected cash may cross your buffer'} Likely timing: {when}.",
+        "body": f"Forecasted cash may get close to the buffer around {when}.",
         "severity": "critical" if "zero" in str(warning.get("what") or "").lower() else "warning",
         "priority": 5,
         "confidence": prediction.get("confidence") or forecast.get("confidence") or "medium",
         "fingerprint": f"{_scope_profile(profile)}:cashflow_shortfall:{when}",
-        "recommended_action": warning.get("recommended_action") or "Delay flexible spending or move a non-urgent bill if available.",
+        "recommended_action": warning.get("recommended_action") or "Review upcoming obligations and flexible spending for the forecast window.",
         "assumptions": forecast.get("assumptions") or [],
         "valid_until": when,
         "evidence": {
@@ -488,7 +675,7 @@ def _budget_pace_candidates(conn, profile: str | None, today: date) -> list[dict
                 "priority": 32,
                 "confidence": "medium",
                 "fingerprint": f"{scope}:budget_pace:{month}:{category.lower()}",
-                "recommended_action": f"Keep new {category} spending below the remaining budget or adjust the budget intentionally.",
+                "recommended_action": f"Review recent {category} spending or adjust the budget if this pace is expected.",
                 "evidence": {
                     "month": month,
                     "category": category,
@@ -577,7 +764,7 @@ def _recurring_calendar_candidates(conn, profile: str | None, today: date) -> li
         conn.execute(
             f"""
             SELECT merchant_key, display_name, amount_cents, frequency, state,
-                   next_expected_date, last_seen_date
+                   next_expected_date, last_seen_date, confidence_label
               FROM recurring_obligations
              WHERE next_expected_date IS NOT NULL
                AND state IN ('active', 'confirmed', 'candidate')
@@ -619,7 +806,7 @@ def _recurring_calendar_candidates(conn, profile: str | None, today: date) -> li
                     "kind": "recurring_stopped",
                     "insight_type": "recurring_stopped",
                     "title": f"{merchant} may have stopped posting",
-                    "body": f"{merchant} was expected around {due}, but Mira has not seen a matching charge yet.",
+                    "body": f"{merchant} was expected around {due}, but no matching charge has posted yet.",
                     "severity": "info",
                     "priority": 35,
                     "confidence": str(row.get("confidence_label") or "medium"),
@@ -635,6 +822,29 @@ def _recurring_calendar_candidates(conn, profile: str | None, today: date) -> li
     return candidates[:3]
 
 
+def _subscription_identity(row: dict) -> tuple:
+    service = _compact_identity(row.get("display_name") or row.get("merchant_key"))
+    frequency = str(row.get("frequency") or "monthly").lower().replace("-", "_")
+    return (
+        service,
+        frequency,
+        int(row.get("amount_cents") or 0),
+        str(row.get("next_expected_date") or "")[:10],
+    )
+
+
+def _subscription_row_rank(row: dict) -> tuple:
+    evidence = _json_load(row.get("evidence_json"))
+    backfilled = evidence.get("backfilled_from") == "merchants"
+    state_rank = {"confirmed": 4, "active": 3, "candidate": 2}.get(str(row.get("state") or ""), 0)
+    source_rank = {"user": 4, "seed": 3, "algorithm": 2, "category": 1}.get(str(row.get("source") or ""), 0)
+    try:
+        score = int(row.get("confidence_score") or 0)
+    except (TypeError, ValueError):
+        score = 0
+    return (0 if backfilled else 1, state_rank, source_rank, score)
+
+
 def _duplicate_subscription_candidates(conn, profile: str | None, today: date) -> list[dict]:
     scope = _scope_profile(profile)
     profile_sql, profile_params = _profile_clause(profile)
@@ -642,7 +852,7 @@ def _duplicate_subscription_candidates(conn, profile: str | None, today: date) -
         conn.execute(
             f"""
             SELECT merchant_key, display_name, category, amount_cents, next_expected_date,
-                   state, confidence_label, evidence_json
+                   state, source, confidence_score, confidence_label, evidence_json
               FROM recurring_obligations
              WHERE state IN ('active', 'confirmed', 'candidate')
                AND amount_cents > 0
@@ -652,8 +862,15 @@ def _duplicate_subscription_candidates(conn, profile: str | None, today: date) -
             profile_params,
         ).fetchall()
     )
-    by_category: dict[str, list[dict]] = {}
+    by_identity: dict[tuple, dict] = {}
     for row in rows:
+        identity = _subscription_identity(row)
+        current = by_identity.get(identity)
+        if current is None or _subscription_row_rank(row) > _subscription_row_rank(current):
+            by_identity[identity] = row
+
+    by_category: dict[str, list[dict]] = {}
+    for row in by_identity.values():
         category = (row.get("category") or "Subscriptions").strip()
         by_category.setdefault(category, []).append(row)
     candidates = []
@@ -734,31 +951,39 @@ def _dismissal_suppressed_kinds(conn, profile: str | None) -> set[str]:
     return {row["kind"] for row in rows if row.get("kind")}
 
 
+def _candidate_insights(conn, profile: str | None, today: date | None = None) -> list[dict]:
+    today = today or date.today()
+    candidates = []
+    shortfall = _shortfall_candidate(conn, profile, today)
+    if shortfall:
+        candidates.append(shortfall)
+    candidates.extend(_recurring_candidates(conn, profile, today))
+    candidates.extend(_budget_pace_candidates(conn, profile, today))
+    candidates.extend(_goal_candidates(conn, profile, today))
+    candidates.extend(_merchant_anomaly_candidates(conn, profile, today))
+    candidates.extend(_category_spike_candidates(conn, profile, today))
+    candidates.extend(_duplicate_subscription_candidates(conn, profile, today))
+    candidates.extend(_recurring_calendar_candidates(conn, profile, today))
+    safe = _safe_to_spend_candidate(conn, profile)
+    if safe:
+        candidates.append(safe)
+    suppressed_kinds = _dismissal_suppressed_kinds(conn, profile)
+    candidates = [item for item in candidates if item.get("kind") not in suppressed_kinds]
+    candidates = _filter_contract_candidates(candidates)
+    return sorted(candidates, key=lambda item: (_priority(item), _severity_rank(item.get("severity") or "info")))
+
+
+def build_candidate_insights(profile: str | None = None, conn=None, today: date | None = None) -> list[dict]:
+    """Return current deterministic insight candidates without writing rows."""
+    if conn is not None:
+        return _candidate_insights(conn, profile, today=today)
+    with get_db() as c:
+        return _candidate_insights(c, profile, today=today)
+
+
 def generate_insights(profile: str | None = None, conn=None) -> list[dict]:
     def _generate(c):
-        today = date.today()
-        candidates = []
-        shortfall = _shortfall_candidate(c, profile, today)
-        if shortfall:
-            candidates.append(shortfall)
-        candidates.extend(_recurring_candidates(c, profile, today))
-        candidates.extend(_budget_pace_candidates(c, profile, today))
-        candidates.extend(_goal_candidates(c, profile, today))
-        candidates.extend(_merchant_anomaly_candidates(c, profile, today))
-        candidates.extend(_category_spike_candidates(c, profile, today))
-        candidates.extend(_duplicate_subscription_candidates(c, profile, today))
-        candidates.extend(_recurring_calendar_candidates(c, profile, today))
-        safe = _safe_to_spend_candidate(c, profile)
-        if safe:
-            candidates.append(safe)
-        suppressed_kinds = _dismissal_suppressed_kinds(c, profile)
-        candidates = [
-            item for item in candidates
-            if item.get("kind") not in suppressed_kinds
-            and item.get("evidence")
-            and str(item.get("confidence") or "medium") != "low"
-        ]
-        candidates = sorted(candidates, key=lambda item: (_priority(item), _severity_rank(item.get("severity") or "info")))
+        candidates = _candidate_insights(c, profile)
         active_fingerprints = [insight["fingerprint"] for insight in candidates]
         managed_kinds = (
             "cashflow_shortfall",
@@ -808,7 +1033,7 @@ def generate_insights(profile: str | None = None, conn=None) -> list[dict]:
 
 def list_insights(profile: str | None = None, include_dismissed: bool = False, conn=None, generate: bool = True) -> list[dict]:
     def _list(c):
-        if generate:
+        if generate and not _has_fresh_cached_insights(c, profile):
             generate_insights(profile=profile, conn=c)
         return _list_rows(c, profile, include_dismissed=include_dismissed)
 

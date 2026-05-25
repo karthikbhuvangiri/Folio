@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
 from typing import Any
@@ -9,8 +10,9 @@ from merchant_identity import canonicalize_merchant_key
 
 
 TAXONOMY_VERSION = "folio_taxonomy_v1"
-RULE_VERSION = "transaction_enrichment_rules_v1"
+RULE_VERSION = "transaction_enrichment_rules_v2"
 LOW_CONFIDENCE_DEFAULT = 0.7
+FALSE_ENV_VALUES = {"0", "false", "no", "off"}
 
 TOP_LEVEL_CATEGORIES = (
     "Income",
@@ -69,6 +71,11 @@ FOLIO_CATEGORY_MAP: dict[str, tuple[str, str, str, str]] = {
     "subscriptions": ("Subscriptions", "Subscriptions", "Recurring services", "essential"),
     "fees & charges": ("Fees & Financial", "Bank Fees", "Financial fees", "essential"),
     "fees": ("Fees & Financial", "Bank Fees", "Financial fees", "essential"),
+    "alcohol": ("Dining", "Alcohol", "Alcohol", "discretionary"),
+    "vaping": ("Personal Care", "Vaping", "Tobacco/vaping", "discretionary"),
+    "tobacco": ("Personal Care", "Tobacco", "Tobacco/vaping", "discretionary"),
+    "credits & refunds": ("Other", "Credits & Refunds", "Refunds and credits", "non_expense"),
+    "refunds": ("Other", "Credits & Refunds", "Refunds and credits", "non_expense"),
     "travel": ("Travel", "Travel", "Travel", "discretionary"),
     "taxes": ("Taxes", "Taxes", "Taxes", "essential"),
     "insurance": ("Insurance", "Insurance", "Risk protection", "essential"),
@@ -134,6 +141,8 @@ SEMANTIC_NON_EXPENSE_CATEGORIES = {
     "credit card payment": "payment",
 }
 
+NON_MERCHANT_KINDS = {"personal_transfer", "credit_card_payment", "income", "tax", "bank_fee"}
+
 CORRECTABLE_FIELDS = {
     "canonical_counterparty",
     "display_counterparty",
@@ -144,6 +153,19 @@ CORRECTABLE_FIELDS = {
     "recurrence",
     "semantic_type",
 }
+
+CONFIDENCE_FAMILIES: dict[str, tuple[str, ...]] = {
+    "counterparty": ("canonical_counterparty", "display_counterparty"),
+    "taxonomy": ("top_level_category", "leaf_category"),
+    "purpose": ("purpose_category",),
+    "essentiality": ("essentiality",),
+    "recurrence": ("recurrence",),
+    "semantic_type": ("semantic_type",),
+}
+
+
+def enrichment_repair_enabled() -> bool:
+    return os.getenv("MIRA_ENRICHMENT_REPAIR_ENABLED", "0").strip().lower() not in FALSE_ENV_VALUES
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
@@ -166,7 +188,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             evidence_json               TEXT NOT NULL DEFAULT '{}',
             source                      TEXT NOT NULL DEFAULT 'rules',
             method                      TEXT NOT NULL DEFAULT 'deterministic',
-            model_version               TEXT NOT NULL DEFAULT 'transaction_enrichment_rules_v1',
+            model_version               TEXT NOT NULL DEFAULT 'transaction_enrichment_rules_v2',
             taxonomy_version            TEXT NOT NULL DEFAULT 'folio_taxonomy_v1',
             user_reviewed               INTEGER NOT NULL DEFAULT 0,
             created_at                  TEXT NOT NULL DEFAULT (datetime('now')),
@@ -458,6 +480,7 @@ def find_low_confidence(
         enrichment = stored or enrich_transaction_dict(tx, conn)
         min_conf = min((enrichment.get("confidence") or {"overall": 0}).values() or [0])
         if min_conf < threshold or not stored:
+            weak_families = sorted(_low_confidence_families(enrichment.get("confidence") or {}, threshold=threshold))
             matches.append(
                 {
                     "transaction_id": tx["id"],
@@ -468,6 +491,8 @@ def find_low_confidence(
                     "category": tx.get("category"),
                     "persisted": bool(stored),
                     "minimum_confidence": round(float(min_conf), 3),
+                    "weak_confidence_families": weak_families,
+                    "actionable_quality_flags": _actionable_quality_flags(enrichment, weak_families),
                     "enrichment": _compact_enrichment(enrichment),
                     "evidence_summary": enrichment.get("evidence_summary", ""),
                 }
@@ -495,7 +520,16 @@ def quality_summary(conn: sqlite3.Connection, profile_id: str | None = None) -> 
     row = conn.execute(
         f"""
         SELECT COUNT(*) AS persisted,
-               SUM(CASE WHEN user_reviewed = 1 THEN 1 ELSE 0 END) AS reviewed
+               SUM(CASE WHEN user_reviewed = 1 THEN 1 ELSE 0 END) AS reviewed,
+               SUM(CASE WHEN TRIM(COALESCE(canonical_counterparty, '')) != '' THEN 1 ELSE 0 END) AS canonical_counterparty,
+               SUM(CASE WHEN TRIM(COALESCE(display_counterparty, '')) != '' THEN 1 ELSE 0 END) AS display_counterparty,
+               SUM(CASE WHEN TRIM(COALESCE(top_level_category, '')) != '' THEN 1 ELSE 0 END) AS top_level_category,
+               SUM(CASE WHEN TRIM(COALESCE(leaf_category, '')) != '' THEN 1 ELSE 0 END) AS leaf_category,
+               SUM(CASE WHEN TRIM(COALESCE(purpose_category, '')) != '' THEN 1 ELSE 0 END) AS purpose_category,
+               SUM(CASE WHEN TRIM(COALESCE(essentiality, 'unknown')) != 'unknown' THEN 1 ELSE 0 END) AS essentiality_known,
+               SUM(CASE WHEN TRIM(COALESCE(recurrence, 'unknown')) != 'unknown' THEN 1 ELSE 0 END) AS recurrence_known,
+               SUM(CASE WHEN TRIM(COALESCE(confidence_json, '{{}}')) NOT IN ('', '{{}}') THEN 1 ELSE 0 END) AS confidence_json,
+               SUM(CASE WHEN TRIM(COALESCE(evidence_json, '{{}}')) NOT IN ('', '{{}}') THEN 1 ELSE 0 END) AS evidence_json
           FROM transaction_enrichment e
          WHERE 1=1{ewhere}
         """,
@@ -503,12 +537,18 @@ def quality_summary(conn: sqlite3.Connection, profile_id: str | None = None) -> 
     ).fetchone()
     persisted = int(row["persisted"] or 0)
     reviewed = int(row["reviewed"] or 0)
-    low = conn.execute(
-        f"SELECT confidence_json FROM transaction_enrichment e WHERE 1=1{ewhere}",
+    quality_rows = conn.execute(
+        f"""
+        SELECT canonical_counterparty, display_counterparty, top_level_category,
+               leaf_category, purpose_category, essentiality, recurrence,
+               semantic_type, confidence_json, user_reviewed
+          FROM transaction_enrichment e
+         WHERE 1=1{ewhere}
+        """,
         eparams,
     ).fetchall()
     low_count = 0
-    for item in low:
+    for item in quality_rows:
         conf = _json_dict(item["confidence_json"])
         if conf and min(conf.values()) < LOW_CONFIDENCE_DEFAULT:
             low_count += 1
@@ -532,24 +572,378 @@ def quality_summary(conn: sqlite3.Connection, profile_id: str | None = None) -> 
         """,
         eparams,
     ).fetchall()
+    essentiality_rows = conn.execute(
+        f"""
+        SELECT essentiality, COUNT(*) AS count
+          FROM transaction_enrichment e
+         WHERE 1=1{ewhere}
+         GROUP BY essentiality
+         ORDER BY count DESC, essentiality
+        """,
+        eparams,
+    ).fetchall()
+    recurrence_rows = conn.execute(
+        f"""
+        SELECT recurrence, COUNT(*) AS count
+          FROM transaction_enrichment e
+         WHERE 1=1{ewhere}
+         GROUP BY recurrence
+         ORDER BY count DESC, recurrence
+        """,
+        eparams,
+    ).fetchall()
+
+    def _field_metric(key: str) -> dict[str, Any]:
+        count = int(row[key] or 0)
+        return {"count": count, "ratio": round(count / persisted, 4) if persisted else 0.0}
+
+    confidence_families = _confidence_family_summary(quality_rows, threshold=LOW_CONFIDENCE_DEFAULT)
+    quality_modes = _quality_error_modes(
+        transaction_count=int(total or 0),
+        persisted_count=persisted,
+        reviewed_count=reviewed,
+        quality_rows=quality_rows,
+        confidence_families=confidence_families,
+    )
+
     return {
         "profile_id": profile_id or "household",
         "transaction_count": int(total or 0),
         "persisted_enrichment_count": persisted,
         "coverage_ratio": round(persisted / total, 4) if total else 0.0,
         "user_reviewed_count": reviewed,
+        "populated_fields": {
+            "canonical_counterparty": _field_metric("canonical_counterparty"),
+            "display_counterparty": _field_metric("display_counterparty"),
+            "top_level_category": _field_metric("top_level_category"),
+            "leaf_category": _field_metric("leaf_category"),
+            "purpose_category": _field_metric("purpose_category"),
+            "essentiality_known": _field_metric("essentiality_known"),
+            "recurrence_known": _field_metric("recurrence_known"),
+            "confidence_json": _field_metric("confidence_json"),
+            "evidence_json": _field_metric("evidence_json"),
+        },
         "low_confidence_count": low_count,
+        "actionable_low_confidence_count": int(quality_modes.get("actionable_low_confidence", {}).get("count") or 0),
         "low_confidence_threshold": LOW_CONFIDENCE_DEFAULT,
+        "confidence_families": confidence_families,
+        "quality_error_modes": quality_modes,
         "taxonomy_version": TAXONOMY_VERSION,
         "model_version": RULE_VERSION,
         "top_level_distribution": [dict(row) for row in top_rows],
         "semantic_type_distribution": [dict(row) for row in sem_rows],
+        "essentiality_distribution": [dict(row) for row in essentiality_rows],
+        "recurrence_distribution": [dict(row) for row in recurrence_rows],
         "provenance": {
             "tool": "get_enrichment_quality_summary",
             "profile_id": profile_id or "household",
             "source": "transaction_enrichment",
         },
     }
+
+
+def preview_enrichment_repairs(
+    conn: sqlite3.Connection,
+    profile_id: str | None = None,
+    *,
+    limit: int = 50,
+) -> dict[str, Any]:
+    ensure_schema(conn)
+    limit = max(1, min(int(limit or 50), 500))
+    rows = _repair_candidate_transactions(conn, profile_id, limit=max(limit * 4, 100))
+    candidates: list[dict[str, Any]] = []
+    skipped_user_reviewed = 0
+    for tx in rows:
+        stored = get_stored_enrichment(conn, tx["id"], tx["profile_id"])
+        if stored and stored.get("user_reviewed"):
+            skipped_user_reviewed += 1
+            continue
+        fresh = enrich_transaction_dict(tx, conn, apply_user_corrections=False)
+        changes = _repair_changes(stored, fresh)
+        if not changes:
+            continue
+        candidates.append(
+            {
+                "transaction_id": tx.get("id"),
+                "profile_id": tx.get("profile_id"),
+                "date": tx.get("date"),
+                "amount": tx.get("amount"),
+                "category": tx.get("category"),
+                "display_counterparty": fresh.get("display_counterparty"),
+                "changes": changes,
+                "reason": _repair_reason(changes, stored),
+            }
+        )
+        if len(candidates) >= limit:
+            break
+    return {
+        "enabled": enrichment_repair_enabled(),
+        "status": "ok",
+        "candidate_count": len(candidates),
+        "candidates": candidates,
+        "skipped_user_reviewed": skipped_user_reviewed,
+        "truncated": len(candidates) >= limit,
+        "model_version": RULE_VERSION,
+        "provenance": {
+            "profile_id": profile_id or "household",
+            "limit": limit,
+            "repair_version": RULE_VERSION,
+        },
+    }
+
+
+def apply_enrichment_repairs(
+    conn: sqlite3.Connection,
+    profile_id: str | None = None,
+    *,
+    limit: int = 50,
+) -> dict[str, Any]:
+    if not enrichment_repair_enabled():
+        return {
+            "status": "disabled",
+            "enabled": False,
+            "applied_count": 0,
+            "candidates": [],
+            "caveats": ["Set MIRA_ENRICHMENT_REPAIR_ENABLED=1 to apply repair rows."],
+        }
+    preview = preview_enrichment_repairs(conn, profile_id, limit=limit)
+    applied: list[dict[str, Any]] = []
+    for candidate in preview.get("candidates") or []:
+        tx = _load_transaction(conn, str(candidate.get("transaction_id") or ""), str(candidate.get("profile_id") or ""))
+        if not tx:
+            continue
+        stored = get_stored_enrichment(conn, tx["id"], tx["profile_id"])
+        if stored and stored.get("user_reviewed"):
+            continue
+        upsert_enrichment(conn, enrich_transaction_dict(tx, conn, apply_user_corrections=False))
+        applied.append(candidate)
+    return {
+        **preview,
+        "status": "applied",
+        "enabled": True,
+        "applied_count": len(applied),
+        "applied": applied,
+    }
+
+
+def _confidence_family_summary(rows: list[sqlite3.Row], *, threshold: float) -> dict[str, Any]:
+    summary: dict[str, Any] = {}
+    total = len(rows)
+    for family, fields in CONFIDENCE_FAMILIES.items():
+        family_values: list[float] = []
+        row_values: list[float] = []
+        missing_rows = 0
+        for row in rows:
+            conf = _json_dict(row["confidence_json"])
+            values = [_confidence_value(conf.get(field)) for field in fields if _confidence_value(conf.get(field)) is not None]
+            if not values:
+                missing_rows += 1
+                continue
+            row_min = min(values)
+            row_values.append(row_min)
+            family_values.extend(values)
+        low_rows = sum(1 for value in row_values if value < threshold)
+        summary[family] = {
+            "fields": list(fields),
+            "rows_with_confidence": len(row_values),
+            "missing_rows": missing_rows,
+            "low_confidence_rows": low_rows,
+            "low_confidence_ratio": round(low_rows / total, 4) if total else 0.0,
+            "min_confidence": round(min(family_values), 4) if family_values else None,
+            "avg_confidence": round(sum(family_values) / len(family_values), 4) if family_values else None,
+        }
+    return summary
+
+
+def _quality_error_modes(
+    *,
+    transaction_count: int,
+    persisted_count: int,
+    reviewed_count: int,
+    quality_rows: list[sqlite3.Row],
+    confidence_families: dict[str, Any],
+) -> dict[str, Any]:
+    missing_enrichment = max(0, transaction_count - persisted_count)
+    unknown_essentiality = 0
+    weak_counterparty = 0
+    weak_taxonomy = 0
+    weak_semantic_type = 0
+    recurrence_only_low = 0
+    actionable_low = 0
+    for row in quality_rows:
+        conf = _json_dict(row["confidence_json"])
+        family_lows = _low_confidence_families(conf, threshold=LOW_CONFIDENCE_DEFAULT)
+        essentiality = str(row["essentiality"] or "").strip().lower()
+        top = str(row["top_level_category"] or "").strip().lower()
+        leaf = str(row["leaf_category"] or "").strip().lower()
+        if essentiality in {"", "unknown"}:
+            unknown_essentiality += 1
+        if "counterparty" in family_lows:
+            weak_counterparty += 1
+        if "taxonomy" in family_lows or top in {"", "other"} or leaf in {"", "other", "uncategorized"}:
+            weak_taxonomy += 1
+        if "semantic_type" in family_lows:
+            weak_semantic_type += 1
+        if family_lows == {"recurrence"}:
+            recurrence_only_low += 1
+        if family_lows - {"recurrence"} or essentiality in {"", "unknown"} or top in {"", "other"}:
+            actionable_low += 1
+
+    return {
+        "missing_enrichment": _quality_mode(
+            missing_enrichment,
+            "Transactions without persisted enrichment rows.",
+            repairable=missing_enrichment > 0,
+        ),
+        "unknown_essentiality": _quality_mode(
+            unknown_essentiality,
+            "Rows where essential vs discretionary status is still unknown.",
+            repairable=unknown_essentiality > 0,
+        ),
+        "weak_counterparty_confidence": _quality_mode(
+            weak_counterparty,
+            "Rows where merchant/counterparty identity is lower confidence.",
+            repairable=False,
+        ),
+        "weak_taxonomy_confidence": _quality_mode(
+            weak_taxonomy,
+            "Rows with weak or overly generic category taxonomy.",
+            repairable=weak_taxonomy > 0,
+        ),
+        "weak_semantic_type_confidence": _quality_mode(
+            weak_semantic_type,
+            "Rows where spending/refund/transfer/payment semantics are lower confidence.",
+            repairable=False,
+        ),
+        "recurrence_only_low_confidence": _quality_mode(
+            recurrence_only_low,
+            "Rows whose only weak signal is recurrence; this should not be treated as wrong category data.",
+            repairable=False,
+        ),
+        "actionable_low_confidence": _quality_mode(
+            actionable_low,
+            "Rows with non-recurrence quality issues that may affect advisor interpretation.",
+            repairable=actionable_low > 0,
+        ),
+        "user_reviewed_rows": _quality_mode(
+            reviewed_count,
+            "Rows protected by explicit user correction/review.",
+            repairable=False,
+        ),
+        "family_summary": confidence_families,
+    }
+
+
+def _quality_mode(count: int, description: str, *, repairable: bool) -> dict[str, Any]:
+    return {"count": int(count or 0), "description": description, "repairable": bool(repairable)}
+
+
+def _low_confidence_families(confidence: dict[str, Any], *, threshold: float) -> set[str]:
+    lows: set[str] = set()
+    for family, fields in CONFIDENCE_FAMILIES.items():
+        values = [_confidence_value(confidence.get(field)) for field in fields if _confidence_value(confidence.get(field)) is not None]
+        if values and min(values) < threshold:
+            lows.add(family)
+    return lows
+
+
+def _actionable_quality_flags(enrichment: dict[str, Any], weak_families: list[str]) -> list[str]:
+    flags: list[str] = []
+    essentiality = str(enrichment.get("essentiality") or "").strip().lower()
+    top = str(enrichment.get("top_level_category") or "").strip().lower()
+    leaf = str(enrichment.get("leaf_category") or "").strip().lower()
+    if essentiality in {"", "unknown"}:
+        flags.append("unknown_essentiality")
+    if top in {"", "other"} or leaf in {"", "other", "uncategorized"}:
+        flags.append("generic_taxonomy")
+    for family in weak_families:
+        if family == "recurrence":
+            continue
+        flags.append(f"weak_{family}_confidence")
+    return sorted(set(flags))
+
+
+def _repair_candidate_transactions(conn: sqlite3.Connection, profile_id: str | None, *, limit: int) -> list[dict[str, Any]]:
+    pwhere, params = _profile_where(profile_id, "t")
+    source = "transactions_visible" if _relation_exists(conn, "transactions_visible") else "transactions"
+    rows = conn.execute(
+        f"""
+        SELECT t.*
+          FROM {source} t
+          LEFT JOIN transaction_enrichment e
+            ON e.transaction_id = t.id AND e.profile_id = t.profile_id
+         WHERE 1=1{pwhere}
+           AND COALESCE(e.user_reviewed, 0) = 0
+         ORDER BY CASE WHEN e.transaction_id IS NULL THEN 0 ELSE 1 END,
+                  t.date DESC, t.id DESC
+         LIMIT ?
+        """,
+        [*params, limit],
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _repair_changes(stored: dict[str, Any] | None, fresh: dict[str, Any]) -> list[dict[str, Any]]:
+    if not stored:
+        return [
+            {
+                "field": field,
+                "old": "",
+                "new": str(fresh.get(field) or ""),
+                "confidence": (fresh.get("confidence") or {}).get(field),
+            }
+            for field in CORRECTABLE_FIELDS
+            if str(fresh.get(field) or "")
+        ]
+    changes: list[dict[str, Any]] = []
+    for field in CORRECTABLE_FIELDS:
+        old = str(stored.get(field) or "")
+        new = str(fresh.get(field) or "")
+        if old == new:
+            continue
+        changes.append(
+            {
+                "field": field,
+                "old": old,
+                "new": new,
+                "confidence": (fresh.get("confidence") or {}).get(field),
+            }
+        )
+    return changes
+
+
+def _repair_reason(changes: list[dict[str, Any]], stored: dict[str, Any] | None) -> str:
+    if not stored:
+        return "missing_enrichment"
+    fields = {str(change.get("field") or "") for change in changes}
+    if fields & {"top_level_category", "leaf_category", "purpose_category", "essentiality"}:
+        return "taxonomy_rule_update"
+    if fields & {"semantic_type"}:
+        return "semantic_type_rule_update"
+    if fields & {"canonical_counterparty", "display_counterparty"}:
+        return "counterparty_rule_update"
+    return "deterministic_rule_update"
+
+
+def _relation_exists(conn: sqlite3.Connection, name: str) -> bool:
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type IN ('table', 'view') AND name = ? LIMIT 1",
+            (name,),
+        ).fetchone()
+    except Exception:
+        return False
+    return bool(row)
+
+
+def _confidence_value(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number < 0 or number > 1:
+        return None
+    return number
 
 
 def classify_ambiguous_with_local_model(tx: dict[str, Any]) -> None:
@@ -574,7 +968,7 @@ def _counterparty(
     canonical = merchant_key or canonicalize_merchant_key(display) or display.upper()
     source = "merchant_identity" if merchant_key or merchant_name else "description"
     conf = _merchant_confidence(tx.get("merchant_confidence"), source)
-    if kind and kind != "merchant_purchase" and not merchant_name:
+    if kind in NON_MERCHANT_KINDS and not merchant_name and _kind_matches_transaction(kind, tx):
         canonical = kind
         display = counterparty or _title_from_description(description) or kind.replace("_", " ").title()
         conf = 0.86
@@ -591,6 +985,25 @@ def _counterparty(
     if merchant_key:
         evidence["merchant_key"] = merchant_key
     return {"canonical_counterparty": canonical, "display_counterparty": display}
+
+
+def _kind_matches_transaction(kind: str, tx: dict[str, Any]) -> bool:
+    category = str(tx.get("category") or "").strip().lower()
+    try:
+        amount = float(tx.get("amount") or 0)
+    except (TypeError, ValueError):
+        amount = 0.0
+    if kind == "income":
+        return amount > 0 or category == "income"
+    if kind == "bank_fee":
+        return amount < 0 and category in {"fees", "fees & charges", "bank fees"}
+    if kind == "tax":
+        return category == "taxes"
+    if kind == "credit_card_payment":
+        return category == "credit card payment"
+    if kind == "personal_transfer":
+        return category in {"personal transfer", "savings transfer", "cash withdrawal", "cash deposit", "investment transfer"}
+    return False
 
 
 def _category(tx: dict[str, Any], confidence: dict[str, float], evidence: dict[str, Any]) -> dict[str, str]:
@@ -675,6 +1088,8 @@ def _semantic_type(tx: dict[str, Any], category: dict[str, str]) -> tuple[str, f
         or "treas tax ref" in description
         or ("irs treas" in description and "ref" in description)
     )
+    if amount > 0 and cat in {"credits & refunds", "refunds"}:
+        return "refund", 0.9
     if amount > 0 and (merchant_kind == "tax" or cat == "taxes") and tax_refund_text:
         return "refund", 0.9
     if merchant_kind in {"personal_transfer", "credit_card_payment", "income", "tax", "bank_fee"}:

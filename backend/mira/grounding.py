@@ -18,12 +18,13 @@ ENTITY_TYPES = {"merchant", "category", "account", "transaction", "goal", "recur
 
 STOP_MERCHANT_WORDS = {"and", "the", "of", "for", "at", "to", "in", "on", "my"}
 STOP_QUERY_WORDS = STOP_MERCHANT_WORDS | {
-    "a", "an", "all", "can", "could", "did", "do", "does", "how", "i", "is",
-    "last", "me", "month", "months", "much", "show", "spend", "spending",
+    "a", "about", "an", "all", "can", "could", "did", "do", "does", "how", "i", "is",
+    "last", "me", "month", "months", "much", "same", "show", "spend", "spending",
     "spent", "this", "transaction", "transactions", "versus", "vs", "what",
     "you", "compare", "compared", "current", "past", "previous", "prior",
     "year", "paid", "pay", "charges", "charge", "expenses", "expense",
-    "money", "wasted", "list", "display", "find", "pull", "please",
+    "money", "wasted", "list", "display", "find", "pull", "please", "that",
+    "then", "there",
 }
 
 CATEGORY_SYNONYMS = {
@@ -36,6 +37,7 @@ CATEGORY_SYNONYMS = {
     "food dining": "Food & Dining",
     "restaurant": "Food & Dining",
     "restaurants": "Food & Dining",
+    "shopping": "Shopping",
     "subscription": "Subscriptions",
     "subscriptions": "Subscriptions",
     "tax": "Taxes",
@@ -600,6 +602,43 @@ def _score_entity(text: str, entity: _Entity) -> GroundCandidate | None:
     )
 
 
+def _short_merchant_family_ambiguity(
+    text: str,
+    top: GroundCandidate,
+    ranked: list[GroundCandidate],
+    limit: int,
+) -> list[GroundCandidate]:
+    query_tokens = significant_tokens(text, query=True)
+    if len(query_tokens) != 1:
+        return []
+    token = query_tokens[0]
+    top_tokens = set(significant_tokens(top.display_name) or words(top.display_name))
+    if token not in top_tokens:
+        return []
+
+    family: list[GroundCandidate] = []
+    seen: set[str] = set()
+    for candidate in ranked:
+        if candidate.entity_type != "merchant":
+            continue
+        key = normalize_text(candidate.display_name)
+        if not key or key in seen:
+            continue
+        candidate_tokens = set(significant_tokens(candidate.display_name) or words(candidate.display_name))
+        if token not in candidate_tokens:
+            continue
+        if candidate is not top and candidate.confidence < 0.74:
+            continue
+        seen.add(key)
+        family.append(candidate)
+        if len(family) >= limit:
+            break
+    if len(family) <= 1:
+        return []
+    family.sort(key=lambda item: (item.confidence, item.evidence.get("frequency") or 0), reverse=True)
+    return family[:limit]
+
+
 def ground_text(
     text: str,
     entity_type: str,
@@ -680,6 +719,10 @@ def ground_text(
             if key not in seen_values:
                 unique.append(candidate)
                 seen_values.add(key)
+        if entity_type == "merchant":
+            specific = _most_specific_exact_merchant_matches(text, unique)
+            if specific:
+                unique = specific
         if len(unique) > 1:
             return GroundResult(
                 kind="ambiguous",
@@ -693,6 +736,20 @@ def ground_text(
                 rejected_candidates=rejected,
             )
         top = unique[0]
+        if entity_type == "merchant":
+            family = _short_merchant_family_ambiguity(text, top, ranked, limit)
+            if family:
+                return GroundResult(
+                    kind="ambiguous",
+                    entity_type=entity_type,
+                    value=None,
+                    canonical_id=None,
+                    display_name=None,
+                    confidence=family[0].confidence,
+                    candidates=[candidate.as_dict() for candidate in family],
+                    evidence={"query": text, "reason": "short merchant name matched multiple live merchants"},
+                    rejected_candidates=rejected,
+                )
         return GroundResult(
             kind="exact",
             entity_type=entity_type,
@@ -746,6 +803,25 @@ def ground_text(
         evidence={"query": text, "reason": "below confidence threshold"},
         rejected_candidates=rejected,
     )
+
+
+def _most_specific_exact_merchant_matches(
+    text: str,
+    candidates: list[GroundCandidate],
+) -> list[GroundCandidate]:
+    query_tokens = set(significant_tokens(text, query=True) or words(text))
+    if not query_tokens:
+        return []
+    covered: list[tuple[int, GroundCandidate]] = []
+    for candidate in candidates:
+        name_tokens = set(significant_tokens(candidate.display_name) or words(candidate.display_name))
+        if name_tokens and name_tokens <= query_tokens:
+            covered.append((len(name_tokens), candidate))
+    if not covered:
+        return []
+    max_size = max(size for size, _candidate in covered)
+    specific = [candidate for size, candidate in covered if size == max_size]
+    return specific if len(specific) == 1 else []
 
 
 def _names_digest(names: Iterable[str] | None) -> str:

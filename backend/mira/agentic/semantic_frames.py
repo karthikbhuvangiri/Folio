@@ -86,6 +86,7 @@ FILTER_KEYS_BY_TOOL: dict[str, set[str]] = {
     "review_recurring": {"status"},
     "review_net_worth": set(),
     "review_data_quality": {"transaction_id"},
+    "review_financial_context": {"subject_type", "subject_key"},
     "manage_memory": set(),
     "preview_finance_change": set(),
     "make_chart": set(),
@@ -102,6 +103,7 @@ PAYLOAD_KEYS_BY_TOOL: dict[str, set[str]] = {
     "review_recurring": {"all"},
     "review_net_worth": {"interval"},
     "review_data_quality": {"threshold", "include_taxonomy"},
+    "review_financial_context": {"question", "intent", "max_facts", "amount", "month_key"},
     "manage_memory": {
         "text",
         "memory_type",
@@ -179,6 +181,12 @@ SEMANTIC_FRAME_SCHEMAS: dict[str, SemanticFrameSchema] = {
         optional={"filters", "payload", "limit"},
         filter_keys=FILTER_KEYS_BY_TOOL["review_data_quality"],
         payload_keys=PAYLOAD_KEYS_BY_TOOL["review_data_quality"],
+    ),
+    "review_financial_context": SemanticFrameSchema(
+        views={"relevant", "lifestyle_profile", "friction_map", "operating_plan", "monthly_retrospective", "forecast_month_outlook.snapshot", "review_cashflow.safe_to_spend"},
+        optional={"filters", "payload", "limit"},
+        filter_keys=FILTER_KEYS_BY_TOOL["review_financial_context"],
+        payload_keys=PAYLOAD_KEYS_BY_TOOL["review_financial_context"],
     ),
     "manage_memory": SemanticFrameSchema(
         views={"remember", "retrieve", "list", "update", "forget"},
@@ -295,6 +303,38 @@ SEMANTIC_VIEW_CONTRACTS: dict[tuple[str, str], SemanticViewContract] = {
     ("review_data_quality", "explain_transaction"): SemanticViewContract(
         optional={"filters"},
         filter_keys={"transaction_id"},
+    ),
+    ("review_financial_context", "relevant"): SemanticViewContract(
+        optional={"filters", "payload", "limit"},
+        filter_keys={"subject_type", "subject_key"},
+        payload_keys={"question", "intent", "max_facts"},
+    ),
+    ("review_financial_context", "lifestyle_profile"): SemanticViewContract(
+        optional={"filters", "payload", "limit"},
+        filter_keys={"subject_type", "subject_key"},
+        payload_keys={"question", "intent", "max_facts"},
+    ),
+    ("review_financial_context", "friction_map"): SemanticViewContract(
+        optional={"filters", "payload", "limit"},
+        filter_keys={"subject_type", "subject_key"},
+        payload_keys={"question", "intent", "max_facts"},
+    ),
+    ("review_financial_context", "operating_plan"): SemanticViewContract(
+        optional={"filters", "payload", "limit"},
+        filter_keys={"subject_type", "subject_key"},
+        payload_keys={"question", "intent", "max_facts"},
+    ),
+    ("review_financial_context", "monthly_retrospective"): SemanticViewContract(
+        optional={"payload", "limit"},
+        payload_keys={"question", "intent", "max_facts", "month_key"},
+    ),
+    ("review_financial_context", "forecast_month_outlook.snapshot"): SemanticViewContract(
+        optional={"payload", "limit"},
+        payload_keys={"question", "intent", "max_facts", "amount"},
+    ),
+    ("review_financial_context", "review_cashflow.safe_to_spend"): SemanticViewContract(
+        optional={"payload", "limit"},
+        payload_keys={"question", "intent", "max_facts", "amount"},
     ),
     ("manage_memory", "remember"): SemanticViewContract(
         optional={"payload"},
@@ -667,6 +707,19 @@ def _validate_tool_specific_frame(tool_name: str, args: dict[str, Any]) -> Seman
     if tool_name == "review_data_quality" and view == "explain_transaction" and not filters.get("transaction_id"):
         return SemanticFrameIssue("clarify", "I need the transaction_id to explain enrichment for one transaction.")
 
+    if tool_name == "review_financial_context":
+        subject_type = str(filters.get("subject_type") or "").strip().lower()
+        if subject_type and subject_type not in {"profile", "category", "merchant", "subscription", "account", "cashflow", "habit"}:
+            return SemanticFrameIssue("clarify", "I need a supported financial context subject type.")
+        max_facts = payload.get("max_facts")
+        if max_facts not in MISSING_VALUES:
+            try:
+                value = int(max_facts)
+            except (TypeError, ValueError):
+                return SemanticFrameIssue("clarify", "I need max_facts as a small integer.")
+            if value < 1 or value > 8:
+                return SemanticFrameIssue("clarify", "I can use between 1 and 8 financial context facts.")
+
     if tool_name == "manage_memory":
         if view == "remember" and not str(payload.get("text") or "").strip():
             return SemanticFrameIssue("clarify", "I need the durable memory text to save.")
@@ -968,6 +1021,38 @@ def _normalize_frame_aliases(original_tool_name: str, tool_name: str, args: dict
         if str(out.get("view") or "").strip().lower() in {"health", "enrichment_summary", "low_confidence"}:
             out.pop("range", None)
 
+    elif tool_name == "review_financial_context":
+        if out.get("mode") and not out.get("view"):
+            out["view"] = out.pop("mode")
+        if out.get("action") and not out.get("view"):
+            out["view"] = out.pop("action")
+        _move_many(out, filters, ("subject_type", "subject_key"))
+        _move_many(out, payload, ("question", "intent", "max_facts", "amount", "month_key"))
+        _move_many(filters, payload, ("question", "intent", "max_facts", "amount", "month_key"))
+        view = str(out.get("view") or "").strip().lower()
+        aliases = {
+            "financial_context": "relevant",
+            "context": "relevant",
+            "lifestyle": "lifestyle_profile",
+            "profile": "lifestyle_profile",
+            "friction": "friction_map",
+            "leaks": "friction_map",
+            "operating": "operating_plan",
+            "plan": "operating_plan",
+            "retrospective": "monthly_retrospective",
+            "monthly_retrospective": "monthly_retrospective",
+            "monthly_diary": "monthly_retrospective",
+            "last_month_read": "monthly_retrospective",
+            "forecast": "forecast_month_outlook.snapshot",
+            "outlook": "forecast_month_outlook.snapshot",
+            "money_outlook": "forecast_month_outlook.snapshot",
+            "safe_to_spend": "review_cashflow.safe_to_spend",
+            "cashflow_safe_to_spend": "review_cashflow.safe_to_spend",
+        }
+        if view in aliases:
+            out["view"] = aliases[view]
+        out.pop("range", None)
+
     elif tool_name == "manage_memory":
         payload_action = str(payload.pop("action", "") or "").strip().lower()
         payload_view = str(payload.pop("view", "") or "").strip().lower()
@@ -1187,6 +1272,8 @@ def _apply_frame_defaults(tool_name: str, args: dict[str, Any]) -> dict[str, Any
             payload.setdefault("interval", "monthly")
     elif tool_name == "review_data_quality":
         out.setdefault("view", "health")
+    elif tool_name == "review_financial_context":
+        out.setdefault("view", "relevant")
     elif tool_name == "manage_memory":
         if not out.get("view") and payload.get("text"):
             out["view"] = "remember"

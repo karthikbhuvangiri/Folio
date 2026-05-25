@@ -1,6 +1,7 @@
 <script>
     import '$lib/styles/dashboard.css';
     import '$lib/styles/transactions.css';
+    import { goto } from '$app/navigation';
     import { page } from '$app/stores';
     import { onMount, onDestroy, tick } from 'svelte';
     import { api, invalidateCacheByPrefix, invalidateCache } from '$lib/api.js';
@@ -148,6 +149,7 @@
     let hasRenderableSankeyData = false;
 
     $: debugLoadingMode = $page.url.searchParams.get('debugLoading') || '';
+    $: debugInsights = $page.url.searchParams.get('debugInsights') === '1';
     $: forceHeroLoading = ['hero', 'all'].includes(debugLoadingMode);
     $: forceMetricLoading = ['metrics', 'all'].includes(debugLoadingMode);
     $: forceSankeyLiveLoading = ['sankey', 'sankey-live', 'sankey-sync', 'all'].includes(debugLoadingMode) && hasRenderableSankeyData;
@@ -253,7 +255,14 @@
     let cashFlowForecast = data.cashFlowForecast || null;
     let investments = data.investments || null;
     let proactiveInsights = [];
-    let proactiveLoading = false;
+    let proactiveLoading = true;
+    let proactiveAnalystRefreshing = false;
+    let proactiveAnalystMessage = '';
+    let proactiveAnalystPollTimer = null;
+    let proactiveAnalystPollAttempts = 0;
+    let primaryProactiveInsight = null;
+    let secondaryProactiveInsights = [];
+    const DASHBOARD_MONEY_SIGNALS_ENABLED = false;
     let manualQuickBalances = {};
     let manualQuickSavingId = null;
     let manualQuickMessage = '';
@@ -362,7 +371,9 @@
             if (!initialLoadComplete) {
                 initialLoadComplete = true;
             }
-            await loadProactiveInsights();
+            if (DASHBOARD_MONEY_SIGNALS_ENABLED) {
+                await loadProactiveInsights();
+            }
 
             console.info('🎉 Dashboard refreshed with new data.');
         } finally {
@@ -375,6 +386,7 @@
         if (animationFrameId != null) {
             cancelAnimationFrame(animationFrameId);
         }
+        clearProactiveAnalystPoll();
     });
 
     onMount(async () => {
@@ -447,7 +459,9 @@
             requestAnimationFrame(() => animateNumbers());
 
             await tick();
-            await loadProactiveInsights();
+            if (DASHBOARD_MONEY_SIGNALS_ENABLED) {
+                await loadProactiveInsights();
+            }
             // Only mark complete if we actually have data to show
             initialLoadComplete = !!(summary && accounts && accounts.length > 0);
 
@@ -755,23 +769,261 @@
     }
 
     $: visibleProactiveInsights = Array.isArray(proactiveInsights) ? proactiveInsights.slice(0, 3) : [];
+    $: showProactiveSection = DASHBOARD_MONEY_SIGNALS_ENABLED && visibleProactiveInsights.length > 0;
+    $: primaryProactiveInsight = visibleProactiveInsights[0] || null;
+    $: secondaryProactiveInsights = visibleProactiveInsights.slice(1);
 
     function insightMeta(insight) {
-        const confidence = insight?.confidence ? `Confidence: ${insight.confidence}` : '';
+        const confidence = insight?.confidence ? `${String(insight.confidence).charAt(0).toUpperCase()}${String(insight.confidence).slice(1)} confidence` : '';
         const caveats = Array.isArray(insight?.caveats) ? insight.caveats : (Array.isArray(insight?.evidence?.caveats) ? insight.evidence.caveats : []);
         const caveat = caveats.length > 0 ? caveats[0] : '';
         return [confidence, caveat].filter(Boolean).join(' · ');
     }
 
+    function shouldExpandInsight(insight) {
+        const severity = String(insight?.severity || '').toLowerCase();
+        const confidence = String(insight?.confidence || '').toLowerCase();
+        return severity === 'critical' || (severity === 'warning' && ['high', 'user'].includes(confidence));
+    }
+
+    function signalCountLabel(count) {
+        return count === 1 ? '1 signal to check' : `${count} signals to check`;
+    }
+
+    function insightIcon(insight) {
+        const kind = String(insight?.kind || '');
+        if (kind === 'cashflow_shortfall') return 'warning';
+        if (kind.includes('recurring')) return 'event_repeat';
+        if (kind.includes('goal')) return 'flag';
+        return 'insights';
+    }
+
+    const INSIGHT_EVIDENCE_LABELS = {
+        category: 'Category',
+        merchant: 'Merchant',
+        merchant_key: 'Merchant key',
+        counterparty: 'Counterparty',
+        month: 'Month',
+        period: 'Period',
+        period_bucket: 'Period',
+        range: 'Period',
+        event_type: 'Type',
+        current_total: 'Current',
+        prior_average: 'Prior average',
+        prior_months: 'Prior months',
+        prior_sample_months: 'Prior sample',
+        delta: 'Change',
+        old_amount: 'Previous amount',
+        new_amount: 'New amount',
+        expected_amount: 'Expected amount',
+        next_expected_date: 'Next expected',
+        latest_date: 'Latest charge',
+        total: 'Total',
+        combined_amount: 'Combined amount',
+        amount: 'Amount',
+        count: 'Count',
+        sample_size: 'Sample size',
+        transaction_count: 'Transactions',
+        row_count: 'Rows'
+    };
+
+    const INSIGHT_EVIDENCE_KEYS = [
+        'category', 'merchant', 'merchant_key', 'counterparty', 'month', 'period',
+        'period_bucket', 'range', 'event_type', 'current_total', 'prior_average',
+        'prior_sample_months', 'delta', 'old_amount', 'new_amount', 'expected_amount',
+        'next_expected_date', 'latest_date', 'total', 'combined_amount', 'amount',
+        'sample_size', 'count', 'transaction_count', 'row_count'
+    ];
+
+    function readableInsightSource(source) {
+        const labels = {
+            'proactive_insights.build_candidate_insights': 'Signal detector',
+            'mira.cashflow_forecast.predict_shortfall': 'Cash-flow forecast',
+            'data_manager.get_dashboard_bundle_data': 'Dashboard summary',
+            'data_manager.get_plan_snapshot_data': 'Plan snapshot',
+            'data_manager.get_category_analytics_data': 'Category analytics',
+            'data_manager.get_monthly_category_breakdown': 'Category history',
+            'data_manager.get_merchant_insights_data': 'Merchant analytics',
+            'recurring_obligations.get_recurring_bundle': 'Recurring detector',
+            'recurring_obligations.get_scheduled_bundle': 'Scheduled bills'
+        };
+        return labels[source] || '';
+    }
+
+    function humanizeEvidenceType(value) {
+        return String(value || '').replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+    }
+
+    function insightEvidenceValue(key, value) {
+        if (value === null || value === undefined || value === '') return '';
+        if (Array.isArray(value)) return value.map(item => String(item)).join(', ');
+        if (typeof value === 'object' && value !== null) return '';
+        if (typeof value === 'number') {
+            if (/(amount|total|average|delta)/.test(key)) return formatCurrency(value);
+            return Number.isInteger(value) ? String(value) : value.toFixed(2);
+        }
+        if (typeof value === 'string' && /^\d{4}-\d{2}-\d{2}/.test(value)) return formatDate(value);
+        if (key === 'event_type') return humanizeEvidenceType(value);
+        return String(value);
+    }
+
+    function addEvidenceLines(lines, values, limit = 5) {
+        if (!values || typeof values !== 'object') return;
+        const payload = values.payload && typeof values.payload === 'object' ? values.payload : {};
+        const merged = { ...values, ...payload };
+        for (const key of INSIGHT_EVIDENCE_KEYS) {
+            const formatted = insightEvidenceValue(key, merged[key]);
+            if (formatted) {
+                const label = INSIGHT_EVIDENCE_LABELS[key] || key.replace(/_/g, ' ');
+                const line = `${label}: ${formatted}`;
+                if (!lines.includes(line)) lines.push(line);
+            }
+            if (lines.length >= limit) break;
+        }
+        if (Array.isArray(values.items) && values.items.length > 0 && lines.length < limit) {
+            const names = values.items.map(item => item?.merchant || item?.merchant_key).filter(Boolean);
+            if (names.length > 0) lines.push(`Items: ${names.slice(0, 3).join(', ')}`);
+        }
+    }
+
+    function insightEvidenceLines(insight) {
+        const evidence = insight?.evidence && typeof insight.evidence === 'object' ? insight.evidence : {};
+        const lines = [];
+        const add = (line) => {
+            const clean = String(line || '').trim();
+            if (clean && !lines.includes(clean)) lines.push(clean);
+        };
+
+        const cited = Array.isArray(evidence.cited_evidence) ? evidence.cited_evidence : [];
+        if (cited.length > 0) {
+            const first = cited[0] || {};
+            add(readableInsightSource(first.source));
+            if (first.kind) add(`Type: ${humanizeEvidenceType(first.kind)}`);
+            addEvidenceLines(lines, first.values, 6);
+            if (cited.length > 1) add(`Evidence items: ${cited.length}`);
+        } else {
+            add(readableInsightSource(evidence.source));
+            const contract = evidence.detector_contract || {};
+            if (contract.fact) add(`Rule: ${contract.fact}`);
+            addEvidenceLines(lines, evidence, 6);
+        }
+
+        const caveats = Array.isArray(insight?.caveats) ? insight.caveats : (Array.isArray(evidence?.caveats) ? evidence.caveats : []);
+        if (caveats.length > 0) add(`Caveat: ${caveats[0]}`);
+        return lines.slice(0, 6);
+    }
+
+    function insightDebugDetails(insight) {
+        const evidence = insight?.evidence && typeof insight.evidence === 'object' ? insight.evidence : {};
+        const contract = evidence.detector_contract || {};
+        return {
+            kind: insight?.kind,
+            insight_type: insight?.insight_type,
+            priority: insight?.priority,
+            severity: insight?.severity,
+            confidence: insight?.confidence,
+            generated_at: insight?.generated_at,
+            valid_until: insight?.valid_until,
+            contract: contract.fact || '',
+            evidence_keys: Object.keys(evidence).filter(key => key !== 'detector_contract')
+        };
+    }
+
     async function loadProactiveInsights() {
+        if (!DASHBOARD_MONEY_SIGNALS_ENABLED) {
+            proactiveLoading = false;
+            proactiveInsights = [];
+            return;
+        }
         proactiveLoading = true;
         try {
             const result = await api.getProactiveInsights();
             proactiveInsights = Array.isArray(result?.items) ? result.items : [];
+            const status = result?.auto_refresh?.status || result?.job?.status || '';
+            if (status === 'queued' || status === 'running') {
+                proactiveAnalystRefreshing = true;
+                proactiveAnalystPollAttempts = 0;
+                proactiveAnalystMessage = backgroundAnalystMessage(null, status);
+                scheduleBackgroundAnalystPoll();
+            }
         } catch (e) {
             console.error('Failed to load proactive insights:', e);
         } finally {
             proactiveLoading = false;
+        }
+    }
+
+    function clearProactiveAnalystPoll() {
+        if (proactiveAnalystPollTimer != null) {
+            clearTimeout(proactiveAnalystPollTimer);
+            proactiveAnalystPollTimer = null;
+        }
+    }
+
+    function backgroundAnalystMessage(run, status = '') {
+        const effectiveStatus = run?.status || status;
+        if ((run?.stored_count || 0) > 0) return 'New signal added.';
+        if (effectiveStatus === 'fresh_cache') return 'Signals were checked recently.';
+        if (effectiveStatus === 'llm_unavailable') return 'The local model is not available right now.';
+        if (effectiveStatus === 'disabled' || effectiveStatus === 'store_disabled') return 'Background checks are disabled.';
+        if (effectiveStatus === 'queued' || effectiveStatus === 'running') return 'Signals are refreshing in the background. You can leave this page.';
+        if (effectiveStatus === 'error') return 'Signals could not refresh right now.';
+        return 'Nothing new right now.';
+    }
+
+    function scheduleBackgroundAnalystPoll() {
+        clearProactiveAnalystPoll();
+        proactiveAnalystPollTimer = setTimeout(pollBackgroundAnalystStatus, 3000);
+    }
+
+    async function pollBackgroundAnalystStatus() {
+        proactiveAnalystPollTimer = null;
+        proactiveAnalystPollAttempts += 1;
+        try {
+            const result = await api.getBackgroundProactiveInsightStatus();
+            proactiveInsights = Array.isArray(result?.items) ? result.items : [];
+            const job = result?.job || {};
+            if (job.status === 'queued' || job.status === 'running') {
+                proactiveAnalystMessage = backgroundAnalystMessage(null, job.status);
+                if (proactiveAnalystPollAttempts < 20) {
+                    scheduleBackgroundAnalystPoll();
+                } else {
+                    proactiveAnalystRefreshing = false;
+                    proactiveAnalystMessage = 'Signals are still refreshing in the background.';
+                }
+                return;
+            }
+            proactiveAnalystRefreshing = false;
+            proactiveAnalystMessage = backgroundAnalystMessage(job.run, job.status);
+        } catch (e) {
+            console.error('Failed to poll background analyst status:', e);
+            proactiveAnalystRefreshing = false;
+            proactiveAnalystMessage = 'Signals could not refresh right now.';
+        }
+    }
+
+    async function refreshBackgroundAnalystInsights() {
+        if (proactiveAnalystRefreshing) return;
+        clearProactiveAnalystPoll();
+        proactiveAnalystRefreshing = true;
+        proactiveAnalystPollAttempts = 0;
+        proactiveAnalystMessage = '';
+        try {
+            invalidateCacheByPrefix('proactive-insights');
+            const result = await api.refreshBackgroundProactiveInsights();
+            proactiveInsights = Array.isArray(result?.items) ? result.items : [];
+            const status = result?.status || result?.job?.status || result?.run?.status || '';
+            if (status === 'queued' || status === 'running') {
+                proactiveAnalystMessage = backgroundAnalystMessage(null, status);
+                scheduleBackgroundAnalystPoll();
+                return;
+            }
+            proactiveAnalystRefreshing = false;
+            proactiveAnalystMessage = backgroundAnalystMessage(result?.run, status);
+        } catch (e) {
+            console.error('Failed to refresh background analyst insights:', e);
+            proactiveAnalystMessage = 'Signals could not refresh right now.';
+            proactiveAnalystRefreshing = false;
         }
     }
 
@@ -1712,6 +1964,33 @@
         return Math.min((balance / limit) * 100, 100);
     }
 
+    function isCreditCardAccount(account) {
+        const accountType = (account?.account_type || '').toLowerCase();
+        return accountType === 'credit' || accountType === 'credit_card';
+    }
+
+    function formatOrdinalDay(day) {
+        const value = Number(day);
+        if (!Number.isInteger(value) || value < 1 || value > 31) return '';
+        const lastTwo = value % 100;
+        if (lastTwo >= 11 && lastTwo <= 13) return `${value}th`;
+        const lastDigit = value % 10;
+        if (lastDigit === 1) return `${value}st`;
+        if (lastDigit === 2) return `${value}nd`;
+        if (lastDigit === 3) return `${value}rd`;
+        return `${value}th`;
+    }
+
+    function dueDayLabel(account) {
+        const ordinal = formatOrdinalDay(account?.usual_due_day);
+        return ordinal ? `Due ${ordinal}` : '';
+    }
+
+    function openAccountPaymentDetails(account) {
+        if (!account?.id) return;
+        goto(`/control-center?tab=accounts&account=${encodeURIComponent(account.id)}`);
+    }
+
     function isManualStale(account) {
         if (account?.provider !== 'manual' || !account.manual_updated_at) return false;
         const updated = new Date(String(account.manual_updated_at).replace(' ', 'T'));
@@ -2406,46 +2685,135 @@
         </section>
     {/if}
 
-    {#if visibleProactiveInsights.length > 0}
-        <section class="mb-6 fade-in-up" style="animation-delay: 54ms">
-            <div class="card" style="padding: 1rem;">
-                <div class="flex items-center justify-between gap-3 mb-3">
-                    <div>
-                        <p class="text-[10px] font-bold tracking-[0.14em] uppercase" style="color: var(--accent)">Mira Noticed</p>
-                        <h3 class="folio-section-title" style="margin:0.15rem 0 0">Top money signals</h3>
+    {#if showProactiveSection}
+        <section class="mb-3 fade-in-up" style="animation-delay: 54ms">
+            <div class="card" style="padding: 0.75rem 0.85rem;">
+                <div class="flex items-center justify-between gap-3">
+                    <div class="min-w-0">
+                        <p class="text-[10px] font-bold tracking-[0.14em] uppercase" style="color: var(--accent)">Money Signals</p>
+                        <h3 class="text-sm font-semibold truncate" style="color: var(--text-primary); margin:0.1rem 0 0">{signalCountLabel(visibleProactiveInsights.length)}</h3>
                     </div>
-                    {#if proactiveLoading}
-                        <span class="text-xs" style="color: var(--text-muted)">Refreshing</span>
-                    {/if}
-                </div>
-                <div class="grid gap-2">
-                    {#each visibleProactiveInsights as insight}
-                        <article class="flex gap-3 items-start" style="border: 1px solid var(--card-border); border-radius: 0.5rem; padding: 0.75rem; background: var(--surface-50);">
-                            <span class="material-symbols-outlined text-[18px]" style="color: {insight.severity === 'critical' ? 'var(--negative)' : insight.severity === 'warning' ? 'var(--warning)' : 'var(--accent)'}">
-                                {insight.kind === 'cashflow_shortfall' ? 'warning' : insight.kind?.includes('recurring') ? 'event_repeat' : insight.kind?.includes('goal') ? 'flag' : 'insights'}
+                    <div class="flex items-center gap-2">
+                        {#if proactiveLoading || proactiveAnalystRefreshing}
+                            <span class="text-xs" style="color: var(--text-muted)">Refreshing</span>
+                        {/if}
+                        <button
+                            type="button"
+                            class="privacy-toggle-btn"
+                            disabled={proactiveLoading || proactiveAnalystRefreshing}
+                            on:click={refreshBackgroundAnalystInsights}
+                            aria-label="Refresh money signals"
+                            title="Refresh money signals"
+                        >
+                            <span class="material-symbols-outlined text-[12px]">
+                                {proactiveAnalystRefreshing ? 'hourglass_top' : 'auto_awesome'}
                             </span>
-                            <div class="min-w-0 flex-1">
-                                <strong class="block text-sm" style="color: var(--text-primary)">{insight.title}</strong>
-                                <p class="text-xs mt-1" style="color: var(--text-muted)">{insight.body}</p>
-                                {#if insight.recommended_action}
-                                    <p class="text-xs mt-2" style="color: var(--text-primary)">{insight.recommended_action}</p>
-                                {/if}
-                                {#if insightMeta(insight)}
-                                    <small class="block mt-2 text-[10px]" style="color: var(--text-muted)">{insightMeta(insight)}</small>
+                        </button>
+                    </div>
+                </div>
+
+                {#if primaryProactiveInsight}
+                    <article class="flex gap-2 items-start mt-3 pt-3" style="border-top: 1px solid var(--card-border);">
+                        <span class="material-symbols-outlined text-[17px]" style="color: {primaryProactiveInsight.severity === 'critical' ? 'var(--negative)' : primaryProactiveInsight.severity === 'warning' ? 'var(--warning)' : 'var(--accent)'}">
+                            {insightIcon(primaryProactiveInsight)}
+                        </span>
+                        <div class="min-w-0 flex-1">
+                            <div class="flex items-center gap-2 min-w-0">
+                                <strong class="block text-sm truncate" style="color: var(--text-primary)">{primaryProactiveInsight.title}</strong>
+                                {#if insightMeta(primaryProactiveInsight)}
+                                    <small class="shrink-0 text-[10px]" style="color: var(--text-muted)">{insightMeta(primaryProactiveInsight)}</small>
                                 {/if}
                             </div>
-                            <button
-                                type="button"
-                                class="privacy-toggle-btn"
-                                on:click={() => dismissProactiveInsight(insight.id)}
-                                aria-label="Dismiss insight"
-                                title="Dismiss insight"
-                            >
-                                <span class="material-symbols-outlined text-[12px]">close</span>
-                            </button>
-                        </article>
-                    {/each}
-                </div>
+                            {#if shouldExpandInsight(primaryProactiveInsight)}
+                                <p class="text-xs mt-1" style="color: var(--text-muted)">{primaryProactiveInsight.body}</p>
+                                {#if primaryProactiveInsight.recommended_action}
+                                    <p class="text-xs mt-1" style="color: var(--text-primary)">{primaryProactiveInsight.recommended_action}</p>
+                                {/if}
+                            {:else}
+                                <p class="text-xs mt-1 truncate" style="color: var(--text-muted)">{primaryProactiveInsight.body}</p>
+                            {/if}
+                            {#if insightEvidenceLines(primaryProactiveInsight).length > 0}
+                                <details class="mt-1 text-[10px]" style="color: var(--text-muted)">
+                                    <summary>Evidence</summary>
+                                    <div class="mt-1 space-y-1">
+                                        {#each insightEvidenceLines(primaryProactiveInsight) as line}
+                                            <div>{line}</div>
+                                        {/each}
+                                    </div>
+                                </details>
+                            {/if}
+                            {#if debugInsights}
+                                <details class="mt-2 text-[10px]" style="color: var(--text-muted)">
+                                    <summary>Evidence debug</summary>
+                                    <pre class="mt-1 whitespace-pre-wrap">{JSON.stringify(insightDebugDetails(primaryProactiveInsight), null, 2)}</pre>
+                                </details>
+                            {/if}
+                        </div>
+                        <button
+                            type="button"
+                            class="privacy-toggle-btn"
+                            on:click={() => dismissProactiveInsight(primaryProactiveInsight.id)}
+                            aria-label="Dismiss insight"
+                            title="Dismiss insight"
+                        >
+                            <span class="material-symbols-outlined text-[12px]">close</span>
+                        </button>
+                    </article>
+                {/if}
+
+                {#if secondaryProactiveInsights.length > 0}
+                    <details class="mt-2 text-xs" style="color: var(--text-muted)">
+                        <summary>{secondaryProactiveInsights.length} more {secondaryProactiveInsights.length === 1 ? 'signal' : 'signals'}</summary>
+                        <div class="grid gap-2 mt-2">
+                            {#each secondaryProactiveInsights as insight}
+                                <article class="flex gap-2 items-start">
+                                    <span class="material-symbols-outlined text-[15px]" style="color: {insight.severity === 'critical' ? 'var(--negative)' : insight.severity === 'warning' ? 'var(--warning)' : 'var(--accent)'}">
+                                        {insightIcon(insight)}
+                                    </span>
+                                    <div class="min-w-0 flex-1">
+                                        <div class="flex items-center gap-2 min-w-0">
+                                            <strong class="block text-xs truncate" style="color: var(--text-primary)">{insight.title}</strong>
+                                            {#if insightMeta(insight)}
+                                                <small class="shrink-0 text-[10px]" style="color: var(--text-muted)">{insightMeta(insight)}</small>
+                                            {/if}
+                                        </div>
+                                        <p class="text-[11px] mt-1 truncate" style="color: var(--text-muted)">{insight.body}</p>
+                                        {#if insightEvidenceLines(insight).length > 0}
+                                            <details class="mt-1 text-[10px]" style="color: var(--text-muted)">
+                                                <summary>Evidence</summary>
+                                                <div class="mt-1 space-y-1">
+                                                    {#each insightEvidenceLines(insight) as line}
+                                                        <div>{line}</div>
+                                                    {/each}
+                                                </div>
+                                            </details>
+                                        {/if}
+                                    </div>
+                                    <button
+                                        type="button"
+                                        class="privacy-toggle-btn"
+                                        on:click={() => dismissProactiveInsight(insight.id)}
+                                        aria-label="Dismiss insight"
+                                        title="Dismiss insight"
+                                    >
+                                        <span class="material-symbols-outlined text-[12px]">close</span>
+                                    </button>
+                                </article>
+                            {/each}
+                        </div>
+                    </details>
+                {/if}
+
+                {#if debugInsights && primaryProactiveInsight}
+                    <details class="mt-2 text-[10px]" style="color: var(--text-muted)">
+                        <summary>All signal debug</summary>
+                        <pre class="mt-1 whitespace-pre-wrap">{JSON.stringify(visibleProactiveInsights.map(insightDebugDetails), null, 2)}</pre>
+                    </details>
+                {/if}
+
+                {#if proactiveAnalystMessage && visibleProactiveInsights.length > 0}
+                    <p class="text-xs mt-2" style="color: var(--text-muted)">{proactiveAnalystMessage}</p>
+                {/if}
             </div>
         </section>
     {/if}
@@ -2495,7 +2863,7 @@
                 <strong>{reviewQueue.unreviewed_count} to review</strong>
                 <span>{(void privacyKey, formatCurrency(reviewQueue.unreviewed_spending || 0))} new spending</span>
             </div>
-            <a href="/transactions?review=unreviewed">Review</a>
+            <a href="/transactions?review=unreviewed&period=all">Review</a>
             <button type="button" on:click={() => reviewToastDismissed = true} aria-label="Dismiss review reminder">
                 <span class="material-symbols-outlined">close</span>
             </button>
@@ -2704,13 +3072,17 @@
                             ? (acc.type === 'mortgage' ? 'home' : acc.type === 'auto' ? 'directions_car' : acc.type === 'student' ? 'school' : 'account_balance')
                             : 'credit_card'}
                         {@const isLoan = acc.account_type === 'loan'}
-                        <div class="hero-account-row">
+                        {@const dueLabel = isCreditCardAccount(acc) ? dueDayLabel(acc) : ''}
+                        <button class="hero-account-row hero-account-row-button" type="button" on:click={() => openAccountPaymentDetails(acc)} title="Open account details">
                             <div class="flex items-center gap-2 flex-1 min-w-0">
                                 <span class="material-symbols-outlined text-[14px]" style="color: {$darkMode ? 'var(--text-muted)' : 'var(--island-text-muted)'}">{liabilityIcon}</span>
                                 <div class="flex-1 min-w-0">
                                     <p class="text-[11px] font-medium truncate" style="color: {$darkMode ? 'var(--text-primary)' : 'var(--island-text-primary)'}">{acc.name}</p>
-                                    <p class="text-[9px]" style="color: {$darkMode ? 'var(--text-muted)' : 'var(--island-text-muted)'}">
-                                        {acc.type.replace('_', ' ')}{#if acc.provider === 'manual'} · manual{#if isManualStale(acc)} · stale{/if}{/if}
+                                    <p class="text-[9px] flex items-center gap-1 min-w-0" style="color: {$darkMode ? 'var(--text-muted)' : 'var(--island-text-muted)'}">
+                                        <span class="truncate">{acc.type.replace('_', ' ')}{#if acc.provider === 'manual'} · manual{#if isManualStale(acc)} · stale{/if}{/if}</span>
+                                        {#if dueLabel}
+                                            <span class="hero-due-chip">{dueLabel}</span>
+                                        {/if}
                                     </p>
                                     {#if !isLoan}
                                         <div class="utilization-bar-track">
@@ -2722,7 +3094,7 @@
                             <p class="folio-amount-compact ml-3" style="color: {$darkMode ? 'var(--warning)' : 'var(--island-warning)'}">
                                 {(void privacyKey, formatCurrency(Math.abs(parseFloat(acc.balance || 0))))}
                             </p>
-                        </div>
+                        </button>
                     {/each}
                     {#if creditAccounts.length === 0}
                         <p class="text-xs py-2 text-center" style="color: {$darkMode ? 'var(--text-muted)' : 'var(--island-text-muted)'}">No liabilities</p>
@@ -3315,7 +3687,8 @@
                             class="sankey-cat-pill"
                             class:pill-active={isActive}
                             class:pill-dimmed={isDimmed}
-                            style="color: {catColor};
+                            style="--pill-color: {catColor};
+                                   color: {catColor};
                                    background: color-mix(in srgb, {catColor} {isActive ? 'var(--pill-bg-active)' : '6'}%, transparent);
                                    border-color: color-mix(in srgb, {catColor} {isActive ? 'var(--pill-border-active)' : '12'}%, transparent);">
                             <span class="material-symbols-outlined text-[13px]">{getSankeyFlowIcon(cat.category)}</span>
@@ -3335,8 +3708,8 @@
             {#if selectedSankeyCategory && sankeyDrillTxns.length > 0}
                 {@const drillTotal = getDrillDownTotal(selectedSankeyCategory)}
                 {@const isCreditDrilldown = selectedSankeyCategory === CREDIT_DRILLDOWN_CATEGORY}
-                <div class="card mt-3 fade-in" style="padding: 0; overflow: visible">
-                    <div class="flex items-center gap-3 px-5 py-2.5" style="border-bottom: 1px solid var(--card-border); background: var(--surface-100)">
+                <div class="sankey-drill-card card mt-3 fade-in" style="padding: 0; overflow: visible">
+                    <div class="sankey-drill-header flex items-center gap-3 px-5 py-2.5" style="border-bottom: 1px solid var(--card-border); background: var(--surface-100)">
                         <div class="w-6 h-6 rounded-lg flex items-center justify-center"
                             style="background: color-mix(in srgb, {getSankeyFlowColor(selectedSankeyCategory)} 15%, transparent)">
                             <span class="material-symbols-outlined text-[14px]" style="color: {getSankeyFlowColor(selectedSankeyCategory)}">
@@ -3344,8 +3717,8 @@
                             </span>
                         </div>
                         <div>
-                            <p class="text-[13px] font-semibold" style="color: var(--text-primary)">{selectedSankeyCategory}</p>
-                            <p class="text-[10px]" style="color: var(--text-muted)">{sankeyDrillTxns.length} transactions · by amount</p>
+                            <p class="sankey-drill-heading text-[13px] font-semibold" style="color: var(--text-primary)">{selectedSankeyCategory}</p>
+                            <p class="sankey-drill-subtitle text-[10px]" style="color: var(--text-muted)">{sankeyDrillTxns.length} transactions · by amount</p>
                         </div>
                         <p class="ml-auto folio-amount" style="color: {isCreditDrilldown ? 'var(--positive)' : 'var(--negative)'}">{isCreditDrilldown ? '+' : ''}{formatCurrency(drillTotal)}</p>
                     </div>
@@ -3363,8 +3736,8 @@
                             class:tx-row-updated={isDrillUpdated}
                             style="border-bottom: 1px solid color-mix(in srgb, var(--card-border) 50%, transparent)">
                             <div class="flex-1 min-w-0">
-                                <p class="text-[13px] font-medium truncate" style="color: var(--text-primary)">{tx.description}</p>
-                                <p class="text-[10px]" style="color: var(--text-muted)">{formatDate(tx.date)} · {tx.account_name}</p>
+                                <p class="sankey-drill-title text-[13px] font-medium truncate" style="color: var(--text-primary)">{tx.description}</p>
+                                <p class="sankey-drill-meta text-[10px]" style="color: var(--text-muted)">{formatDate(tx.date)} · {tx.account_name}</p>
                             </div>
                             <div class="drill-tx-right">
                                 <p class="folio-amount-compact" style="color: {amount >= 0 ? 'var(--positive)' : 'var(--negative)'}">

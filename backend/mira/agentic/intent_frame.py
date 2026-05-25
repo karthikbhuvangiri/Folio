@@ -120,6 +120,16 @@ DISCOURSE_ACTION_ALIASES = {
     "inherit": "follow_up",
     "patch_prior": "follow_up",
 }
+MEMORY_ACTION_VALUES = {"forget", "list", "none", "remember", "retrieve", "update"}
+MEMORY_ACTION_ALIASES = {
+    "delete": "forget",
+    "read": "retrieve",
+    "recall": "retrieve",
+    "remove": "forget",
+    "save": "remember",
+    "search": "retrieve",
+    "store": "remember",
+}
 
 EXECUTABLE_SELECTOR_KEYS = {
     "args",
@@ -240,6 +250,69 @@ class MiraSubject:
 
 
 @dataclass(frozen=True)
+class MiraMemoryOperation:
+    action: str = "none"
+    text: str | None = None
+    question: str | None = None
+    topic: str | None = None
+    memory_id: Any = None
+    memory_type: str | None = None
+    limit: Any = None
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any] | None) -> "MiraMemoryOperation":
+        data = _dict(payload)
+        if not data:
+            return cls()
+        _reject_executable_keys(data)
+        action = _canonical(data.get("action") or data.get("memory_action"), default="none", aliases=MEMORY_ACTION_ALIASES)
+        text = _nullable_text(data.get("text"))
+        question = _nullable_text(data.get("question") or data.get("search"))
+        topic = _nullable_text(data.get("topic"))
+        if action == "none":
+            if text:
+                action = "remember"
+            elif question or topic:
+                action = "retrieve"
+        _require_allowed("memory.action", action, MEMORY_ACTION_VALUES)
+        return cls(
+            action=action,
+            text=text,
+            question=question,
+            topic=topic,
+            memory_id=data.get("memory_id"),
+            memory_type=_nullable_text(data.get("memory_type")),
+            limit=data.get("limit"),
+        )
+
+    @property
+    def is_empty(self) -> bool:
+        return (
+            self.action == "none"
+            and not self.text
+            and not self.question
+            and not self.topic
+            and self.memory_id in (None, "")
+            and not self.memory_type
+            and self.limit in (None, "")
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        out: dict[str, Any] = {"action": self.action}
+        for key, value in (
+            ("text", self.text),
+            ("question", self.question),
+            ("topic", self.topic),
+            ("memory_id", self.memory_id),
+            ("memory_type", self.memory_type),
+            ("limit", self.limit),
+        ):
+            if value not in (None, ""):
+                out[key] = value
+        return out
+
+
+@dataclass(frozen=True)
 class MiraIntentFrame:
     route: str
     intent: str
@@ -251,6 +324,7 @@ class MiraIntentFrame:
     discourse_action: str = "new"
     answer: str = ""
     chart_type: str | None = None
+    memory: MiraMemoryOperation = field(default_factory=MiraMemoryOperation)
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "MiraIntentFrame":
@@ -284,10 +358,11 @@ class MiraIntentFrame:
             chart_type=chart_type,
             discourse_action=discourse_action,
             answer=_text(payload.get("answer")),
+            memory=MiraMemoryOperation.from_dict(payload.get("memory") if isinstance(payload.get("memory"), dict) else None),
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        out = {
             "route": self.route,
             "answer": self.answer,
             "intent": self.intent,
@@ -299,6 +374,9 @@ class MiraIntentFrame:
             "chart_type": self.chart_type,
             "discourse_action": self.discourse_action,
         }
+        if not self.memory.is_empty:
+            out["memory"] = self.memory.to_dict()
+        return out
 
 
 @dataclass(frozen=True)
@@ -316,6 +394,7 @@ class ConversationFrame:
     pending_clarification: dict[str, Any] = field(default_factory=dict)
     evidence_stale: bool = False
     force_reground: bool = False
+    memory: MiraMemoryOperation = field(default_factory=MiraMemoryOperation)
 
     @classmethod
     def from_intent_frame(cls, frame: MiraIntentFrame) -> "ConversationFrame":
@@ -330,6 +409,7 @@ class ConversationFrame:
             chart_type=frame.chart_type,
             evidence_stale=frame.discourse_action == "correction",
             force_reground=frame.discourse_action in {"correction", "refine"},
+            memory=frame.memory,
         )
 
     @classmethod
@@ -355,6 +435,7 @@ class ConversationFrame:
                 last_evidence_step_id=prior_frame.last_evidence_step_id,
                 last_backend_tool=prior_frame.last_backend_tool,
                 pending_clarification=copy.deepcopy(prior_frame.pending_clarification),
+                memory=frame.memory,
             )
         if action == "new" or prior_frame is None:
             return cls.from_intent_frame(frame)
@@ -383,6 +464,7 @@ class ConversationFrame:
             pending_clarification={} if action == "clarification_reply" else copy.deepcopy(prior_frame.pending_clarification),
             evidence_stale=action in {"correction", "refine"} or prior_frame.evidence_stale,
             force_reground=action in {"correction", "refine"} or prior_frame.force_reground,
+            memory=frame.memory,
         )
 
     @classmethod
@@ -415,6 +497,7 @@ class ConversationFrame:
             pending_clarification=_dict(data.get("pending_clarification")),
             evidence_stale=bool(data.get("evidence_stale")),
             force_reground=bool(data.get("force_reground")),
+            memory=MiraMemoryOperation.from_dict(data.get("memory") if isinstance(data.get("memory"), dict) else None),
         )
 
     @classmethod
@@ -430,7 +513,7 @@ class ConversationFrame:
         return cls.from_dict(frame_payload)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        out = {
             "route": self.route,
             "intent": self.intent,
             "subject": self.subject.to_dict(),
@@ -445,6 +528,9 @@ class ConversationFrame:
             "evidence_stale": self.evidence_stale,
             "force_reground": self.force_reground,
         }
+        if not self.memory.is_empty:
+            out["memory"] = self.memory.to_dict()
+        return out
 
     def to_answer_context(self) -> dict[str, Any]:
         return {
@@ -534,6 +620,7 @@ __all__ = [
     "EXECUTABLE_SELECTOR_KEYS",
     "INTENT_VALUES",
     "MiraIntentFrame",
+    "MiraMemoryOperation",
     "MiraSubject",
     "OUTPUT_VALUES",
     "ROUTE_VALUES",

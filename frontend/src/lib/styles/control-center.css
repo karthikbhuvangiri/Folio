@@ -1,24 +1,27 @@
 .cc-page {
     display: flex;
     flex-direction: column;
-    gap: 1.15rem;
+    gap: 1rem;
     min-height: calc(100vh - 7rem);
     padding-bottom: 1rem;
 }
 
 .cc-header {
     display: flex;
+    flex-direction: column;
     align-items: center;
     justify-content: space-between;
-    gap: 1.1rem;
-    flex-wrap: wrap;
-    padding: 1.1rem 1.2rem;
-    border: 1px solid color-mix(in srgb, var(--card-border) 80%, transparent);
-    border-radius: 1.55rem;
+    gap: 1.25rem;
+    padding: 1.2rem 1.25rem;
+    border: 1px solid var(--island-border, rgba(56, 189, 248, 0.16));
+    border-radius: 1.35rem;
     background:
-        radial-gradient(circle at top left, color-mix(in srgb, var(--accent) 14%, transparent), transparent 42%),
-        linear-gradient(180deg, color-mix(in srgb, var(--card-bg) 97%, white 2%), color-mix(in srgb, var(--surface-100) 24%, var(--card-bg)));
-    box-shadow: 0 24px 54px rgba(3, 12, 28, 0.2);
+        radial-gradient(circle at 88% 12%, rgba(52, 211, 153, 0.08), transparent 32%),
+        linear-gradient(135deg, var(--tx-ink-card, rgba(36, 42, 55, 0.965)) 0%, rgba(31, 37, 49, 0.975) 52%, var(--tx-ink-card-2, rgba(25, 30, 40, 0.985)) 100%);
+    box-shadow:
+        0 18px 50px rgba(15, 18, 22, 0.22),
+        0 1px 0 rgba(255, 255, 255, 0.08) inset;
+    color: #f5f1ea;
     position: relative;
     overflow: hidden;
 }
@@ -35,12 +38,21 @@
     pointer-events: none;
 }
 
+.cc-header-top {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 1rem;
+    width: 100%;
+}
+
 .cc-title-wrap {
     display: flex;
-    align-items: center;
+    align-items: flex-start;
     gap: 0.9rem;
     position: relative;
     z-index: 1;
+    min-width: 0;
 }
 
 .cc-header-actions {
@@ -55,29 +67,112 @@
 .cc-hero-icon {
     width: 3rem;
     height: 3rem;
-    border-radius: 1.1rem;
+    border-radius: 0.95rem;
     display: flex;
     align-items: center;
     justify-content: center;
-    background: linear-gradient(135deg, color-mix(in srgb, var(--accent) 85%, white 8%), #3c6fb2);
-    color: white;
-    box-shadow: 0 18px 42px rgba(74, 144, 217, 0.24);
+    background: rgba(255, 255, 255, 0.055);
+    border: 1px solid rgba(148, 163, 184, 0.16);
+    color: #9af2de;
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
 }
 
 .cc-kicker {
-    color: var(--text-muted);
+    color: var(--island-text-muted, rgba(148, 163, 184, 0.82));
+}
+
+.cc-header .folio-page-title {
+    margin: 0;
+    color: var(--island-text-primary, #f8fafc);
+    font-size: clamp(1.65rem, 1.25vw + 1rem, 2.35rem);
+}
+
+.cc-header .folio-page-subtitle {
+    max-width: 48rem;
+    color: var(--island-text-secondary, rgba(203, 213, 225, 0.78));
+}
+
+.cc-hero-signals {
+    position: relative;
+    z-index: 1;
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 0.65rem;
+    width: 100%;
+}
+
+.cc-hero-signal {
+    min-width: 0;
+    padding: 0.8rem 0.9rem;
+    border-radius: 0.9rem;
+    border: 1px solid rgba(148, 163, 184, 0.16);
+    background:
+        linear-gradient(180deg, rgba(7, 11, 17, 0.26), rgba(7, 11, 17, 0.12));
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.045);
+}
+
+.cc-hero-signal span {
+    display: block;
+    color: var(--island-text-muted, rgba(148, 163, 184, 0.82));
+    font-size: 0.62rem;
+    font-weight: 800;
+    letter-spacing: 0.12em;
+    line-height: 1.2;
+    text-transform: uppercase;
+}
+
+.cc-hero-signal strong {
+    display: block;
+    margin-top: 0.34rem;
+    color: var(--island-text-primary, #f8fafc);
+    font-family: var(--font-financial);
+    font-size: clamp(1.15rem, 0.7vw + 0.92rem, 1.65rem);
+    font-weight: 400;
+    line-height: 1;
+    font-variant-numeric: tabular-nums;
+}
+
+.cc-hero-signal small {
+    display: block;
+    margin-top: 0.28rem;
+    color: var(--island-text-muted, rgba(148, 163, 184, 0.78));
+    font-size: 0.7rem;
+    font-weight: 650;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.cc-hero-signal-positive {
+    border-color: rgba(52, 211, 153, 0.16);
+    background:
+        radial-gradient(ellipse at 10% 50%, rgba(52, 211, 153, 0.055), transparent 58%),
+        linear-gradient(180deg, rgba(7, 11, 17, 0.26), rgba(7, 11, 17, 0.12));
+}
+
+.cc-hero-signal-accent {
+    border-color: rgba(56, 189, 248, 0.16);
+}
+
+.cc-hero-signal-warning {
+    border-color: rgba(245, 158, 11, 0.16);
+}
+
+.cc-hero-signal-muted {
+    opacity: 0.82;
 }
 
 .cc-tabbar {
     display: flex;
     flex-wrap: wrap;
-    gap: 0.55rem;
-    padding: 0.4rem;
-    border-radius: 999px;
-    border: 1px solid color-mix(in srgb, var(--card-border) 80%, transparent);
-    background: linear-gradient(180deg, color-mix(in srgb, var(--card-bg) 96%, white 1%), color-mix(in srgb, var(--surface-100) 20%, var(--card-bg)));
+    gap: 0.25rem;
+    padding: 0.28rem;
+    border-radius: 1.2rem;
+    border: 1px solid color-mix(in srgb, var(--card-border) 72%, transparent);
+    background: color-mix(in srgb, var(--card-bg) 92%, transparent);
     width: fit-content;
     max-width: 100%;
+    box-shadow: 0 10px 22px rgba(15, 23, 42, 0.055);
 }
 
 .cc-merchant-quick-label {
@@ -181,8 +276,11 @@
 }
 
 .cc-tab {
-    padding: 0.72rem 1rem;
-    border-radius: 999px;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.42rem;
+    padding: 0.58rem 0.8rem;
+    border-radius: 0.95rem;
     border: 1px solid transparent;
     background: transparent;
     color: var(--text-secondary);
@@ -190,6 +288,14 @@
     font-weight: 700;
     cursor: pointer;
     transition: all 0.18s ease;
+}
+
+.cc-tab small {
+    color: var(--text-muted);
+    font-family: var(--font-mono);
+    font-size: 0.64rem;
+    font-weight: 800;
+    letter-spacing: 0;
 }
 
 .cc-tab:hover {
@@ -201,7 +307,11 @@
     color: var(--accent);
     border-color: color-mix(in srgb, var(--accent) 42%, var(--card-border));
     background: color-mix(in srgb, var(--accent) 12%, var(--card-bg));
-    box-shadow: 0 14px 32px rgba(74, 144, 217, 0.12);
+    box-shadow: 0 10px 22px rgba(74, 144, 217, 0.1);
+}
+
+.cc-tab-active small {
+    color: color-mix(in srgb, var(--accent) 74%, var(--text-muted));
 }
 
 .cc-notice {
@@ -224,10 +334,10 @@
 
 .cc-pane {
     border: 1px solid color-mix(in srgb, var(--card-border) 82%, transparent);
-    border-radius: 1.55rem;
+    border-radius: 1.05rem;
     background:
-        linear-gradient(180deg, color-mix(in srgb, var(--card-bg) 97%, white 2%), color-mix(in srgb, var(--surface-100) 26%, var(--card-bg)));
-    box-shadow: 0 22px 52px rgba(3, 12, 28, 0.16);
+        linear-gradient(180deg, color-mix(in srgb, var(--card-bg) 98%, white 1%), color-mix(in srgb, var(--card-bg) 94%, var(--surface-100)));
+    box-shadow: 0 14px 34px rgba(3, 12, 28, 0.1);
     min-height: 0;
     overflow: hidden;
 }
@@ -256,8 +366,9 @@
     flex-direction: column;
     align-items: stretch;
     gap: 1rem;
-    padding: 1.25rem 1.25rem 1.05rem;
-    background: linear-gradient(180deg, color-mix(in srgb, var(--surface-100) 36%, transparent), transparent);
+    padding: 1.1rem 1.15rem 0.95rem;
+    background:
+        linear-gradient(180deg, color-mix(in srgb, var(--surface-100) 18%, transparent), transparent);
     border-bottom: 1px solid color-mix(in srgb, var(--card-border) 68%, transparent);
 }
 
@@ -525,27 +636,29 @@
     position: relative;
     z-index: 0;
     border: 1px solid color-mix(in srgb, var(--card-border) 78%, transparent);
-    border-radius: 1.1rem;
-    background: linear-gradient(180deg, color-mix(in srgb, var(--card-bg) 96%, white 1%), color-mix(in srgb, var(--surface-100) 18%, var(--card-bg)));
+    border-radius: 0.85rem;
+    background:
+        linear-gradient(180deg, color-mix(in srgb, var(--card-bg) 92%, transparent), color-mix(in srgb, var(--card-bg-flat) 58%, var(--card-bg)));
     color: inherit;
     text-align: left;
     cursor: pointer;
-    box-shadow: 0 12px 28px rgba(3, 12, 28, 0.08);
+    box-shadow: 0 5px 14px rgba(3, 12, 28, 0.04);
     transition: background 0.16s ease, transform 0.16s ease, border-color 0.16s ease, box-shadow 0.16s ease;
 }
 
 .cc-table-row:hover {
-    background: linear-gradient(180deg, color-mix(in srgb, var(--surface-100) 72%, transparent), color-mix(in srgb, var(--surface-100) 16%, var(--card-bg)));
+    background:
+        linear-gradient(180deg, color-mix(in srgb, var(--accent) 3%, var(--card-bg)), color-mix(in srgb, var(--card-bg-flat) 64%, var(--card-bg)));
     transform: translateY(-1px);
 }
 
 .cc-table-row-active {
     z-index: 12;
-    border-color: color-mix(in srgb, var(--accent) 44%, var(--card-border));
-    background: linear-gradient(180deg, color-mix(in srgb, var(--accent) 10%, var(--card-bg)), color-mix(in srgb, var(--surface-100) 18%, var(--card-bg)));
+    border-color: color-mix(in srgb, var(--accent) 34%, var(--card-border));
+    background: linear-gradient(180deg, color-mix(in srgb, var(--accent) 7%, var(--card-bg)), color-mix(in srgb, var(--surface-100) 16%, var(--card-bg)));
     box-shadow:
-        0 18px 42px rgba(7, 19, 41, 0.14),
-        inset 3px 0 0 color-mix(in srgb, var(--accent) 78%, transparent);
+        0 9px 20px rgba(7, 19, 41, 0.08),
+        inset 2px 0 0 color-mix(in srgb, var(--accent) 62%, transparent);
 }
 
 .cc-table-row-active .cc-cell-subtitle {
@@ -631,8 +744,9 @@
     gap: 0.9rem;
     padding: 1rem;
     border: 1px solid color-mix(in srgb, var(--card-border) 76%, transparent);
-    border-radius: 1.2rem;
-    background: color-mix(in srgb, var(--surface-100) 30%, transparent);
+    border-radius: 0.95rem;
+    background:
+        linear-gradient(180deg, color-mix(in srgb, var(--card-bg) 74%, transparent), color-mix(in srgb, var(--surface-100) 24%, transparent));
 }
 
 .cc-form-grid {
@@ -807,20 +921,25 @@
 }
 
 .cc-insight-card {
-    padding: 0.95rem 1rem;
-    border-radius: 1.1rem;
-    border: 1px solid color-mix(in srgb, var(--card-border) 78%, transparent);
+    position: relative;
+    padding: 0.82rem 0.92rem 0.82rem 1rem;
+    border-radius: 0.78rem;
+    border: 1px solid color-mix(in srgb, var(--card-border) 72%, transparent);
     background:
-        linear-gradient(180deg, color-mix(in srgb, var(--surface-100) 34%, transparent), color-mix(in srgb, var(--card-bg) 92%, transparent));
+        linear-gradient(180deg, color-mix(in srgb, var(--card-bg) 88%, transparent), color-mix(in srgb, var(--card-bg-flat) 54%, var(--card-bg)));
     display: flex;
     flex-direction: column;
     gap: 0.2rem;
+    box-shadow: inset 2px 0 0 color-mix(in srgb, var(--accent) 32%, transparent);
 }
 
 .cc-insight-card strong {
-    font-size: 1rem;
+    font-family: var(--font-financial);
+    font-size: clamp(1.05rem, 0.55vw + 0.9rem, 1.45rem);
     font-weight: 700;
     color: var(--text-primary);
+    line-height: 1.05;
+    font-variant-numeric: tabular-nums;
 }
 
 .cc-insight-card small {
@@ -838,8 +957,12 @@
 
 :root:not(.dark) .cc-header {
     background:
-        linear-gradient(180deg, rgba(250, 247, 242, 0.97), rgba(245, 241, 235, 0.96));
-    box-shadow: 0 18px 36px rgba(15, 23, 42, 0.08);
+        radial-gradient(circle at 88% 12%, rgba(52, 211, 153, 0.08), transparent 32%),
+        linear-gradient(135deg, var(--tx-ink-card, rgba(36, 42, 55, 0.965)) 0%, rgba(31, 37, 49, 0.975) 52%, var(--tx-ink-card-2, rgba(25, 30, 40, 0.985)) 100%);
+    border-color: var(--island-border, rgba(56, 189, 248, 0.16));
+    box-shadow:
+        0 18px 50px rgba(15, 18, 22, 0.22),
+        0 1px 0 rgba(255, 255, 255, 0.08) inset;
 }
 
 :root:not(.dark) .cc-header::after {
@@ -847,11 +970,29 @@
 }
 
 :root:not(.dark) .cc-hero-icon {
-    background: linear-gradient(135deg, #2f3948, #1e2632);
-    color: #f8fafc;
-    box-shadow:
-        0 12px 28px rgba(15, 23, 42, 0.14),
-        inset 0 1px 0 rgba(255, 255, 255, 0.18);
+    background: rgba(255, 255, 255, 0.055);
+    border-color: rgba(148, 163, 184, 0.16);
+    color: #9af2de;
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
+}
+
+:root:not(.dark) .cc-header .profile-pill {
+    background: rgba(255, 255, 255, 0.035);
+    border-color: rgba(148, 163, 184, 0.16);
+    color: var(--island-text-secondary, #b2c0d0);
+}
+
+:root:not(.dark) .cc-header .profile-pill:hover {
+    background: rgba(255, 255, 255, 0.065);
+    color: var(--island-text-primary, #f8fafc);
+    border-color: rgba(148, 163, 184, 0.24);
+}
+
+:root:not(.dark) .cc-header .profile-pill--active {
+    background: rgba(88, 132, 255, 0.12);
+    border-color: rgba(88, 132, 255, 0.42);
+    color: #8eb1ff;
+    box-shadow: none;
 }
 
 :root:not(.dark) .cc-tabbar {
@@ -867,23 +1008,24 @@
 
 :root:not(.dark) .cc-pane {
     background:
-        linear-gradient(180deg, rgba(250, 247, 242, 0.97), rgba(245, 241, 235, 0.96));
-    box-shadow: 0 18px 40px rgba(15, 23, 42, 0.07);
+        linear-gradient(180deg, rgba(250, 247, 242, 0.96), rgba(250, 247, 242, 0.9));
+    box-shadow: 0 12px 30px rgba(15, 23, 42, 0.055);
 }
 
 :root:not(.dark) .cc-pane-header {
-    background: linear-gradient(180deg, rgba(242, 238, 231, 0.72), rgba(250, 247, 242, 0));
+    background:
+        linear-gradient(180deg, rgba(250, 247, 242, 0.78), rgba(250, 247, 242, 0));
 }
 
 :root:not(.dark) .cc-table-row {
-    box-shadow: 0 8px 20px rgba(15, 23, 42, 0.05);
+    box-shadow: 0 5px 14px rgba(15, 23, 42, 0.04);
 }
 
 :root:not(.dark) .cc-table-row-active {
     border-color: rgba(15, 23, 42, 0.12);
     background: linear-gradient(180deg, rgba(245, 241, 235, 0.97), rgba(250, 247, 242, 0.98));
     box-shadow:
-        0 10px 24px rgba(15, 23, 42, 0.08),
+        0 8px 18px rgba(15, 23, 42, 0.07),
         inset 3px 0 0 color-mix(in srgb, var(--accent) 72%, transparent);
 }
 
@@ -891,7 +1033,8 @@
 :root:not(.dark) .cc-stat,
 :root:not(.dark) .cc-insight-card,
 :root:not(.dark) .cc-mini-table-wrap {
-    background: rgba(250, 247, 242, 0.88);
+    background:
+        linear-gradient(180deg, rgba(255, 253, 249, 0.72), rgba(250, 247, 242, 0.58));
 }
 
 :root:not(.dark) .cc-pane-drawer::-webkit-scrollbar {
@@ -910,31 +1053,36 @@
 }
 
 .dark .cc-header {
-    background: linear-gradient(180deg, rgba(27, 31, 38, 0.96), rgba(24, 28, 34, 0.96));
-    box-shadow: 0 18px 38px rgba(2, 6, 23, 0.22);
+    background:
+        radial-gradient(circle at 88% 12%, rgba(52, 211, 153, 0.08), transparent 32%),
+        linear-gradient(135deg, var(--tx-ink-card, rgba(36, 42, 55, 0.965)) 0%, rgba(31, 37, 49, 0.975) 52%, var(--tx-ink-card-2, rgba(25, 30, 40, 0.985)) 100%);
+    border-color: var(--island-border, rgba(56, 189, 248, 0.16));
+    box-shadow:
+        0 18px 50px rgba(15, 18, 22, 0.22),
+        0 1px 0 rgba(255, 255, 255, 0.08) inset;
 }
 
 .dark .cc-header::after {
     display: none;
 }
 
-.dark :global(.cc-header .profile-pill) {
+.dark .cc-header .profile-pill {
     background: rgba(255, 255, 255, 0.02);
     border-color: color-mix(in srgb, var(--card-border) 88%, transparent);
 }
 
-.dark :global(.cc-header .profile-pill:hover) {
+.dark .cc-header .profile-pill:hover {
     background: rgba(255, 255, 255, 0.04);
     border-color: color-mix(in srgb, var(--text-muted) 38%, var(--card-border));
 }
 
-.dark :global(.cc-header .profile-pill--active) {
+.dark .cc-header .profile-pill--active {
     background: rgba(88, 132, 255, 0.08);
     border-color: rgba(88, 132, 255, 0.42);
     box-shadow: none;
 }
 
-.dark :global(.cc-header .profile-pill--active:hover) {
+.dark .cc-header .profile-pill--active:hover {
     background: rgba(88, 132, 255, 0.12);
     border-color: rgba(88, 132, 255, 0.5);
 }
@@ -972,6 +1120,10 @@
         grid-template-columns: 1fr;
     }
 
+    .cc-hero-signals {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
     .cc-pane-drawer {
         position: static;
         max-height: none;
@@ -991,6 +1143,14 @@
         width: 100%;
     }
 
+    .cc-header-top {
+        flex-direction: column;
+    }
+
+    .cc-hero-signals {
+        grid-template-columns: 1fr;
+    }
+
     .cc-table-header,
     .cc-table-row {
         grid-template-columns: 1fr;
@@ -1002,6 +1162,7 @@
 
     .cc-tab {
         flex: 1 1 auto;
+        justify-content: center;
         text-align: center;
     }
 }
@@ -1080,30 +1241,6 @@
     font-size: 0.82rem;
     gap: 0.3rem;
     white-space: nowrap;
-}
-
-.cc-icon-btn {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 2rem;
-    height: 2rem;
-    border: 1px solid color-mix(in srgb, var(--card-border) 82%, transparent);
-    border-radius: 0.55rem;
-    background: color-mix(in srgb, var(--card-bg) 92%, transparent);
-    color: var(--text-muted);
-    cursor: pointer;
-    transition: color 0.14s ease, border-color 0.14s ease, background 0.14s ease;
-}
-
-.cc-icon-btn:hover {
-    color: var(--danger, #dc2626);
-    border-color: color-mix(in srgb, var(--danger, #dc2626) 36%, var(--card-border));
-    background: color-mix(in srgb, var(--danger, #dc2626) 7%, var(--card-bg));
-}
-
-.cc-icon-btn .material-symbols-outlined {
-    font-size: 1.05rem;
 }
 
 /* Compact pill toggle sizing for inline table rows */

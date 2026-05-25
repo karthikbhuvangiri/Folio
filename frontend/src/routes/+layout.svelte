@@ -20,6 +20,7 @@
         demoMode: false,
         manualSyncEnabled: true,
         bankLinkingEnabled: true,
+        miraEnabled: false,
         demoPersistence: 'persistent'
     };
 
@@ -34,7 +35,7 @@
         { path: '/budget',       icon: 'account_balance_wallet', label: 'Budgets' },
     ];
 
-    const copilotItem = { path: '/copilot', icon: 'auto_awesome', label: 'Mira' };
+    const copilotItem = { path: '/copilot', label: 'Mira' };
     const controlCenterItem = { path: '/control-center', icon: 'tune', label: 'Control Center' };
 
     /* ── Sync ── */
@@ -376,21 +377,17 @@
 
         <!-- Copilot group -->
         <div class="rail-nav-group rail-nav-group--copilot">
-            <a href={copilotItem.path}
-               class="rail-link rail-link--copilot"
-               class:rail-link--active={isActive(copilotItem.path, currentPath)}
-               class:rail-link--copilot-active={isActive(copilotItem.path, currentPath)}
-               aria-current={isActive(copilotItem.path, currentPath) ? 'page' : undefined}>
-                {#if isActive(copilotItem.path, currentPath)}<span class="rail-active-bar rail-active-bar--copilot" aria-hidden="true"></span>{/if}
-                <span class="rail-link-icon rail-copilot-icon-inline material-symbols-outlined"
-                      style={isActive(copilotItem.path, currentPath) ? "font-variation-settings: 'FILL' 1;" : ''}>
-                    {copilotItem.icon}
-                </span>
-                <span class="rail-link-label">{copilotItem.label}</span>
-                {#if !isActive(copilotItem.path, currentPath)}
-                    <span class="rail-copilot-badge-inline">AI</span>
-                {/if}
-            </a>
+            {#if appConfig.miraEnabled}
+                <a href={copilotItem.path}
+                   class="rail-link rail-link--copilot"
+                   class:rail-link--active={isActive(copilotItem.path, currentPath)}
+                   class:rail-link--copilot-active={isActive(copilotItem.path, currentPath)}
+                   aria-current={isActive(copilotItem.path, currentPath) ? 'page' : undefined}>
+                    {#if isActive(copilotItem.path, currentPath)}<span class="rail-active-bar rail-active-bar--copilot" aria-hidden="true"></span>{/if}
+                    <span class="rail-link-icon rail-copilot-icon-inline mira-mark mira-mark--nav" aria-hidden="true"></span>
+                    <span class="rail-link-label">{copilotItem.label}</span>
+                </a>
+            {/if}
             <a href={controlCenterItem.path}
                class="rail-link rail-link--sm"
                class:rail-link--active={isActive(controlCenterItem.path, currentPath)}
@@ -531,21 +528,17 @@
 
                 <!-- Mobile Copilot group -->
                 <div class="rail-nav-group rail-nav-group--copilot">
-                    <a href={copilotItem.path} on:click={() => mobileMenuOpen = false}
-                       class="rail-link rail-link--copilot"
-                       class:rail-link--active={isActive(copilotItem.path, currentPath)}
-                       class:rail-link--copilot-active={isActive(copilotItem.path, currentPath)}
-                       aria-current={isActive(copilotItem.path, currentPath) ? 'page' : undefined}>
-                        {#if isActive(copilotItem.path, currentPath)}<span class="rail-active-bar rail-active-bar--copilot"></span>{/if}
-                        <span class="rail-link-icon rail-copilot-icon-inline material-symbols-outlined"
-                              style={isActive(copilotItem.path, currentPath) ? "font-variation-settings: 'FILL' 1;" : ''}>
-                            {copilotItem.icon}
-                        </span>
-                        <span class="rail-link-label">{copilotItem.label}</span>
-                        {#if !isActive(copilotItem.path, currentPath)}
-                            <span class="rail-copilot-badge-inline">AI</span>
-                        {/if}
-                    </a>
+                    {#if appConfig.miraEnabled}
+                        <a href={copilotItem.path} on:click={() => mobileMenuOpen = false}
+                           class="rail-link rail-link--copilot"
+                           class:rail-link--active={isActive(copilotItem.path, currentPath)}
+                           class:rail-link--copilot-active={isActive(copilotItem.path, currentPath)}
+                           aria-current={isActive(copilotItem.path, currentPath) ? 'page' : undefined}>
+                            {#if isActive(copilotItem.path, currentPath)}<span class="rail-active-bar rail-active-bar--copilot"></span>{/if}
+                            <span class="rail-link-icon rail-copilot-icon-inline mira-mark mira-mark--nav" aria-hidden="true"></span>
+                            <span class="rail-link-label">{copilotItem.label}</span>
+                        </a>
+                    {/if}
                     <a href={controlCenterItem.path} on:click={() => mobileMenuOpen = false}
                        class="rail-link rail-link--sm"
                        class:rail-link--active={isActive(controlCenterItem.path, currentPath)}
@@ -1175,21 +1168,6 @@
             0 0 20px var(--accent-glow);
     }
 
-    /* ✅ NEW: Copilot active bar — purple tint */
-    .rail-active-bar--copilot {
-        background: linear-gradient(to bottom, rgba(139, 92, 246, 0.85), rgba(109, 62, 216, 0.65));
-        box-shadow:
-            0 0 8px rgba(139, 92, 246, 0.35),
-            0 0 20px rgba(139, 92, 246, 0.18);
-    }
-
-    :global(.dark) .rail-active-bar--copilot {
-        background: linear-gradient(to bottom, rgba(139, 92, 246, 0.9), rgba(168, 85, 247, 0.7));
-        box-shadow:
-            0 0 10px rgba(139, 92, 246, 0.30),
-            0 0 24px rgba(139, 92, 246, 0.15);
-    }
-
     @keyframes rail-bar-enter {
         from { height: 0; margin-top: 0; opacity: 0; }
         to   { height: 18px; margin-top: -9px; opacity: 1; }
@@ -1235,27 +1213,27 @@
         padding: 9px 14px;
     }
 
-    /* ✅ NEW: Copilot as inline nav link — gradient icon in default state */
+    /* Mira as inline nav mark */
     .rail-copilot-icon-inline {
-        background: linear-gradient(135deg, var(--accent), #a855f7);
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
-        background-clip: text;
-        color: transparent;
+        width: 23px;
+        flex: 0 0 23px;
     }
 
-    /* ✅ NEW: Copilot hover — purple-tinted background */
+    .rail-link--copilot:hover .rail-copilot-icon-inline,
+    .rail-link--copilot-active .rail-copilot-icon-inline {
+        color: var(--sidebar-text-active);
+    }
+
     .rail-link--copilot:hover {
         background: var(--rail-copilot-bg-hover) !important;
     }
 
     :global(.dark) .rail-link--copilot:hover {
         box-shadow:
-            0 0 14px rgba(139, 92, 246, 0.06),
-            inset 0 0 14px rgba(139, 92, 246, 0.04);
+            0 0 12px rgba(148, 163, 184, 0.03),
+            inset 0 0 12px rgba(148, 163, 184, 0.02);
     }
 
-    /* ✅ NEW: Copilot active state — subtle purple glow box */
     .rail-link--copilot-active {
         background: var(--rail-copilot-bg-active) !important;
         border-color: var(--rail-copilot-border-active) !important;
@@ -1265,33 +1243,12 @@
     :global(.dark) .rail-link--copilot-active {
         box-shadow:
             var(--rail-copilot-glow-active),
-            inset 0 0 18px rgba(139, 92, 246, 0.04) !important;
-        border-color: rgba(139, 92, 246, 0.16) !important;
+            inset 0 0 16px rgba(148, 163, 184, 0.03) !important;
+        border-color: rgba(148, 163, 184, 0.12) !important;
     }
 
-    /* ✅ NEW: Copilot active icon — solid accent, no gradient */
     .rail-link--copilot-active .rail-copilot-icon-inline {
-        -webkit-text-fill-color: var(--accent);
-        background: none;
-        filter: drop-shadow(0 0 6px rgba(139, 92, 246, 0.4));
-    }
-
-    /* ✅ NEW: Inline AI badge (replaces the old card-style badge) */
-    .rail-copilot-badge-inline {
-        margin-left: auto;
-        font-size: 8px;
-        font-weight: 800;
-        letter-spacing: 0.06em;
-        padding: 2px 6px;
-        border-radius: 6px;
-        background: linear-gradient(135deg, var(--accent), #8b5cf6);
-        color: #fff;
-        line-height: 1.4;
-        box-shadow:
-            0 2px 6px rgba(139, 92, 246, 0.30),
-            0 0 12px rgba(168, 85, 247, 0.12),
-            inset 0 1px 0 rgba(255, 255, 255, 0.2);
-        flex-shrink: 0;
+        filter: none;
     }
 
     /* ————————————————————————————————————————

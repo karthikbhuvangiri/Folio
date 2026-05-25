@@ -259,7 +259,7 @@ def get_accounts_filtered(profile: str | None = None, conn=None) -> list[dict]:
                         account_type,
                         current_balance as balance, currency, profile_id as profile,
                         COALESCE(provider, 'teller') as provider,
-                        last_synced_at, manual_updated_at, manual_notes
+                        last_synced_at, manual_updated_at, manual_notes, usual_due_day
                  FROM accounts WHERE is_active = 1"""
         params = []
         if profile and profile != "household":
@@ -285,6 +285,48 @@ def get_accounts_filtered(profile: str | None = None, conn=None) -> list[dict]:
         return _query(conn)
     with get_db() as c:
         return _query(c)
+
+
+def _normalize_usual_due_day(value) -> int | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        raise ValueError("Usual due day must be an integer from 1 to 31.")
+    if isinstance(value, float) and not value.is_integer():
+        raise ValueError("Usual due day must be an integer from 1 to 31.")
+    try:
+        day = int(value)
+    except (TypeError, ValueError):
+        raise ValueError("Usual due day must be an integer from 1 to 31.")
+    if day < 1 or day > 31:
+        raise ValueError("Usual due day must be an integer from 1 to 31.")
+    return day
+
+
+def update_account_payment_details(account_id: str, payload: dict, profile: str | None = None, conn=None) -> dict | None:
+    """Update lightweight payment metadata for active credit card accounts."""
+    due_day = _normalize_usual_due_day(payload.get("usual_due_day"))
+
+    def _update(c):
+        sql = "SELECT * FROM accounts WHERE id = ? AND is_active = 1"
+        params = [account_id]
+        if profile and profile != "household":
+            sql += " AND profile_id = ?"
+            params.append(profile)
+        row = c.execute(sql, params).fetchone()
+        if not row:
+            return None
+        current = dict(row)
+        account_type = (current.get("account_type") or "").strip().lower()
+        if account_type not in {"credit", "credit_card"}:
+            raise ValueError("Payment details are only available for credit card accounts.")
+        c.execute("UPDATE accounts SET usual_due_day = ? WHERE id = ?", (due_day, account_id))
+        return dict(c.execute("SELECT * FROM accounts WHERE id = ?", (account_id,)).fetchone())
+
+    if conn is not None:
+        return _update(conn)
+    with get_db() as c:
+        return _update(c)
 
 
 def get_data_health_summary(profile: str | None = None, conn=None) -> dict:
@@ -473,6 +515,7 @@ def get_transactions_paginated(
     conn=None,
     start_date: str | None = None,
     end_date: str | None = None,
+    sort: str | None = None,
 ) -> dict:
     """
     Fetch transactions with all filters pushed into SQL WHERE clauses.
@@ -542,6 +585,13 @@ def get_transactions_paginated(
                         {where_sql}"""
         total_count = c.execute(count_sql, params).fetchone()[0]
 
+        sort_token = str(sort or "date_desc").strip().lower()
+        order_by = {
+            "date_asc": "t.date ASC, t.id ASC",
+            "amount_desc": "ABS(t.amount) DESC, t.date DESC, t.id DESC",
+            "amount_asc": "ABS(t.amount) ASC, t.date DESC, t.id DESC",
+        }.get(sort_token, "t.date DESC, t.id DESC")
+
         # Data query with pagination
         data_sql = f"""SELECT t.id as original_id, t.profile_id as profile, t.date, t.description,
                               t.raw_description, t.amount, t.category, t.original_category,
@@ -562,7 +612,7 @@ def get_transactions_paginated(
                        {alias_join_sql}
                        {metadata_join_sql}
                        {where_sql}
-                       ORDER BY t.date DESC
+                       ORDER BY {order_by}
                        LIMIT ? OFFSET ?"""
         data_params = params + [limit, offset]
         rows = c.execute(data_sql, data_params).fetchall()
@@ -3027,7 +3077,7 @@ def get_scheduled_transactions_data(days: int = 45, profile: str | None = None, 
         return _query(c)
 
 
-def create_month_explanation(month: str, profile: str | None = None, use_llm: bool = True, conn=None) -> dict:
+def create_month_explanation(month: str, profile: str | None = None, use_llm: bool = True, save: bool = True, conn=None) -> dict:
     """Build a source-linked month explanation and persist it as a saved insight."""
     import json as _json
 
@@ -3041,19 +3091,34 @@ def create_month_explanation(month: str, profile: str | None = None, use_llm: bo
         top_categories = facts["top_categories"][:3]
         top_merchants = facts["top_merchants"][:3]
         pulse = facts["spending_pulse"][:2]
+        upcoming = facts.get("upcoming") or {}
+        upcoming_groups = (upcoming.get("groups") or [])[:2]
+        upcoming_total = float(upcoming.get("total") or 0)
         lines = [
-            f"## {facts['month_label']} in plain English",
-            "",
-            f"You brought in {summary.get('income_formatted')} and spent {summary.get('expenses_formatted')}, leaving net flow at {summary.get('net_flow_formatted')}.",
+            f"Takeaway: {facts['month_label']} ended at {summary.get('net_flow_formatted')} net flow after {summary.get('expenses_formatted')} in spending and {summary.get('income_formatted')} in income.",
         ]
-        if top_categories:
-            lines.append("Your biggest spending categories were " + ", ".join(f"{c['category']} ({c['total_formatted']})" for c in top_categories) + ".")
-        if top_merchants:
-            lines.append("The top merchants were " + ", ".join(f"{m['merchant']} ({m['total_formatted']})" for m in top_merchants) + ".")
         if pulse:
-            lines.append("The clearest month-over-month changes were " + ", ".join(f"{p['category']} {p['direction']} {p['delta_formatted']}" for p in pulse) + ".")
-        if facts.get("recurring"):
-            lines.append(f"Recurring commitments are running at {facts['recurring']['monthly_formatted']} per month.")
+            lines.append("Drivers: The biggest month-over-month moves were " + ", ".join(f"{p['category']} {p['direction']} {p['delta_formatted']}" for p in pulse) + ".")
+        elif top_categories:
+            lines.append("Drivers: The largest categories were " + ", ".join(f"{c['category']} ({c['total_formatted']})" for c in top_categories[:2]) + ".")
+        else:
+            lines.append("Drivers: No category movement stood out in the available data.")
+        if upcoming_total > 0:
+            group_text = ", ".join(f"{g.get('label')} (${float(g.get('amount') or 0):,.0f})" for g in upcoming_groups)
+            suffix = f", led by {group_text}" if group_text else ""
+            lines.append(f"Watch: ${upcoming_total:,.0f} is scheduled over the next {upcoming.get('window_days')} days{suffix}.")
+        elif facts.get("recurring"):
+            lines.append(f"Watch: Recurring commitments are running at {facts['recurring']['monthly_formatted']} per month.")
+        else:
+            lines.append("Watch: No scheduled or recurring pressure was present in the available data.")
+
+        recurring = facts.get("recurring") or {}
+        facts_line = f"Facts: recurring runs {recurring.get('monthly_formatted', '$0')} monthly across {recurring.get('active_count', 0)} active items"
+        if top_categories:
+            facts_line += "; top categories are " + ", ".join(f"{c['category']} ({c['total_formatted']})" for c in top_categories)
+        if top_merchants:
+            facts_line += "; top merchants are " + ", ".join(f"{m['merchant']} ({m['total_formatted']})" for m in top_merchants)
+        lines.append(facts_line + ".")
         return "\n".join(lines)
 
     def _query(c):
@@ -3139,13 +3204,20 @@ def create_month_explanation(month: str, profile: str | None = None, use_llm: bo
             try:
                 import llm_client
                 prompt = (
-                    "You are Mira, a local-first personal finance analyst inside Folio. "
-                    "Write a concise month explanation from the JSON facts. Use only the facts provided. "
-                    "No generic advice, no moralizing, no unsupported claims. "
-                    "Use 4 short sections with markdown headings: What happened, What changed, What to check, Source facts.\n\n"
+                    "You are Mira, Folio's local-first personal finance analyst. "
+                    "Turn the JSON facts into a compact explanation for an analytics summary card. "
+                    "Use only the facts provided. Do not infer causes, intent, employment, income patterns, or advice. "
+                    "Do not mention JSON or the prompt. "
+                    "Return plain text, not markdown. "
+                    "Format exactly four short labeled lines:\n"
+                    "Takeaway: one sentence with net flow, spending, and income.\n"
+                    "Drivers: one sentence naming the biggest category, merchant, or month-over-month change that explains the month.\n"
+                    "Watch: one sentence naming upcoming scheduled expenses or recurring pressure; if neither is present, say that plainly.\n"
+                    "Facts: one compact sentence with two or three numbers the user can verify.\n"
+                    "Keep the full answer under 120 words. Be specific, calm, and useful.\n\n"
                     f"FACTS:\n{_json.dumps(facts, indent=2)}"
                 )
-                answer = llm_client.complete(prompt, max_tokens=900, purpose="copilot")
+                answer = llm_client.complete(prompt, max_tokens=360, purpose="copilot")
                 source = llm_client.get_provider()
             except Exception as exc:
                 logger.info("Month explanation LLM unavailable; using deterministic fallback: %s", exc)
@@ -3153,19 +3225,21 @@ def create_month_explanation(month: str, profile: str | None = None, use_llm: bo
             answer = _fallback_answer(facts)
 
         question = f"Explain {month_label}"
-        c.execute(
-            """INSERT INTO saved_insights (profile_id, question, answer, kind, pinned)
-               VALUES (?, ?, ?, 'insight', 0)""",
-            (profile_id, question, answer),
-        )
-        insight_id = c.execute("SELECT last_insert_rowid()").fetchone()[0]
+        insight_id = None
+        if save:
+            c.execute(
+                """INSERT INTO saved_insights (profile_id, question, answer, kind, pinned)
+                   VALUES (?, ?, ?, 'insight', 0)""",
+                (profile_id, question, answer),
+            )
+            insight_id = c.execute("SELECT last_insert_rowid()").fetchone()[0]
         return {
             "id": insight_id,
             "question": question,
             "answer": answer,
             "facts": facts,
             "source": source,
-            "saved": True,
+            "saved": bool(save),
         }
 
     if conn is not None:
@@ -4123,7 +4197,7 @@ def _post_sync_recurring(all_new_transactions: list[dict]):
 def fetch_fresh_data(incremental: bool = True, sync_job_id: str | None = None) -> dict:
     """
     Fetch from Teller API (and SimpleFIN if configured) and write to SQLite.
-    Called ONLY by /api/sync.
+    Called by manual and automatic provider sync paths.
     """
     with _lock:
         _set_sync_phase(sync_job_id, "preparing")
@@ -5763,7 +5837,8 @@ def get_merchant_directory(
                     MAX(COALESCE(NULLIF(t.merchant_name,''), t.description_normalized, t.description)) AS clean_name,
                     t.profile_id,
                     SUM(ABS(t.amount)) AS total_spent,
-                    COUNT(*) AS charge_count
+                    COUNT(*) AS charge_count,
+                    MAX(t.date) AS last_spent_date
                 FROM transactions_visible t
                 WHERE {" AND ".join(tx_where)}
                 GROUP BY
@@ -5891,7 +5966,8 @@ def get_merchant_directory(
                 COALESCE(recurring_overlay.last_charge_date, overlay.last_charge_date) AS last_charge_date,
                 spend.profile_id,
                 spend.total_spent,
-                spend.charge_count
+                spend.charge_count,
+                spend.last_spent_date
             FROM merchant_spend spend
             LEFT JOIN merchant_alias alias
                 ON alias.profile_id = spend.profile_id

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -8,6 +9,7 @@ from typing import Any, Callable
 
 from range_parser import resolve_followup_range
 
+from mira.persona import selector_default_route_line, selector_persona_line
 from mira.agentic.intent_frame import (
     DISCOURSE_ACTION_VALUES,
     INTENT_VALUES,
@@ -137,6 +139,53 @@ SELECTOR_RESPONSE_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
 }
 
+COMPACT_SELECTOR_RESPONSE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "route": {"type": "string"},
+        "intent": {"type": "string"},
+        "subject": {
+            "type": "object",
+            "properties": {
+                "kind": {"type": "string"},
+                "text": {"type": ["string", "null"]},
+            },
+            "required": ["kind"],
+            "additionalProperties": False,
+        },
+        "time": {"type": "string"},
+        "time_a": {"type": ["string", "null"]},
+        "time_b": {"type": ["string", "null"]},
+        "output": {"type": "string"},
+        "chart_type": {"type": ["string", "null"]},
+        "discourse_action": {"type": "string"},
+        "details": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "metric": {"type": ["string", "null"]},
+                "group_by": {"type": ["string", "null"]},
+                "amount": {"type": ["number", "string", "null"]},
+                "purpose": {"type": ["string", "null"]},
+                "change_type": {"type": ["string", "null"]},
+                "merchant": {"type": ["string", "null"]},
+                "category": {"type": ["string", "null"]},
+                "search": {"type": ["string", "null"]},
+                "transaction_id": {"type": ["string", "null"]},
+                "limit": {"type": ["integer", "null"]},
+                "memory_action": {"type": ["string", "null"]},
+                "text": {"type": ["string", "null"]},
+                "question": {"type": ["string", "null"]},
+                "topic": {"type": ["string", "null"]},
+                "memory_id": {"type": ["integer", "string", "null"]},
+                "memory_type": {"type": ["string", "null"]},
+            },
+        },
+    },
+    "required": ["route", "intent", "subject", "time", "output", "discourse_action"],
+    "additionalProperties": False,
+}
+
 
 @dataclass(frozen=True)
 class SelectorResult:
@@ -155,10 +204,31 @@ class SelectorResult:
     intent_frame: dict[str, Any] | None = None
 
 
-def build_selector_system_prompt() -> str:
-    return """You are Mira: best-friend energy, Folio finance expert when needed. Return compact JSON only.
+def build_selector_system_prompt(*, compact_output: bool | None = None) -> str:
+    compact = _selector_compact_output_enabled() if compact_output is None else bool(compact_output)
+    schema_line = (
+        "Schema: {route,intent,subject:{kind,text},time,time_a,time_b,output,chart_type,discourse_action,details}"
+        if compact
+        else "Schema: {route,intent,subject:{kind,text},time,time_a,time_b,output,chart_type,discourse_action,answer,details}"
+    )
+    chat_line = (
+        'Chat: intent=none, subject.kind=none, time=none, output=none. Leave answer text out; answerer writes prose. Finance/write_preview/explain_last leave answer out.'
+        if compact
+        else 'Chat: intent=none, subject.kind=none, time=none, output=none. Greetings/thanks/ok/small-talk may include answer with details.answer_mode="inline"; help, explanations, knowledge, advice, and creative writing leave answer="". Finance/write_preview/explain_last leave answer="".'
+    )
+    details_line = (
+        "Details allowed: metric,group_by,amount,purpose,change_type,merchant,category,search,transaction_id,limit,memory_action,text,question,topic,memory_id,memory_type. Include only non-null details; omit details unless a non-empty detail is needed."
+        if compact
+        else "Details allowed: metric,group_by,amount,purpose,change_type,merchant,category,search,transaction_id,limit,answer_mode,memory_action,text,question,topic,memory_id,memory_type. Include only non-null details."
+    )
+    compact_line = (
+        "\nCompact output: omit answer, answer_mode, null fields, empty details, time_a/time_b unless custom, chart_type unless chart, and subject.text when subject.kind is none. Return one minimal JSON object."
+        if compact
+        else ""
+    )
+    return selector_persona_line() + f"""
 
-Schema: {route,intent,subject:{kind,text},time,time_a,time_b,output,chart_type,discourse_action,answer,details}
+{schema_line}
 No tool names, views, filters, calls, SQL, or chart data. Python compiles tools.
 
 route: chat|finance|memory|write_preview|explain_last
@@ -168,10 +238,10 @@ time: this_month|last_month|ytd|all_time|last_Nd|last_N_months|last_year|custom|
 output: scalar|table|list|chart|comparison|status|preview|none
 discourse_action: new|follow_up|correction|refine|clarification_reply|clear
 
-Default chat unless Folio data, memory, write preview, or explain-last is clearly requested. Chat: intent=none, subject.kind=none, time=none, output=none. Only greetings/thanks/ok/small-talk may include answer with details.answer_mode="inline"; help, explanations, knowledge, advice, and creative writing leave answer="". Finance/memory/write_preview/explain_last leave answer="".
-Finance: Folio lookup -> route finance. how much/total spent at/on merchant/category -> spending_total scalar. why/high/spike -> spending_explain table. top/biggest/list/show -> table intent. recent/latest/when income/deposit -> transaction_lookup; income/deposit/paycheck subject=category Income unless txn id. budget/savings/cashflow/afford/recurring/net worth -> matching intent. chart/plot/graph -> output=chart + chart_type. "expenses"/"spending" alone is metric, not subject. move/set/recategorize/change charges/category -> route write_preview intent write_preview output preview with details.change_type=bulk_recategorize, details.merchant, details.category; never memory_action/text.
-Memory only: route=memory intent=memory_op. save/remember -> output=status details.memory_action=remember details.text=<memory>. ask/list/forget/update saved memories -> details.memory_action=retrieve/list/forget/update plus question/topic/text/memory_id. Questions about this chat or last message are chat.
-Details allowed: metric, group_by, amount, purpose, change_type, merchant, category, search, transaction_id, limit, answer_mode, memory_action, text, question, topic, memory_id, memory_type.
+""" + selector_default_route_line() + f""" {chat_line}
+Finance: Folio lookup -> route finance. how much/total spent at/on merchant/category -> spending_total scalar. why/high/spike -> spending_explain table. top/biggest/list/show -> table intent. recent/latest/when income/deposit -> transaction_lookup; income/deposit/paycheck subject=category Income unless txn id. budget/savings/cashflow/afford/can I spend/recurring/net worth -> matching intent. chart/plot/graph -> output=chart + chart_type. "expenses"/"spending" alone is metric, not subject. move/set/recategorize/change charges/category -> route write_preview intent write_preview output preview with details.change_type=bulk_recategorize, details.merchant, details.category; never memory_action/text.
+""" + _memory_selector_instruction_line() + """
+""" + details_line + compact_line + """
 Month names become custom with time_a=YYYY-MM-01. "last month" is last_month. Only relative follow-ups like "the month before" use month_before_prior. Follow-ups inherit omitted prior slots. Latest user words override prior context."""
 
 
@@ -242,11 +312,14 @@ def run_selector(
     history: list[dict[str, Any]] | None = None,
     base_tools: list[dict[str, Any]] | None = None,
     completer: SelectorCompleter | None = None,
-    max_tokens: int = 140,
+    max_tokens: int = 220,
     allow_legacy_executable_calls: bool = False,
 ) -> SelectorResult:
     tools = base_tools or all_tool_schemas()
     started = time.perf_counter()
+    slash = _memory_slash_selector_result(question=question, started=started)
+    if slash is not None:
+        return slash
     manifest = ""
     recent_context = format_recent_context(history)
     complete = completer or _default_completer
@@ -266,6 +339,7 @@ def run_selector(
     )
     calls, decision = apply_discourse_frames(calls=calls, decision=decision, history=history, tools=tools, question=question)
     calls, decision = apply_context_semantics(calls=calls, decision=decision, history=history, question=question)
+    calls, decision = _demote_non_slash_memory_route(calls=calls, decision=decision)
 
     status = selector_status(decision, calls)
     error = selector_error(decision, calls) if status == "clarify" else ""
@@ -298,6 +372,206 @@ def run_selector(
         trace=trace,
         intent_frame=intent_frame,
     )
+
+
+def _memory_slash_selector_result(*, question: str, started: float) -> SelectorResult | None:
+    parsed = _parse_memory_slash_command(question)
+    if parsed is None:
+        return None
+
+    action = str(parsed.get("action") or "").strip().lower()
+    body = str(parsed.get("body") or "").strip()
+    normalizer_calls = 0
+    normalizer_result: dict[str, Any] | None = None
+    if action == "help":
+        decision = _inline_slash_answer(_memory_slash_help())
+    elif action == "remember":
+        from mira import memory_v2
+
+        normalizer_result = memory_v2.normalize_explicit_memory_command(body)
+        normalizer_calls = 1
+        if not normalizer_result.get("ok"):
+            decision = _inline_slash_answer(str(normalizer_result.get("reason") or "I could not turn that into a safe memory."))
+        else:
+            decision = _memory_command_decision(
+                action="remember",
+                output="status",
+                memory={
+                    "action": "remember",
+                    "text": normalizer_result["text"],
+                    "memory_type": normalizer_result.get("memory_type"),
+                    "topic": normalizer_result.get("topic"),
+                },
+                details={
+                    "memory_action": "remember",
+                    "text": normalizer_result["text"],
+                    "memory_type": normalizer_result.get("memory_type"),
+                    "topic": normalizer_result.get("topic"),
+                },
+            )
+    elif action == "list":
+        memory_type = body if body in _SLASH_MEMORY_TYPES else ""
+        decision = _memory_command_decision(
+            action="list",
+            output="list",
+            memory={"action": "list", **({"memory_type": memory_type} if memory_type else {})},
+            details={"memory_action": "list", **({"memory_type": memory_type} if memory_type else {})},
+        )
+    elif action == "search":
+        if not body:
+            decision = _inline_slash_answer("Use `/memory search answer style` to search saved memories.")
+        else:
+            decision = _memory_command_decision(
+                action="retrieve",
+                output="list",
+                memory={"action": "retrieve", "question": body},
+                details={"memory_action": "retrieve", "question": body},
+            )
+    elif action == "forget":
+        if not body:
+            decision = _inline_slash_answer("Use `/memory forget 12` or `/memory forget answer style`.")
+        else:
+            memory: dict[str, Any] = {"action": "forget"}
+            if body.isdigit():
+                memory["memory_id"] = int(body)
+            else:
+                memory["topic"] = body
+            decision = _memory_command_decision(
+                action="forget",
+                output="status",
+                memory=memory,
+                details={"memory_action": "forget", **{k: v for k, v in memory.items() if k != "action"}},
+            )
+    else:
+        decision = _inline_slash_answer(_memory_slash_help())
+
+    decision = normalize_intent_frame_decision(decision)
+    status = selector_status(decision, [])
+    trace = {
+        "runtime": "agentic_vnext",
+        "stage": "slash_command",
+        "status": status,
+        "attempts": normalizer_calls,
+        "llm_calls": normalizer_calls,
+        "selector_ms": round((time.perf_counter() - started) * 1000, 2),
+        "repair_used": False,
+        "family_detail_used": False,
+        "prompt_tokens_est": 0,
+        "manifest_tokens_est": 0,
+        "slash_command": "memory",
+    }
+    if normalizer_result is not None:
+        trace["memory_command_normalized"] = bool(normalizer_result.get("ok"))
+    return SelectorResult(
+        calls=[],
+        decision=decision,
+        raw=str(question or ""),
+        prompt="",
+        manifest="",
+        attempts=normalizer_calls,
+        llm_calls=normalizer_calls,
+        status=status,
+        error=selector_error(decision, []) if status == "clarify" else "",
+        family_detail_used=False,
+        repair_used=False,
+        trace=trace,
+        intent_frame=decision.get("intent_frame") if isinstance(decision.get("intent_frame"), dict) else None,
+    )
+
+
+def _demote_non_slash_memory_route(*, calls: list[dict[str, Any]], decision: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    if not _memory_slash_commands_enabled():
+        return calls, decision
+    frame = decision.get("intent_frame") if isinstance(decision.get("intent_frame"), dict) else {}
+    route = str(frame.get("route") or decision.get("route") or "").strip().lower()
+    if route != "memory":
+        return calls, decision
+    return [], normalize_intent_frame_decision(_inline_slash_answer(_memory_slash_help()))
+
+
+_SLASH_MEMORY_TYPES = {
+    "preference",
+    "goal",
+    "constraint",
+    "stressor",
+    "commitment",
+    "identity_fact",
+    "tone_preference",
+}
+
+
+def _parse_memory_slash_command(question: str) -> dict[str, str] | None:
+    if not _memory_slash_commands_enabled():
+        return None
+    text = str(question or "").strip()
+    prefix = "/memory"
+    if text != prefix and not text.startswith(prefix + " "):
+        return None
+    rest = text[len(prefix):].strip()
+    if not rest:
+        return {"action": "help", "body": ""}
+    head, _, tail = rest.partition(" ")
+    action = head.strip().lower()
+    aliases = {
+        "add": "remember",
+        "find": "search",
+        "recall": "search",
+        "remove": "forget",
+        "save": "remember",
+    }
+    return {"action": aliases.get(action, action), "body": tail.strip()}
+
+
+def _memory_slash_commands_enabled() -> bool:
+    return str(os.getenv("MIRA_MEMORY_SLASH_COMMANDS_ENABLED", "true")).strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _memory_selector_instruction_line() -> str:
+    if _memory_slash_commands_enabled():
+        return "Memory slash commands are handled before this selector. For natural-language memory questions, stay chat and suggest `/memory remember ...`, `/memory list`, `/memory search ...`, or `/memory forget ...` when useful. Questions about this chat or last message are chat."
+    return "Memory only: route=memory intent=memory_op. save/remember -> output=status details.memory_action=remember details.text=<memory>. ask/list/forget/update saved memories -> details.memory_action=retrieve/list/forget/update plus question/topic/text/memory_id. Questions about this chat or last message are chat."
+
+
+def _memory_command_decision(*, action: str, output: str, memory: dict[str, Any], details: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "route": "memory",
+        "intent": "memory_op",
+        "subject": {"kind": "none", "text": None},
+        "time": "none",
+        "output": output,
+        "discourse_action": "new",
+        "answer": "",
+        "details": details,
+        "intent_frame": {
+            "route": "memory",
+            "intent": "memory_op",
+            "subject": {"kind": "none", "text": None},
+            "time": "none",
+            "output": output,
+            "discourse_action": "new",
+            "memory": memory,
+        },
+        "slash_command": "memory",
+        "memory_command_action": action,
+    }
+
+
+def _inline_slash_answer(answer: str) -> dict[str, Any]:
+    return {
+        "route": "chat",
+        "intent": "none",
+        "subject": {"kind": "none", "text": None},
+        "time": "none",
+        "output": "none",
+        "discourse_action": "new",
+        "answer": str(answer or "").strip(),
+        "details": {"answer_mode": "inline"},
+        "slash_command": "memory",
+    }
+
+
+def _memory_slash_help() -> str:
+    return "Use `/memory remember ...`, `/memory list`, `/memory search ...`, or `/memory forget ...`."
 
 
 def normalize_selector_decision(
@@ -464,7 +738,7 @@ def _intent_frame_payload_from_selector_decision(decision: dict[str, Any]) -> di
     output = _intent_frame_output_from_decision(decision, intent=intent)
     subject = _intent_frame_subject_from_decision(decision)
     time_value, time_a, time_b = _intent_frame_time_from_decision(decision)
-    return {
+    payload = {
         "route": route,
         "answer": str(decision.get("answer") or decision.get("direct_answer") or ""),
         "intent": intent,
@@ -476,6 +750,27 @@ def _intent_frame_payload_from_selector_decision(decision: dict[str, Any]) -> di
         "chart_type": _intent_frame_chart_type_from_decision(decision, output=output),
         "discourse_action": _intent_frame_discourse_action(decision),
     }
+    memory = _intent_frame_memory_from_decision(decision, route=route)
+    if memory:
+        payload["memory"] = memory
+    return payload
+
+
+def _intent_frame_memory_from_decision(decision: dict[str, Any], *, route: str) -> dict[str, Any]:
+    if route != "memory":
+        return {}
+    details = decision.get("details") if isinstance(decision.get("details"), dict) else {}
+    out: dict[str, Any] = {}
+    action = str(details.get("memory_action") or details.get("action") or "").strip()
+    if action:
+        out["action"] = action
+    for key in ("text", "question", "topic", "memory_id", "memory_type", "limit"):
+        value = details.get(key)
+        if value not in (None, "", [], {}):
+            out[key] = value
+    if details.get("search") not in (None, "", [], {}) and "question" not in out:
+        out["question"] = details.get("search")
+    return out
 
 
 def _intent_frame_route_from_decision(decision: dict[str, Any]) -> str:
@@ -629,6 +924,8 @@ def _intent_frame_time_from_decision(decision: dict[str, Any]) -> tuple[str, str
 
 def _intent_frame_output_from_decision(decision: dict[str, Any], *, intent: str) -> str:
     requested = str(decision.get("output") or decision.get("requested_output") or "").strip().lower()
+    if intent == "affordability":
+        return "status"
     output_aliases = {
         "scalar_total": "scalar",
         "rows": "table",
@@ -2297,6 +2594,14 @@ def estimate_tokens(text: str) -> int:
     return max(1, len(text or "") // 4)
 
 
+def _selector_compact_output_enabled() -> bool:
+    return str(os.getenv("MIRA_SELECTOR_COMPACT_OUTPUT_ENABLED", "0")).strip().lower() not in {"0", "false", "no", "off"}
+
+
+def selector_response_schema() -> dict[str, Any]:
+    return COMPACT_SELECTOR_RESPONSE_SCHEMA if _selector_compact_output_enabled() else SELECTOR_RESPONSE_SCHEMA
+
+
 def resolve_selector_num_ctx(
     *,
     selector_model: str,
@@ -2323,11 +2628,12 @@ def _default_completer(prompt: str, max_tokens: int, purpose: str) -> str:
         prompt,
         max_tokens=max_tokens,
         purpose=purpose,
-        response_format=SELECTOR_RESPONSE_SCHEMA,
+        response_format=selector_response_schema(),
     )
 
 
 __all__ = [
+    "COMPACT_SELECTOR_RESPONSE_SCHEMA",
     "SELECTOR_RESPONSE_SCHEMA",
     "SelectorResult",
     "apply_context_semantics",
@@ -2348,6 +2654,7 @@ __all__ = [
     "resolve_selector_num_ctx",
     "run_selector",
     "selected_family",
+    "selector_response_schema",
     "selector_needs_repair",
     "selector_status",
 ]

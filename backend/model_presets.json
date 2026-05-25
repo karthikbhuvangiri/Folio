@@ -1,51 +1,38 @@
 {
   "presets": {
-    "battery_saver": {
-      "label": "Battery Saver",
-      "description": "Coolest and quietest local setup for imports and everyday categorization.",
-      "categorize_model": "llama3.2:3b",
-      "copilot_model": "phi4-mini",
-      "disk_gb": 4,
-      "recommended_min_ram_gb": 8,
-      "default_batch_size": 12,
-      "inter_batch_delay_ms": 1200
-    },
-    "balanced": {
-      "label": "Balanced",
-      "description": "Best everyday default for local Ollama on laptops.",
+    "default": {
+      "label": "Mira Recommended",
+      "description": "Tested local Mira setup. Advanced mode is available for unvalidated model experiments.",
       "categorize_model": "gemma4:e4b",
-      "copilot_model": "qwen2.5:7b",
-      "disk_gb": 15,
+      "controller_model": "gemma4:e4b",
+      "copilot_model": "gemma4:e4b",
+      "disk_gb": 9.6,
       "recommended_min_ram_gb": 16,
       "default_batch_size": 25,
       "inter_batch_delay_ms": 600
-    },
-    "quality": {
-      "label": "Quality",
-      "description": "Stronger Copilot answers while keeping categorization thermally sane.",
-      "categorize_model": "gemma3:12b",
-      "copilot_model": "gemma4:26b",
-      "disk_gb": 28,
-      "recommended_min_ram_gb": 32,
-      "default_batch_size": 25,
-      "inter_batch_delay_ms": 900
     }
   },
   "recommendedDefaults": {
     "8gb": {
-      "preset": "battery_saver",
-      "categorize_model": "llama3.2:3b",
-      "copilot_model": "phi4-mini"
+      "preset": "default",
+      "categorize_model": "gemma4:e4b",
+      "controller_model": "gemma4:e4b",
+      "copilot_model": "gemma4:e4b",
+      "advisor_model": "gemma4:e4b"
     },
     "16gb": {
-      "preset": "balanced",
+      "preset": "default",
       "categorize_model": "gemma4:e4b",
-      "copilot_model": "qwen2.5:7b"
+      "controller_model": "gemma4:e4b",
+      "copilot_model": "gemma4:e4b",
+      "advisor_model": "gemma4:e4b"
     },
     "32gb": {
-      "preset": "balanced",
+      "preset": "default",
       "categorize_model": "gemma4:e4b",
-      "copilot_model": "gemma4:e4b"
+      "controller_model": "gemma4:e4b",
+      "copilot_model": "gemma4:e4b",
+      "advisor_model": "gemma4:26b"
     }
   },
   "models": {
@@ -110,10 +97,15 @@
       "task_fit": ["categorize", "copilot"],
       "ram_tier": "16gb",
       "approx_size_gb": 9.6,
-      "badges": ["Gemma 4", "Recommended", "Great for categorization"],
+      "download_size_gb": 9.6,
+      "recommended_ram_gb": 16,
+      "quantization": "Q4_K_M",
+      "ollama_tag": "gemma4:e4b",
+      "validated_for_mira": true,
+      "badges": ["Gemma 4", "Default", "Q4_K_M"],
       "categorize_default": "recommended",
-      "copilot_default": "good",
-      "warning": "Primary Folio categorization recommendation; validated as a strong balance of speed and quality on 16 GB and 32 GB Macs."
+      "copilot_default": "recommended",
+      "warning": "Tested Mira default for chat, controller, and categorization. Ollama may use more memory at runtime than the download size."
     },
     "hf.co/HauhauCS/Gemma-4-E4B-Uncensored-HauhauCS-Aggressive:Q5_K_M": {
       "label": "Gemma 4 E4B Uncensored Q5",
@@ -197,13 +189,19 @@
     "gemma4:26b": {
       "label": "Gemma 4 26B",
       "family": "Gemma 4",
-      "task_fit": ["copilot"],
+      "task_fit": ["advisor"],
       "ram_tier": "32gb",
       "approx_size_gb": 18.0,
-      "badges": ["Gemma 4", "Recommended", "Copilot"],
+      "download_size_gb": 18.0,
+      "recommended_ram_gb": 30,
+      "quantization": "Q4_K_M",
+      "ollama_tag": "gemma4:26b",
+      "validated_for_mira": true,
+      "badges": ["Gemma 4", "Advisor", "30 GB+"],
       "categorize_default": "avoid",
-      "copilot_default": "recommended",
-      "warning": "Excellent 32 GB Copilot choice, but intentionally not a default categorization model."
+      "copilot_default": "avoid",
+      "advisor_default": "recommended",
+      "warning": "High-memory Advisor model. Setup uses it only when system RAM is at least 30 GB; chat stays on Gemma 4 E4B by default."
     },
     "gemma4:31b": {
       "label": "Gemma 4 31B",

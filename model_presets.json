@@ -1,51 +1,38 @@
 {
   "presets": {
-    "battery_saver": {
-      "label": "Battery Saver",
-      "description": "Coolest and quietest local setup for imports and everyday categorization.",
-      "categorize_model": "llama3.2:3b",
-      "copilot_model": "phi4-mini",
-      "disk_gb": 4,
-      "recommended_min_ram_gb": 8,
-      "default_batch_size": 12,
-      "inter_batch_delay_ms": 1200
-    },
-    "balanced": {
-      "label": "Balanced",
-      "description": "Best everyday default for local Ollama on laptops.",
+    "default": {
+      "label": "Mira Recommended",
+      "description": "Tested local Mira setup. Advanced mode is available for unvalidated model experiments.",
       "categorize_model": "gemma4:e4b",
-      "copilot_model": "qwen2.5:7b",
-      "disk_gb": 15,
+      "controller_model": "gemma4:e4b",
+      "copilot_model": "gemma4:e4b",
+      "disk_gb": 9.6,
       "recommended_min_ram_gb": 16,
       "default_batch_size": 25,
       "inter_batch_delay_ms": 600
-    },
-    "quality": {
-      "label": "Quality",
-      "description": "Stronger Copilot answers while keeping categorization thermally sane.",
-      "categorize_model": "gemma4:e4b",
-      "copilot_model": "gemma4:26b",
-      "disk_gb": 28,
-      "recommended_min_ram_gb": 32,
-      "default_batch_size": 25,
-      "inter_batch_delay_ms": 900
     }
   },
   "recommendedDefaults": {
     "8gb": {
-      "preset": "battery_saver",
-      "categorize_model": "llama3.2:3b",
-      "copilot_model": "phi4-mini"
+      "preset": "default",
+      "categorize_model": "gemma4:e4b",
+      "controller_model": "gemma4:e4b",
+      "copilot_model": "gemma4:e4b",
+      "advisor_model": "gemma4:e4b"
     },
     "16gb": {
-      "preset": "balanced",
+      "preset": "default",
       "categorize_model": "gemma4:e4b",
-      "copilot_model": "qwen2.5:7b"
+      "controller_model": "gemma4:e4b",
+      "copilot_model": "gemma4:e4b",
+      "advisor_model": "gemma4:e4b"
     },
     "32gb": {
-      "preset": "balanced",
+      "preset": "default",
       "categorize_model": "gemma4:e4b",
-      "copilot_model": "gemma4:e4b"
+      "controller_model": "gemma4:e4b",
+      "copilot_model": "gemma4:e4b",
+      "advisor_model": "gemma4:26b"
     }
   },
   "models": {
@@ -80,7 +67,7 @@
       "badges": ["Fast", "Multilingual", "Balanced"],
       "categorize_default": "good",
       "copilot_default": "good",
-      "warning": "Good small multilingual option with very manageable local footprint."
+      "warning": "Very fast small multilingual option; best when speed matters more than maximum categorization accuracy."
     },
     "qwen3:4b": {
       "label": "Qwen 3 4B",
@@ -89,9 +76,9 @@
       "ram_tier": "8gb",
       "approx_size_gb": 2.5,
       "badges": ["Balanced", "Multilingual", "Modern"],
-      "categorize_default": "good",
+      "categorize_default": "avoid",
       "copilot_default": "good",
-      "warning": "A strong modern small-model option when you want better headroom than 3B models."
+      "warning": "Can leak reasoning text instead of a clean category label, so avoid it for strict local categorization."
     },
     "gemma4:e2b": {
       "label": "Gemma 4 E2B",
@@ -110,10 +97,15 @@
       "task_fit": ["categorize", "copilot"],
       "ram_tier": "16gb",
       "approx_size_gb": 9.6,
-      "badges": ["Gemma 4", "Recommended", "Great for categorization"],
+      "download_size_gb": 9.6,
+      "recommended_ram_gb": 16,
+      "quantization": "Q4_K_M",
+      "ollama_tag": "gemma4:e4b",
+      "validated_for_mira": true,
+      "badges": ["Gemma 4", "Default", "Q4_K_M"],
       "categorize_default": "recommended",
-      "copilot_default": "good",
-      "warning": "Primary Folio recommendation for 16 GB laptops."
+      "copilot_default": "recommended",
+      "warning": "Tested Mira default for chat, controller, and categorization. Ollama may use more memory at runtime than the download size."
     },
     "hf.co/HauhauCS/Gemma-4-E4B-Uncensored-HauhauCS-Aggressive:Q5_K_M": {
       "label": "Gemma 4 E4B Uncensored Q5",
@@ -145,9 +137,9 @@
       "ram_tier": "16gb",
       "approx_size_gb": 4.7,
       "badges": ["Balanced", "Copilot", "Multilingual"],
-      "categorize_default": "good",
+      "categorize_default": "recommended",
       "copilot_default": "recommended",
-      "warning": "Excellent balanced choice for 16 GB and 32 GB laptops, especially for Copilot."
+      "warning": "Excellent balanced choice for 16 GB and 32 GB laptops; one of the best speed-to-quality categorization options tested locally."
     },
     "qwen3:8b": {
       "label": "Qwen 3 8B",
@@ -156,9 +148,9 @@
       "ram_tier": "16gb",
       "approx_size_gb": 5.2,
       "badges": ["Copilot", "Modern", "Quality"],
-      "categorize_default": "good",
+      "categorize_default": "avoid",
       "copilot_default": "good",
-      "warning": "Better suited to richer Copilot interactions than long categorization imports."
+      "warning": "Better suited to richer Copilot interactions than strict categorization imports; Qwen 3 models may need extra no-thinking controls to format reliably."
     },
     "deepseek-r1:8b": {
       "label": "DeepSeek-R1 8B",
@@ -175,13 +167,19 @@
     "gemma4:26b": {
       "label": "Gemma 4 26B",
       "family": "Gemma 4",
-      "task_fit": ["copilot"],
+      "task_fit": ["advisor"],
       "ram_tier": "32gb",
       "approx_size_gb": 18.0,
-      "badges": ["Gemma 4", "Recommended", "Copilot"],
+      "download_size_gb": 18.0,
+      "recommended_ram_gb": 30,
+      "quantization": "Q4_K_M",
+      "ollama_tag": "gemma4:26b",
+      "validated_for_mira": true,
+      "badges": ["Gemma 4", "Advisor", "30 GB+"],
       "categorize_default": "avoid",
-      "copilot_default": "recommended",
-      "warning": "Excellent 32 GB Copilot choice, but intentionally not a default categorization model."
+      "copilot_default": "avoid",
+      "advisor_default": "recommended",
+      "warning": "High-memory Advisor model. Setup uses it only when system RAM is at least 30 GB; chat stays on Gemma 4 E4B by default."
     },
     "gemma4:31b": {
       "label": "Gemma 4 31B",
@@ -202,9 +200,9 @@
       "ram_tier": "32gb",
       "approx_size_gb": 8.1,
       "badges": ["Balanced", "Copilot", "Gemma"],
-      "categorize_default": "good",
+      "categorize_default": "recommended",
       "copilot_default": "good",
-      "warning": "Good upper-mid option when you want better quality without jumping to the hottest local models."
+      "warning": "Strong 32 GB quality-first categorization option when you want better accuracy and can accept slower throughput than Gemma 4 E4B."
     },
     "qwen2.5:14b": {
       "label": "Qwen 2.5 14B",
@@ -230,7 +228,7 @@
     },
     "mistral-small:24b": {
       "label": "Mistral Small 24B",
-      "family": "Mistral Small",
+      "family": "Mistral",
       "task_fit": ["copilot"],
       "ram_tier": "32gb",
       "approx_size_gb": 14.0,
@@ -238,7 +236,7 @@
       "expert_only": true,
       "categorize_default": "avoid",
       "copilot_default": "good",
-      "warning": "Powerful local Copilot model, but too heavy to recommend for sustained categorization on laptops."
+      "warning": "High-quality local assistant option, but intentionally de-emphasized for routine laptop use."
     }
   }
 }

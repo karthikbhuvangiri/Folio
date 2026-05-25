@@ -9,7 +9,7 @@ Time windows use a `range` token:
   current_month | last_month | prior_month | YYYY-MM
   this_week    | last_week
   last_7d | last_30d | last_90d | last_180d | last_365d | last_N_months
-  ytd | last_year | all
+  ytd | last_year | all | YYYY-MM-DD..YYYY-MM-DD
 """
 
 from __future__ import annotations
@@ -41,6 +41,7 @@ from data_manager import (
 from cashflow_classifier import CREDITS_REFUNDS_CATEGORY
 from mira import metric_registry
 from mira import cashflow_forecast
+from mira.agentic.temporal_parser import bounded_range_dates
 
 logger = logging.getLogger(__name__)
 INTERNAL_TOOL_NAMES = {"run_sql"}
@@ -75,6 +76,10 @@ def _resolve_range(token: str | None) -> tuple[str | None, str | None, str]:
     if not token:
         token = "current_month"
     token = token.strip().lower()
+    bounded = bounded_range_dates(token)
+    if bounded:
+        start, end = bounded
+        return start, end, token
     parsed = parse_range(token)
     if parsed.explicit:
         token = parsed.token
@@ -143,7 +148,8 @@ _RANGE_ENUM = [
 _RANGE_DESC = (
     "Time window. One of: current_month (default), last_month, this_week, last_week, "
     "last_7d, last_30d, last_90d, last_180d, last_365d, ytd, last_year, all, "
-    "last_N_months such as last_13_months, or a specific YYYY-MM."
+    "last_N_months such as last_13_months, a specific YYYY-MM, or an internal "
+    "bounded date token YYYY-MM-DD..YYYY-MM-DD."
 )
 _NON_SPENDING_CATEGORIES = tuple(DATA_NON_SPENDING_CATEGORIES)
 _NON_SPENDING_CATEGORY_KEYS = {str(name).strip().lower() for name in _NON_SPENDING_CATEGORIES}
@@ -825,6 +831,7 @@ def _t_get_transactions(args: dict, profile: str | None, conn) -> Any:
         conn=conn,
         start_date=start,
         end_date=end,
+        sort=args.get("sort"),
     ) or {}
     if isinstance(result, dict):
         rows = _semantic_rows(result)
@@ -1054,6 +1061,7 @@ def _t_find_transactions(args: dict, profile: str | None, conn) -> Any:
         "mode": args.get("mode"),
         "limit": max(1, min(int(args.get("limit") or 25), 50)),
         "offset": max(0, int(args.get("offset") or 0)),
+        "sort": args.get("sort"),
     }
     query_args = {k: v for k, v in query_args.items() if v not in (None, "", [])}
     result = _t_get_transactions(query_args, profile, conn)
@@ -1647,6 +1655,27 @@ def _t_get_enrichment_quality_summary(args: dict, profile: str | None, conn) -> 
     caveats = []
     if missing > 0:
         caveats.append(f"{missing} transaction(s) do not have persisted enrichment yet.")
+    coverage_ratio = float(summary.get("coverage_ratio") or 0)
+    coverage_percent = round(coverage_ratio * 100, 1)
+    summary["summary"] = (
+        f"Transaction enrichment is {coverage_percent}% populated "
+        f"({int(summary.get('persisted_enrichment_count') or 0)} of "
+        f"{int(summary.get('transaction_count') or 0)} transactions)."
+    )
+    actionable_low = int(summary.get("actionable_low_confidence_count") or 0)
+    strict_low = int(summary.get("low_confidence_count") or 0)
+    if strict_low and actionable_low != strict_low:
+        summary["summary"] += f" {actionable_low} row(s) have actionable non-recurrence quality flags."
+    fields = summary.get("populated_fields") if isinstance(summary.get("populated_fields"), dict) else {}
+    essentiality = fields.get("essentiality_known") if isinstance(fields.get("essentiality_known"), dict) else {}
+    if essentiality and float(essentiality.get("ratio") or 0) < 0.95:
+        caveats.append(
+            f"Essentiality is known for {int(essentiality.get('count') or 0)} transaction(s); unknown rows should be treated cautiously."
+        )
+    if strict_low and actionable_low < strict_low:
+        caveats.append(
+            "The strict low-confidence count includes recurrence-only uncertainty; actionable quality flags separate taxonomy, counterparty, essentiality, and semantic issues."
+        )
     return _add_contract(
         summary,
         tool="get_enrichment_quality_summary",
@@ -2704,6 +2733,512 @@ def _t_run_sql(args: dict, profile: str | None, conn) -> Any:
     return {"row_count": len(rows), "rows": data, "truncated": len(rows) > 200}
 
 
+def _t_review_financial_context(args: dict, profile: str | None, conn) -> Any:
+    """Read-only access to Mira's compact financial understanding facts."""
+
+    from mira.financial_understanding import list_financial_facts
+    from mira.financial_feedback import feedback_adjustments_for_subjects, financial_feedback_loop_enabled
+
+    view = str(args.get("view") or "relevant").strip().lower()
+    if view not in {"relevant", "lifestyle_profile", "friction_map", "operating_plan", "monthly_retrospective", "forecast_month_outlook.snapshot", "review_cashflow.safe_to_spend"}:
+        view = "relevant"
+    if view == "forecast_month_outlook.snapshot":
+        return _financial_outlook_context(args, profile, conn)
+    if view == "review_cashflow.safe_to_spend":
+        return _financial_safe_to_spend_context(args, profile, conn)
+    if view == "monthly_retrospective":
+        return _financial_monthly_retrospective_context(args, profile, conn)
+    try:
+        max_facts = max(1, min(int(args.get("max_facts") or 5), 8))
+    except (TypeError, ValueError):
+        max_facts = 5
+    subject_type = str(args.get("subject_type") or "").strip().lower()
+    subject_key = _financial_context_key(args.get("subject_key")) if args.get("subject_key") else ""
+
+    rows = list_financial_facts(conn=conn, profile=profile, limit=max(max_facts * 4, 20))
+    feedback_adjustments: dict[tuple[str, str], dict[str, Any]] = {}
+    if financial_feedback_loop_enabled() and rows:
+        subjects = [
+            (str(row.get("subject_type") or ""), str(row.get("subject_key") or ""))
+            for row in rows
+            if row.get("subject_type") and row.get("subject_key")
+        ]
+        feedback_adjustments = feedback_adjustments_for_subjects(conn=conn, profile=profile, subjects=subjects)
+        if feedback_adjustments:
+            rows = sorted(rows, key=lambda row: (_financial_feedback_priority(row, feedback_adjustments), str(row.get("generated_at") or ""), int(row.get("id") or 0)), reverse=True)
+    facts: list[dict[str, Any]] = []
+    suppressed = 0
+    feedback_suppressed = 0
+    feedback_reframed = 0
+    direct_subject = bool(subject_type and subject_key)
+    for row in rows:
+        family = str(row.get("fact_family") or "").strip()
+        row_subject_type = str(row.get("subject_type") or "").strip().lower()
+        row_subject_key = str(row.get("subject_key") or "").strip().lower()
+        if view != "relevant" and family != view:
+            continue
+        if subject_type and row_subject_type != subject_type:
+            continue
+        if subject_key and row_subject_key != subject_key:
+            continue
+        if str(row.get("sensitivity") or "low").strip().lower() == "high":
+            if not (subject_type and subject_key and row_subject_type == subject_type and row_subject_key == subject_key):
+                suppressed += 1
+                continue
+        adjustment = feedback_adjustments.get((row_subject_type, row_subject_key)) if feedback_adjustments else None
+        if adjustment and (adjustment.get("suppress") or adjustment.get("too_sensitive")) and not direct_subject:
+            feedback_suppressed += 1
+            continue
+        if adjustment:
+            row = {**row, "_feedback_adjustment": adjustment}
+            if adjustment.get("reframe"):
+                feedback_reframed += 1
+        facts.append(_financial_context_fact(row))
+        if len(facts) >= max_facts:
+            break
+    stated_intent_fact = None
+    if direct_subject:
+        try:
+            from mira.stated_intents import stated_intent_context_for_subject
+
+            stated_intent_fact = stated_intent_context_for_subject(
+                conn=conn,
+                profile=profile,
+                subject_type=subject_type,
+                subject_key=subject_key,
+            )
+        except Exception:
+            stated_intent_fact = None
+    if stated_intent_fact:
+        facts = [stated_intent_fact, *facts[: max(0, max_facts - 1)]]
+    habit_streak_fact = None
+    if direct_subject:
+        try:
+            from mira.habit_streaks import habit_streak_context_for_subject
+
+            habit_streak_fact = habit_streak_context_for_subject(
+                conn=conn,
+                profile=profile,
+                subject_type=subject_type,
+                subject_key=subject_key,
+            )
+        except Exception:
+            habit_streak_fact = None
+    if habit_streak_fact:
+        prefix = [stated_intent_fact] if stated_intent_fact else []
+        start = 1 if stated_intent_fact else 0
+        facts = [*prefix, habit_streak_fact, *facts[start : max(0, max_facts - 1)]][:max_facts]
+
+    caveats = []
+    if not rows:
+        caveats.append("No active financial-understanding facts are available yet.")
+    if suppressed:
+        caveats.append(f"{suppressed} high-sensitivity context fact(s) were omitted.")
+    if feedback_suppressed:
+        caveats.append(f"{feedback_suppressed} feedback-suppressed context fact(s) were omitted.")
+    if feedback_reframed:
+        caveats.append(f"{feedback_reframed} context fact(s) include user correction framing.")
+    generated = [str(row.get("generated_at") or "") for row in rows if row.get("generated_at")]
+    result = {
+        "status": "ok" if facts else "empty",
+        "context_kind": "financial_understanding",
+        "view": view,
+        "summary": _financial_context_summary(facts, view),
+        "facts": facts,
+        "caveats": caveats,
+        "provenance": {
+            "fact_ids": [fact.get("id") for fact in facts if fact.get("id") not in (None, "")],
+            "generated_at": max(generated) if generated else "",
+        },
+    }
+    return _add_contract(
+        result,
+        tool="review_financial_context",
+        args=args,
+        label=view,
+        row_count=len(facts),
+        filters={"subject_type": subject_type, "subject_key": subject_key},
+        calculation_basis="Read from Mira's compact financial-understanding facts; does not compute scalar totals.",
+        caveats=caveats,
+    )
+
+
+def _financial_outlook_context(args: dict, profile: str | None, conn) -> Any:
+    from mira.money_outlook import load_latest_money_outlook_snapshot, money_outlook_enabled
+
+    view = "forecast_month_outlook.snapshot"
+    caveats: list[str] = []
+    if not money_outlook_enabled():
+        caveats.append("Money Outlook is disabled.")
+        return _add_contract(
+            {
+                "status": "empty",
+                "context_kind": "money_outlook",
+                "view": view,
+                "summary": "No cached money outlook is available.",
+                "facts": [],
+                "caveats": caveats,
+                "provenance": {},
+            },
+            tool="review_financial_context",
+            args=args,
+            label=view,
+            row_count=0,
+            calculation_basis="Cached deterministic money outlook snapshot; no live projection was computed.",
+            caveats=caveats,
+        )
+
+    snapshot = load_latest_money_outlook_snapshot(conn, profile=profile, as_of=args.get("as_of"))
+    if not snapshot:
+        caveats.append("No fresh cached money outlook is available yet.")
+        return _add_contract(
+            {
+                "status": "empty",
+                "context_kind": "money_outlook",
+                "view": view,
+                "summary": "No fresh cached money outlook is available yet.",
+                "facts": [],
+                "caveats": caveats,
+                "provenance": {},
+            },
+            tool="review_financial_context",
+            args=args,
+            label=view,
+            row_count=0,
+            calculation_basis="Cached deterministic money outlook snapshot; no live projection was computed.",
+            caveats=caveats,
+        )
+
+    intent = str(args.get("intent") or "").strip().lower()
+    amount = _fmt_money(args.get("amount"))
+    savings_delta = _fmt_money(snapshot.get("projected_savings_delta"))
+    if intent == "affordability" and amount > 0:
+        remaining_after_purchase = _fmt_money(savings_delta - amount)
+        threshold = max(100.0, round(amount * 0.25, 2))
+        if remaining_after_purchase > threshold:
+            caveats.append("Money Outlook skipped because this purchase is not near the monthly savings threshold.")
+            return _add_contract(
+                {
+                    "status": "empty",
+                    "context_kind": "money_outlook",
+                    "view": view,
+                    "summary": "Cached money outlook was not needed for this affordability answer.",
+                    "facts": [],
+                    "caveats": caveats,
+                    "provenance": {"snapshot_id": snapshot.get("id"), "generated_at": snapshot.get("generated_at")},
+                },
+                tool="review_financial_context",
+                args=args,
+                label=view,
+                row_count=0,
+                calculation_basis="Cached deterministic money outlook snapshot; skipped because projected room was not near threshold.",
+                caveats=caveats,
+            )
+    else:
+        remaining_after_purchase = None
+
+    summary = _money_outlook_context_summary(snapshot)
+    outlook = {
+        "month_key": snapshot.get("month_key"),
+        "projected_end_balance": snapshot.get("projected_end_balance"),
+        "projected_income_remaining": snapshot.get("projected_income_remaining"),
+        "projected_obligations_remaining": snapshot.get("projected_obligations_remaining"),
+        "projected_flexible_spend_remaining": snapshot.get("projected_flexible_spend_remaining"),
+        "projected_savings_delta": snapshot.get("projected_savings_delta"),
+        "target_savings_amount": snapshot.get("target_savings_amount"),
+        "confidence": snapshot.get("confidence"),
+        "drivers": (snapshot.get("drivers") or [])[:5],
+        "caveats": (snapshot.get("caveats") or [])[:5],
+        "generated_at": snapshot.get("generated_at"),
+        "valid_until": snapshot.get("valid_until"),
+        "safe_to_spend": {
+            "safe_to_spend_today": snapshot.get("safe_to_spend_today"),
+            "safe_to_spend_this_week": snapshot.get("safe_to_spend_this_week"),
+            "buffer_status": snapshot.get("buffer_status"),
+            "next_pressure_date": snapshot.get("low_point_date"),
+            "top_caveat": snapshot.get("safe_to_spend_top_caveat"),
+        },
+        "low_point": {
+            "low_point_date": snapshot.get("low_point_date"),
+            "low_point_amount": snapshot.get("low_point_amount"),
+            "buffer_amount": snapshot.get("buffer_amount"),
+            "buffer_status": snapshot.get("buffer_status"),
+            "buffer_breach": bool(snapshot.get("buffer_breach")),
+            "drivers": (snapshot.get("low_point_drivers") or [])[:5],
+        },
+    }
+    if remaining_after_purchase is not None:
+        outlook["affordability_amount"] = amount
+        outlook["projected_savings_delta_after_purchase"] = remaining_after_purchase
+    facts = [
+        {
+            "family": "money_outlook",
+            "kind": "forecast_month_outlook",
+            "summary": summary,
+            "numbers": {
+                "projected_savings_delta": snapshot.get("projected_savings_delta"),
+                "projected_end_balance": snapshot.get("projected_end_balance"),
+                "target_savings_amount": snapshot.get("target_savings_amount"),
+                "projected_income_remaining": snapshot.get("projected_income_remaining"),
+                "projected_obligations_remaining": snapshot.get("projected_obligations_remaining"),
+                "projected_flexible_spend_remaining": snapshot.get("projected_flexible_spend_remaining"),
+                "safe_to_spend_today": snapshot.get("safe_to_spend_today"),
+                "safe_to_spend_this_week": snapshot.get("safe_to_spend_this_week"),
+                "low_point_amount": snapshot.get("low_point_amount"),
+                "buffer_amount": snapshot.get("buffer_amount"),
+                **({"projected_savings_delta_after_purchase": remaining_after_purchase} if remaining_after_purchase is not None else {}),
+            },
+            "drivers": outlook["drivers"],
+            "confidence": snapshot.get("confidence"),
+        }
+    ]
+    return _add_contract(
+        {
+            "status": "ok",
+            "context_kind": "money_outlook",
+            "view": view,
+            "summary": summary,
+            "outlook": outlook,
+            "facts": facts,
+            "caveats": outlook["caveats"],
+            "provenance": {
+                "snapshot_id": snapshot.get("id"),
+                "generated_at": snapshot.get("generated_at"),
+                "valid_until": snapshot.get("valid_until"),
+                "fingerprint": snapshot.get("fingerprint"),
+            },
+        },
+        tool="review_financial_context",
+        args=args,
+        label=view,
+        row_count=1,
+        calculation_basis="Cached deterministic money outlook snapshot; does not compute new finance totals on the chat path.",
+        caveats=outlook["caveats"],
+    )
+
+
+def _financial_safe_to_spend_context(args: dict, profile: str | None, conn) -> Any:
+    from mira.money_outlook import load_latest_money_outlook_snapshot, money_outlook_enabled, safe_to_spend_enabled
+
+    view = "review_cashflow.safe_to_spend"
+    caveats: list[str] = []
+    if not money_outlook_enabled() or not safe_to_spend_enabled():
+        caveats.append("Safe-to-spend is disabled.")
+        return _add_contract(
+            {
+                "status": "empty",
+                "context_kind": "safe_to_spend",
+                "view": view,
+                "summary": "No cached safe-to-spend result is available.",
+                "facts": [],
+                "caveats": caveats,
+                "provenance": {},
+            },
+            tool="review_financial_context",
+            args=args,
+            label=view,
+            row_count=0,
+            calculation_basis="Cached deterministic Money Outlook snapshot; no live finance math was computed in chat.",
+            caveats=caveats,
+        )
+
+    snapshot = load_latest_money_outlook_snapshot(conn, profile=profile, as_of=args.get("as_of"))
+    if not snapshot:
+        caveats.append("No fresh cached money outlook is available yet.")
+        return _add_contract(
+            {
+                "status": "empty",
+                "context_kind": "safe_to_spend",
+                "view": view,
+                "summary": "No fresh cached safe-to-spend result is available yet.",
+                "facts": [],
+                "caveats": caveats,
+                "provenance": {},
+            },
+            tool="review_financial_context",
+            args=args,
+            label=view,
+            row_count=0,
+            calculation_basis="Cached deterministic Money Outlook snapshot; no live finance math was computed in chat.",
+            caveats=caveats,
+        )
+
+    safe_today = snapshot.get("safe_to_spend_today")
+    safe_week = snapshot.get("safe_to_spend_this_week")
+    buffer_status = str(snapshot.get("buffer_status") or "unknown")
+    pressure_date = snapshot.get("low_point_date")
+    top_caveat = str(snapshot.get("safe_to_spend_top_caveat") or "")
+    if top_caveat:
+        caveats.append(top_caveat)
+    summary = (
+        f"Safe-to-spend today is ${_fmt_money(safe_today):,.2f}; "
+        f"this week is ${_fmt_money(safe_week):,.2f}. Buffer status: {buffer_status}."
+    )
+    facts = [
+        {
+            "family": "safe_to_spend",
+            "kind": "review_cashflow.safe_to_spend",
+            "summary": summary,
+            "numbers": {
+                "safe_to_spend_today": safe_today,
+                "safe_to_spend_this_week": safe_week,
+                "low_point_amount": snapshot.get("low_point_amount"),
+                "buffer_amount": snapshot.get("buffer_amount"),
+            },
+            "dates": {"next_pressure_date": pressure_date},
+            "confidence": snapshot.get("confidence"),
+            "buffer_status": buffer_status,
+        }
+    ]
+    return _add_contract(
+        {
+            "status": "ok",
+            "context_kind": "safe_to_spend",
+            "view": view,
+            "summary": summary,
+            "safe_to_spend": {
+                "safe_to_spend_today": safe_today,
+                "safe_to_spend_this_week": safe_week,
+                "buffer_status": buffer_status,
+                "next_pressure_date": pressure_date,
+                "top_caveat": top_caveat,
+            },
+            "facts": facts,
+            "caveats": caveats[:3],
+            "provenance": {
+                "snapshot_id": snapshot.get("id"),
+                "generated_at": snapshot.get("generated_at"),
+                "valid_until": snapshot.get("valid_until"),
+                "fingerprint": snapshot.get("fingerprint"),
+            },
+        },
+        tool="review_financial_context",
+        args=args,
+        label=view,
+        row_count=1,
+        calculation_basis="Cached deterministic Money Outlook snapshot; the LLM may phrase but not compute safe-to-spend.",
+        caveats=caveats[:3],
+    )
+
+
+def _financial_monthly_retrospective_context(args: dict, profile: str | None, conn) -> Any:
+    from mira.monthly_retrospectives import monthly_retrospective_context, monthly_retrospective_enabled
+
+    view = "monthly_retrospective"
+    caveats: list[str] = []
+    if not monthly_retrospective_enabled():
+        caveats.append("Monthly retrospective is disabled.")
+        return _add_contract(
+            {
+                "status": "empty",
+                "context_kind": "monthly_retrospective",
+                "view": view,
+                "summary": "No monthly retrospective is available.",
+                "facts": [],
+                "caveats": caveats,
+                "provenance": {},
+            },
+            tool="review_financial_context",
+            args=args,
+            label=view,
+            row_count=0,
+            calculation_basis="Cached deterministic monthly retrospective; no live totals were computed.",
+            caveats=caveats,
+        )
+    month_key = str(args.get("month_key") or args.get("range") or "").strip()[:7] or None
+    fact = monthly_retrospective_context(conn=conn, profile=profile, month_key=month_key)
+    facts = [fact] if fact else []
+    if not facts:
+        caveats.append("No stored monthly retrospective matched this scope.")
+    return _add_contract(
+        {
+            "status": "ok" if facts else "empty",
+            "context_kind": "monthly_retrospective",
+            "view": view,
+            "summary": fact.get("summary") if fact else "No monthly retrospective matched.",
+            "facts": facts,
+            "caveats": caveats,
+            "provenance": {
+                "fact_ids": [fact.get("id")] if fact and fact.get("id") is not None else [],
+                "month_key": fact.get("time_scope") if fact else "",
+            },
+        },
+        tool="review_financial_context",
+        args=args,
+        label=view,
+        row_count=len(facts),
+        calculation_basis="Cached deterministic monthly retrospective; the LLM may phrase but not recalculate.",
+        caveats=caveats,
+    )
+
+
+def _money_outlook_context_summary(snapshot: dict[str, Any]) -> str:
+    month_key = str(snapshot.get("month_key") or "this month")
+    delta = _fmt_money(snapshot.get("projected_savings_delta"))
+    target = _fmt_money(snapshot.get("target_savings_amount"))
+    confidence = str(snapshot.get("confidence") or "medium")
+    direction = "above" if delta >= 0 else "below"
+    return (
+        f"Cached outlook for {month_key}: projected savings delta is "
+        f"${abs(delta):,.2f} {direction} the ${target:,.2f} target; confidence is {confidence}."
+    )
+
+
+def _financial_context_key(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    text = re.sub(r"[^a-z0-9]+", "_", text).strip("_")
+    return text or "profile"
+
+
+def _financial_feedback_priority(row: dict[str, Any], adjustments: dict[tuple[str, str], dict[str, Any]]) -> int:
+    key = (str(row.get("subject_type") or "").strip().lower(), str(row.get("subject_key") or "").strip().lower())
+    adjustment = adjustments.get(key) or {}
+    if adjustment.get("uprank"):
+        return 2
+    if adjustment.get("downrank") or adjustment.get("suppress") or adjustment.get("too_sensitive"):
+        return 0
+    return 1
+
+
+def _financial_context_fact(row: dict[str, Any]) -> dict[str, Any]:
+    evidence = row.get("evidence") if isinstance(row.get("evidence"), dict) else {}
+    result = {
+        "id": row.get("id"),
+        "family": row.get("fact_family"),
+        "kind": row.get("kind"),
+        "subject_type": row.get("subject_type"),
+        "subject_key": row.get("subject_key"),
+        "summary": row.get("summary"),
+        "numbers": row.get("numbers") if isinstance(row.get("numbers"), dict) else {},
+        "traits": row.get("traits") if isinstance(row.get("traits"), list) else [],
+        "confidence": row.get("confidence"),
+        "sensitivity": row.get("sensitivity"),
+        "valid_until": row.get("valid_until"),
+        "time_scope": evidence.get("time_scope"),
+        "improvement_theme": evidence.get("improvement_theme"),
+    }
+    adjustment = row.get("_feedback_adjustment") if isinstance(row.get("_feedback_adjustment"), dict) else {}
+    if adjustment:
+        result["feedback"] = {
+            "effects": adjustment.get("effects") or {},
+            "feedback_types": adjustment.get("feedback_types") or {},
+            "safe_summaries": adjustment.get("safe_summaries") or [],
+        }
+    return result
+
+
+def _financial_context_summary(facts: list[dict[str, Any]], view: str) -> str:
+    if not facts:
+        return "No compact financial context matched."
+    label = {
+        "lifestyle_profile": "lifestyle",
+        "friction_map": "friction",
+        "operating_plan": "operating-plan",
+        "monthly_retrospective": "monthly retrospective",
+    }.get(view, "financial context")
+    return f"{len(facts)} {label} fact(s) available."
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Registry
 # ──────────────────────────────────────────────────────────────────────────────
@@ -3071,6 +3606,22 @@ TOOL_REGISTRY: dict[str, dict[str, Any]] = {
         "fn": _t_get_data_health_summary,
         "description": "Read-only Mira data-health summary: DB quick_check, transaction/visible counts, sync freshness, enrichment coverage, cache freshness, caveats, and profile scope.",
         "parameters": {"type": "object", "properties": {}},
+    },
+    "review_financial_context": {
+        "fn": _t_review_financial_context,
+        "description": "Read-only Mira financial-understanding facts for lifestyle, friction, operating-plan, monthly-retrospective, and cached outlook context. This does not compute scalar finance totals.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "view": {"type": "string", "enum": ["relevant", "lifestyle_profile", "friction_map", "operating_plan", "monthly_retrospective"]},
+                "subject_type": {"type": "string", "enum": ["profile", "category", "merchant", "subscription", "account", "cashflow"]},
+                "subject_key": {"type": "string"},
+                "question": {"type": "string"},
+                "intent": {"type": "string"},
+                "max_facts": {"type": "integer", "default": 5},
+                "month_key": {"type": "string", "description": "Optional YYYY-MM closed month for monthly_retrospective."},
+            },
+        },
     },
     "get_net_worth_delta": {
         "fn": _t_get_net_worth_delta,

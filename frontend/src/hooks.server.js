@@ -111,3 +111,28 @@ export async function handle({ event, resolve }) {
         );
     }
 }
+
+export async function handleFetch({ request, fetch }) {
+    const url = new URL(request.url);
+
+    if (!url.pathname.startsWith('/api')) {
+        return fetch(request);
+    }
+
+    const targetUrl = `${BACKEND_URL}${url.pathname}${url.search}`;
+    const headers = new Headers(request.headers);
+    if (!headers.has('X-API-Key')) {
+        const apiKey = process.env.VITE_API_KEY || process.env.Folio_API_KEY || process.env.FOLIO_API_KEY || '';
+        if (apiKey) headers.set('X-API-Key', apiKey);
+    }
+
+    const init = {
+        method: request.method,
+        headers,
+    };
+    if (request.method !== 'GET' && request.method !== 'HEAD') {
+        init.body = await request.arrayBuffer();
+    }
+
+    return fetch(targetUrl, init);
+}

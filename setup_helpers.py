@@ -7,6 +7,10 @@ import platform
 import subprocess
 from pathlib import Path
 
+RECOMMENDED_LOCAL_MODEL = "gemma4:e4b"
+HIGH_MEMORY_ADVISOR_MODEL = "gemma4:26b"
+ADVISOR_HIGH_MEMORY_MIN_RAM_GB = 30
+
 
 def load_model_presets(root_dir: Path) -> dict[str, dict]:
     with (root_dir / "model_presets.json").open("r", encoding="utf-8") as fh:
@@ -14,33 +18,7 @@ def load_model_presets(root_dir: Path) -> dict[str, dict]:
     if "presets" not in payload:
         return payload
 
-    presets = payload["presets"]
-    return {
-        "light": {
-            "label": presets["battery_saver"]["label"],
-            "description": presets["battery_saver"]["description"],
-            "categorize_model": presets["battery_saver"]["categorize_model"],
-            "copilot_model": presets["battery_saver"]["copilot_model"],
-            "disk_gb": presets["battery_saver"]["disk_gb"],
-            "recommended_min_ram_gb": presets["battery_saver"]["recommended_min_ram_gb"],
-        },
-        "balanced": {
-            "label": presets["balanced"]["label"],
-            "description": presets["balanced"]["description"],
-            "categorize_model": presets["balanced"]["categorize_model"],
-            "copilot_model": presets["balanced"]["copilot_model"],
-            "disk_gb": presets["balanced"]["disk_gb"],
-            "recommended_min_ram_gb": presets["balanced"]["recommended_min_ram_gb"],
-        },
-        "quality": {
-            "label": presets["quality"]["label"],
-            "description": presets["quality"]["description"],
-            "categorize_model": presets["quality"]["categorize_model"],
-            "copilot_model": presets["quality"]["copilot_model"],
-            "disk_gb": presets["quality"]["disk_gb"],
-            "recommended_min_ram_gb": presets["quality"]["recommended_min_ram_gb"],
-        },
-    }
+    return {key: dict(value) for key, value in payload["presets"].items()}
 
 
 def _detect_total_ram_bytes(host_os: str) -> int | None:
@@ -101,6 +79,9 @@ def detect_system_profile(host_os: str) -> dict:
 
 
 def recommend_model_preset(system_profile: dict, model_presets: dict[str, dict]) -> str:
+    if "default" in model_presets:
+        return "default"
+
     ram_gb = system_profile.get("ram_gb")
     cpu_count = system_profile.get("cpu_count", 0)
     architecture = system_profile.get("architecture", "")
@@ -118,6 +99,13 @@ def recommend_model_preset(system_profile: dict, model_presets: dict[str, dict])
         return "light"
 
     return "light"
+
+
+def recommend_advisor_model(system_profile: dict) -> str:
+    ram_gb = system_profile.get("ram_gb")
+    if ram_gb is not None and ram_gb >= ADVISOR_HIGH_MEMORY_MIN_RAM_GB:
+        return HIGH_MEMORY_ADVISOR_MODEL
+    return RECOMMENDED_LOCAL_MODEL
 
 
 def format_system_profile(system_profile: dict) -> str:

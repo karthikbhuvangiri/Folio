@@ -36,6 +36,8 @@
     let savingMerchantFor = null;
     let exportingCsv = false;
     let bulkReviewing = false;
+    let reviewConfirmOpen = false;
+    let pendingBulkReview = null;
     let months = [];
     let accountNames = [];
 
@@ -93,27 +95,29 @@
     let monthPickerOpen = false;
     let categoryPickerOpen = false;
     let accountPickerOpen = false;
+    let categoryFilterSearch = '';
 
 
     function openFilter(which) {
         monthPickerOpen    = which === 'month';
         categoryPickerOpen = which === 'category';
         accountPickerOpen  = which === 'account';
+        if (which !== 'category') categoryFilterSearch = '';
     }
 
     function closeAllFilters() {
         monthPickerOpen = false;
         categoryPickerOpen = false;
         accountPickerOpen = false;
+        categoryFilterSearch = '';
     }
 
     function handleWindowClick() {
         closeAllFilters();
         monthDropdownOpen = false;
-        // Close category re-tag dropdown if open (but don't cancel full edit)
-        if (catDropdownOpenForTx) {
-            catDropdownOpenForTx = null;
-            catDropdownSearch = '';
+        // Close category re-tag state fully so the editing border does not linger.
+        if (catDropdownOpenForTx || editingTxId) {
+            cancelEditing();
         }
         if (editingMerchantTxId && !savingMerchantFor) {
             cancelMerchantEditing();
@@ -197,6 +201,7 @@
 
     async function saveTransactionMetadata(tx) {
         const draft = ensureMetadataDraft(tx);
+        const willMarkReviewed = !tx.reviewed && !!draft.reviewed;
         savingMetadataFor = tx.original_id;
         try {
             const tags = String(draft.tags || '').split(',').map(t => t.trim()).filter(Boolean);
@@ -206,12 +211,16 @@
                 reviewed: !!draft.reviewed
             });
             const updated = result.transaction || {};
+            const savedReviewed = updated.reviewed != null ? !!updated.reviewed : !!draft.reviewed;
             transactions = transactions.map(item => item.original_id === tx.original_id
-                ? { ...item, notes: updated.notes || '', tags: updated.tags || tags, reviewed: !!updated.reviewed }
+                ? { ...item, notes: updated.notes || '', tags: updated.tags || tags, reviewed: savedReviewed }
                 : item);
             summaryTransactions = summaryTransactions.map(item => item.original_id === tx.original_id
-                ? { ...item, notes: updated.notes || '', tags: updated.tags || tags, reviewed: !!updated.reviewed }
+                ? { ...item, notes: updated.notes || '', tags: updated.tags || tags, reviewed: savedReviewed }
                 : item);
+            if (willMarkReviewed && savedReviewed) {
+                await resetFiltersAfterReview();
+            }
             updateFeedback = 'Transaction details saved';
             recentlyUpdatedTxId = tx.original_id;
             setTimeout(() => { updateFeedback = ''; recentlyUpdatedTxId = null; }, 2500);
@@ -452,7 +461,17 @@
     }
 
     onMount(async () => {
-        const requestedReview = new URLSearchParams(window.location.search).get('review');
+        const query = new URLSearchParams(window.location.search);
+        const requestedPeriod = query.get('period');
+        const requestedMonth = query.get('month');
+        if (periodOptions.some(option => option.key === requestedPeriod)) {
+            handlePeriodChange(requestedPeriod);
+        } else if (/^\d{4}-\d{2}$/.test(requestedMonth || '')) {
+            selectedCustomMonth = requestedMonth;
+            handlePeriodChange('custom');
+        }
+
+        const requestedReview = query.get('review');
         if (requestedReview === 'reviewed' || requestedReview === 'unreviewed') {
             reviewFilter = requestedReview;
         }
@@ -880,6 +899,9 @@
     $: filteredEditCategories = catDropdownSearch
         ? allCategories.filter(c => c.toLowerCase().includes(catDropdownSearch.toLowerCase()))
         : allCategories;
+    $: filteredFilterCategories = categoryFilterSearch
+        ? allCategories.filter(c => c.toLowerCase().includes(categoryFilterSearch.toLowerCase()))
+        : allCategories;
 
     function clearFilters() {
         search = '';
@@ -890,7 +912,24 @@
         filterAccount = '';
         reviewFilter = 'all';
         pageOffset = 0;
+        if (typeof window !== 'undefined') {
+            const url = new URL(window.location.href);
+            const hadFilterParams = ['review', 'period', 'month'].some(param => url.searchParams.has(param));
+            if (hadFilterParams) {
+                url.searchParams.delete('review');
+                url.searchParams.delete('period');
+                url.searchParams.delete('month');
+                window.history.replaceState(window.history.state, '', `${url.pathname}${url.search}${url.hash}`);
+            }
+        }
         // fetchTransactions() will be triggered by the reactive filter block
+    }
+
+    async function resetFiltersAfterReview() {
+        clearFilters();
+        closeAllFilters();
+        monthDropdownOpen = false;
+        await Promise.all([fetchTransactions(), fetchSummaryTransactions()]);
     }
 
     $: hasActiveFilters = search || filterCategory || filterAccount || reviewFilter !== 'all' || selectedPeriod !== 'this_month';
@@ -924,18 +963,46 @@
     async function markFilteredReviewed() {
         if (bulkReviewing || totalCount <= 0) return;
         const label = reviewFilter === 'unreviewed' ? 'unreviewed' : 'filtered';
-        const confirmed = window.confirm(`Mark all ${totalCount.toLocaleString()} ${label} transaction${totalCount === 1 ? '' : 's'} as reviewed?`);
-        if (!confirmed) return;
+        const params = buildSummaryParams(0);
+        delete params.limit;
+        delete params.offset;
+        if (reviewFilter === 'all') params.reviewed = false;
+        pendingBulkReview = {
+            count: totalCount,
+            label,
+            scope: describeBulkReviewScope(),
+            params
+        };
+        reviewConfirmOpen = true;
+    }
 
+    function describeBulkReviewScope() {
+        const parts = [periodLabel];
+        if (filterCategory) parts.push(filterCategory);
+        if (filterAccount) parts.push(filterAccount);
+        if (search.trim()) parts.push(`"${search.trim()}"`);
+        return parts.join(' · ');
+    }
+
+    function cancelBulkReviewConfirm() {
+        if (bulkReviewing) return;
+        reviewConfirmOpen = false;
+        pendingBulkReview = null;
+    }
+
+    function handleReviewConfirmKeydown(e) {
+        if (!reviewConfirmOpen || bulkReviewing) return;
+        if (e.key === 'Escape') cancelBulkReviewConfirm();
+    }
+
+    async function confirmFilteredReviewed() {
+        if (bulkReviewing || !pendingBulkReview) return;
         bulkReviewing = true;
         try {
-            const params = buildSummaryParams(0);
-            delete params.limit;
-            delete params.offset;
-            if (reviewFilter === 'all') params.reviewed = false;
+            const params = { ...(pendingBulkReview.params || {}) };
             const result = await api.bulkReviewTransactions(params, true);
             invalidateCache();
-            await Promise.all([fetchTransactions(), fetchSummaryTransactions()]);
+            await resetFiltersAfterReview();
             updateFeedback = `Marked ${(result.updated_count || 0).toLocaleString()} transaction${result.updated_count === 1 ? '' : 's'} reviewed`;
             setTimeout(() => { updateFeedback = ''; }, 3000);
         } catch (e) {
@@ -943,6 +1010,8 @@
             updateFeedback = 'Failed to mark transactions reviewed';
         } finally {
             bulkReviewing = false;
+            reviewConfirmOpen = false;
+            pendingBulkReview = null;
         }
     }
 
@@ -1230,7 +1299,7 @@
     }
 </script>
 
-<svelte:window on:click={handleWindowClick} />
+<svelte:window on:click={handleWindowClick} on:keydown={handleReviewConfirmKeydown} />
 <div class="profile-transition" class:profile-loading={profileSwitching}>
 <div class="flex items-start justify-between mb-6 fade-in">
     <div>
@@ -1249,6 +1318,53 @@
         <span class="text-[12px] font-medium" style="color: var(--text-primary)">{updateFeedback}</span>
     </div>
 {/if}
+
+<!-- PERIOD SELECTOR -->
+<div class="tx-period-row txn-period-row fade-in-up" style="animation-delay: 40ms">
+    <div class="period-toggle-track" style="--seg-count: {periodOptions.length}; --active-idx: {activePeriodIdx};">
+        <div class="period-toggle-thumb"></div>
+        {#each periodOptions as p}
+            <button class="period-toggle-label" class:active={selectedPeriod === p.key}
+                on:click={() => handlePeriodChange(p.key)}>
+                {p.label}
+            </button>
+        {/each}
+    </div>
+    {#if selectedPeriod === 'custom'}
+    <div class="month-dropdown-wrapper">
+        <button
+            class="month-dropdown-trigger"
+            class:ring-2={selectedPeriod === 'custom'}
+            class:ring-accent={selectedPeriod === 'custom'}
+            on:click|stopPropagation={() => { monthDropdownOpen = !monthDropdownOpen; closeAllFilters(); }}
+        >
+            <span>{formatMonth(selectedCustomMonth)}</span>
+            <span class="material-symbols-outlined text-[13px]"
+                  style="opacity: 0.5; transition: transform 0.2s;"
+                  class:rotate-180={monthDropdownOpen}>
+                expand_more
+            </span>
+        </button>
+
+        {#if monthDropdownOpen}
+            <button type="button" class="month-dropdown-backdrop" aria-label="Close month picker" on:click={() => monthDropdownOpen = false}></button>
+            <div class="month-dropdown-menu" role="listbox" style="bottom: auto; top: calc(100% + 6px);">
+                {#each months as m}
+                    <button
+                        class="month-dropdown-item"
+                        class:month-dropdown-item-active={selectedCustomMonth === m && selectedPeriod === 'custom'}
+                        role="option"
+                        aria-selected={selectedCustomMonth === m && selectedPeriod === 'custom'}
+                        on:click|stopPropagation={() => handleCustomMonthSelect(m)}
+                    >
+                        {formatMonth(m)}
+                    </button>
+                {/each}
+            </div>
+        {/if}
+    </div>
+    {/if}
+</div>
 
 <!-- MONTH STORY CARD -->
 <section class="tx-story-card fade-in-up" style="animation-delay: 60ms">
@@ -1309,7 +1425,7 @@
     </div>
 </section>
 
-<!-- PERIOD SELECTOR + FILTERS -->
+<!-- SEARCH + FILTERS -->
 <div class="tx-command-card fade-in-up" style="animation-delay: 100ms; position: relative; z-index: 10;">
     <div class="tx-command-search">
         <span class="material-symbols-outlined">search</span>
@@ -1317,52 +1433,8 @@
         <kbd>/</kbd>
     </div>
 
-    <!-- Row 1: Period toggle + Month dropdown + Category + Account filters -->
-    <div class="tx-command-controls txn-period-row">
-        <div class="period-toggle-track" style="--seg-count: {periodOptions.length}; --active-idx: {activePeriodIdx};">
-            <div class="period-toggle-thumb"></div>
-            {#each periodOptions as p}
-                <button class="period-toggle-label" class:active={selectedPeriod === p.key}
-                    on:click={() => handlePeriodChange(p.key)}>
-                    {p.label}
-                </button>
-            {/each}
-        </div>
-        {#if selectedPeriod === 'custom'}
-        <div class="month-dropdown-wrapper">
-            <button
-                class="month-dropdown-trigger"
-                class:ring-2={selectedPeriod === 'custom'}
-                class:ring-accent={selectedPeriod === 'custom'}
-                on:click|stopPropagation={() => { monthDropdownOpen = !monthDropdownOpen; closeAllFilters(); }}
-            >
-                <span>{formatMonth(selectedCustomMonth)}</span>
-                <span class="material-symbols-outlined text-[13px]"
-                      style="opacity: 0.5; transition: transform 0.2s;"
-                      class:rotate-180={monthDropdownOpen}>
-                    expand_more
-                </span>
-            </button>
-
-            {#if monthDropdownOpen}
-                <button type="button" class="month-dropdown-backdrop" aria-label="Close month picker" on:click={() => monthDropdownOpen = false}></button>
-                <div class="month-dropdown-menu" role="listbox" style="bottom: auto; top: calc(100% + 6px);">
-                    {#each months as m}
-                        <button
-                            class="month-dropdown-item"
-                            class:month-dropdown-item-active={selectedCustomMonth === m && selectedPeriod === 'custom'}
-                            role="option"
-                            aria-selected={selectedCustomMonth === m && selectedPeriod === 'custom'}
-                            on:click|stopPropagation={() => handleCustomMonthSelect(m)}
-                        >
-                            {formatMonth(m)}
-                        </button>
-                    {/each}
-                </div>
-            {/if}
-        </div>
-        {/if}
-
+    <!-- Row 1: Category + Account filters -->
+    <div class="tx-command-controls">
         <!-- Category Filter Pill -->
         <div class="relative" style="z-index: 51">
             <button class="txn-filter-pill"
@@ -1379,35 +1451,53 @@
             </button>
             {#if categoryPickerOpen}
                 <!-- svelte-ignore a11y-click-events-have-key-events -->
-                <div class="txn-filter-dropdown" role="presentation" on:click|stopPropagation>
-                    <button
-                        class="txn-filter-option"
-                        class:active={filterCategory === ''}
-                        on:click={() => { filterCategory = ''; categoryPickerOpen = false; }}>
-                        <span class="txn-filter-option-label">
-                            <span class="material-symbols-outlined" style="color: var(--text-muted)">category</span>
-                            <span>All Categories</span>
-                        </span>
-                        {#if filterCategory === ''}
-                            <span class="material-symbols-outlined text-[14px]" style="color: var(--accent)">check</span>
-                        {/if}
-                    </button>
-                    {#each allCategories as cat}
+                <div class="txn-filter-dropdown txn-category-filter-dropdown" role="presentation" on:click|stopPropagation>
+                    <div class="tx-cat-dropdown-search-wrap">
+                        <span class="material-symbols-outlined text-[14px]" style="color: var(--text-muted)">search</span>
+                        <input
+                            bind:value={categoryFilterSearch}
+                            placeholder="Search categories..."
+                            class="tx-cat-dropdown-search"
+                            on:keydown={(e) => {
+                                if (e.key === 'Escape') closeAllFilters();
+                            }}
+                        />
+                    </div>
+                    <div class="tx-cat-dropdown-list">
                         <button
                             class="txn-filter-option"
-                            class:active={cat === filterCategory}
-                            on:click={() => { filterCategory = cat; categoryPickerOpen = false; }}>
+                            class:active={filterCategory === ''}
+                            on:click={() => { filterCategory = ''; closeAllFilters(); }}>
                             <span class="txn-filter-option-label">
-                                <span class="material-symbols-outlined" style="color: {CATEGORY_COLORS[cat] || 'var(--text-muted)'}">
-                                    {CATEGORY_ICONS[cat] || 'label'}
-                                </span>
-                                <span>{cat}</span>
+                                <span class="material-symbols-outlined" style="color: var(--text-muted)">category</span>
+                                <span>All Categories</span>
                             </span>
-                            {#if cat === filterCategory}
+                            {#if filterCategory === ''}
                                 <span class="material-symbols-outlined text-[14px]" style="color: var(--accent)">check</span>
                             {/if}
                         </button>
-                    {/each}
+                        {#each filteredFilterCategories as cat}
+                            <button
+                                class="txn-filter-option"
+                                class:active={cat === filterCategory}
+                                on:click={() => { filterCategory = cat; closeAllFilters(); }}>
+                                <span class="txn-filter-option-label">
+                                    <span class="material-symbols-outlined" style="color: {CATEGORY_COLORS[cat] || 'var(--text-muted)'}">
+                                        {CATEGORY_ICONS[cat] || 'label'}
+                                    </span>
+                                    <span>{cat}</span>
+                                </span>
+                                {#if cat === filterCategory}
+                                    <span class="material-symbols-outlined text-[14px]" style="color: var(--accent)">check</span>
+                                {/if}
+                            </button>
+                        {/each}
+                        {#if filteredFilterCategories.length === 0 && categoryFilterSearch}
+                            <div class="px-3 py-2 text-[11px]" style="color: var(--text-muted)">
+                                No matching categories
+                            </div>
+                        {/if}
+                    </div>
                 </div>
             {/if}
         </div>
@@ -1460,10 +1550,38 @@
         </div>
 
         {#if reviewFilter !== 'reviewed' && totalCount > 0}
-            <button class="tx-bulk-review-btn" disabled={bulkReviewing} on:click={markFilteredReviewed}>
-                <span class="material-symbols-outlined">done_all</span>
-                {bulkReviewing ? 'Marking...' : `Mark ${reviewFilter === 'unreviewed' ? 'all' : 'unreviewed'} reviewed`}
-            </button>
+            {#if reviewConfirmOpen && pendingBulkReview}
+                <div class="tx-bulk-review-confirm" role="group" aria-label="Confirm bulk review">
+                    <span class="material-symbols-outlined tx-bulk-review-confirm-icon" aria-hidden="true">done_all</span>
+                    <span class="tx-bulk-review-confirm-copy">
+                        <strong>{pendingBulkReview.count.toLocaleString()} {pendingBulkReview.label}</strong>
+                        <span aria-hidden="true">·</span>
+                        <span>{pendingBulkReview.scope}</span>
+                    </span>
+                    <span class="tx-bulk-review-confirm-actions">
+                        <button
+                            type="button"
+                            class="tx-bulk-review-confirm-secondary"
+                            disabled={bulkReviewing}
+                            on:click={cancelBulkReviewConfirm}>
+                            Cancel
+                        </button>
+                        <button
+                            type="button"
+                            class="tx-bulk-review-confirm-primary"
+                            disabled={bulkReviewing}
+                            on:click={confirmFilteredReviewed}>
+                            <span class="material-symbols-outlined">{bulkReviewing ? 'hourglass_top' : 'done_all'}</span>
+                            {bulkReviewing ? 'Confirming...' : 'Confirm'}
+                        </button>
+                    </span>
+                </div>
+            {:else}
+                <button class="tx-bulk-review-btn" disabled={bulkReviewing} on:click={markFilteredReviewed}>
+                    <span class="material-symbols-outlined">done_all</span>
+                    {`Mark ${reviewFilter === 'unreviewed' ? 'all' : 'unreviewed'} reviewed`}
+                </button>
+            {/if}
         {/if}
 
         <button class="tx-export-btn" disabled={exportingCsv} on:click={exportCurrentTransactions} title="Export the current filtered transaction list as CSV">
@@ -1533,11 +1651,9 @@
             </div>
         {:else}
             <div class="tx-column-headers">
-                <span>Date</span>
                 <span>Transaction</span>
                 <span>Merchant</span>
                 <span>Category</span>
-                <span></span>
                 <span class="tx-col-header-amount">Amount</span>
             </div>
             {#each groupedTxns as [date, txns], gi}
@@ -1545,7 +1661,7 @@
                 {@const dayInfo = formatLedgerDay(date)}
 
                 <div class="tx-day-group" class:tx-day-group-separated={gi > 0}>
-                    <aside class="tx-day-rail">
+                    <div class="tx-day-band">
                         <div class="tx-day-rail-date">
                             <strong>{dayInfo.day}</strong>
                             <div>
@@ -1553,8 +1669,6 @@
                                 {#if dayInfo.relative}<small>{dayInfo.relative}</small>{/if}
                             </div>
                         </div>
-                    </aside>
-                    <div class="tx-day-body">
                         {#if txns.length > 1}
                         <div class="tx-day-summary-strip">
                             <div>
@@ -1566,6 +1680,8 @@
                             </div>
                         </div>
                         {/if}
+                    </div>
+                    <div class="tx-day-body">
 
                 {#each txns as tx (tx.original_id)}
                     {@const amount = parseFloat(tx.amount)}
@@ -1677,7 +1793,11 @@
                                     class:tx-cat-pill-editing={editingTxId === tx.original_id}
                                     on:click|stopPropagation={() => {
                                         if (editingTxId === tx.original_id) {
-                                            catDropdownOpenForTx = catDropdownOpenForTx === tx.original_id ? null : tx.original_id;
+                                            if (catDropdownOpenForTx === tx.original_id) {
+                                                cancelEditing();
+                                            } else {
+                                                catDropdownOpenForTx = tx.original_id;
+                                            }
                                         } else {
                                             startEditing(tx.original_id);
                                         }
@@ -1689,14 +1809,14 @@
                                     <span class="tx-cat-pill-label">{tx.category || 'Uncategorized'}</span>
                                     <span class="material-symbols-outlined text-[12px] tx-cat-pill-chevron"
                                         class:txn-chevron-open={catDropdownOpenForTx === tx.original_id}
-                                        style="color: var(--text-muted); opacity: 0.5;">
+                                        style="color: var(--text-muted);">
                                         expand_more
                                     </span>
                                 </button>
 
                                 {#if catDropdownOpenForTx === tx.original_id}
                                     <!-- svelte-ignore a11y-click-events-have-key-events -->
-                                    <div class="txn-filter-dropdown tx-cat-dropdown" role="presentation" on:click|stopPropagation>
+                                    <div class="txn-filter-dropdown tx-cat-dropdown tx-retag-dropdown" role="presentation" on:click|stopPropagation>
                                         <div class="tx-cat-apply-toggle">
                                             <div class="tx-cat-apply-toggle-copy">
                                                 <span class="tx-cat-apply-toggle-label">Apply</span>
@@ -1797,17 +1917,14 @@
                             {/if}
                         </div>
 
-                        <!-- Zone 3: Signal and amount -->
-                        <div class="tx-zone-signal">
-                            {#if rowSignal}
-                                <span class="tx-signal-chip" class:tx-signal-chip-alert={rowSignal === 'Large'}>{rowSignal}</span>
-                            {/if}
-                        </div>
-
                         <div class="tx-zone-amount">
                             <div>
-                                <p class="folio-amount-compact"
-                                    style="color: {amount >= 0 ? 'var(--positive)' : txns.length === 1 ? 'var(--negative)' : 'var(--text-primary)'}">
+                                {#if rowSignal}
+                                    <span class="tx-signal-chip" class:tx-signal-chip-alert={rowSignal === 'Large'}>{rowSignal}</span>
+                                {/if}
+                                <p class="folio-amount-compact tx-row-amount"
+                                    class:tx-row-amount-positive={amount >= 0}
+                                    class:tx-row-amount-negative={amount < 0}>
                                     {amount >= 0 ? '+' : ''}{formatCurrency(amount, 2)}
                                 </p>
                             </div>

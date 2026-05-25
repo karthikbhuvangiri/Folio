@@ -1650,20 +1650,35 @@ def _history_keys_for_obligation(*values: str | None) -> set[str]:
     return keys
 
 
+def _direct_history_keys_for_obligation(*values: str | None) -> set[str]:
+    keys: set[str] = set()
+    for value in values:
+        key = canonical_key(value)
+        if key:
+            keys.add(key)
+    return keys
+
+
 def _best_recent_history(
     history: dict[tuple[str, str], dict[str, Any]],
     profile_id: str | None,
     keys: set[str],
+    *,
+    preferred_keys: set[str] | None = None,
 ) -> dict[str, Any]:
-    best: dict[str, Any] = {}
-    for scope in (profile_id or "household", "household"):
-        for key in keys:
-            candidate = history.get((scope, key))
-            if not candidate:
-                continue
-            if int(candidate.get("seen_count") or 0) > int(best.get("seen_count") or 0):
-                best = candidate
-    return best
+    def choose(search_keys: set[str]) -> dict[str, Any]:
+        best: dict[str, Any] = {}
+        for scope in (profile_id or "household", "household"):
+            for key in search_keys:
+                candidate = history.get((scope, key))
+                if not candidate:
+                    continue
+                if int(candidate.get("seen_count") or 0) > int(best.get("seen_count") or 0):
+                    best = candidate
+        return best
+
+    preferred = choose(preferred_keys or set())
+    return preferred or choose(keys)
 
 
 def _same_cycle_window_days(frequency: str | None) -> int:
@@ -1861,6 +1876,7 @@ def get_recurring_bundle(conn, profile: str | None = None) -> dict[str, Any]:
     feedback = _active_feedback(conn, profile)
     history_totals = _spend_history_by_merchant(conn, profile)
     legacy_totals = _legacy_subscription_totals(conn, profile)
+    recent_history = _recent_history_by_merchant(conn, profile)
     items: list[dict[str, Any]] = []
     dismissed: list[dict[str, Any]] = []
     suppressed_event_keys: set[tuple[str, str]] = set()
@@ -1897,7 +1913,6 @@ def get_recurring_bundle(conn, profile: str | None = None) -> dict[str, Any]:
 
         amount = dollars(row[5])
         frequency = row[6] or "monthly"
-        annual = annualize_amount(amount, frequency)
         score = int(row[10] or 0)
         label = row[11] or confidence_label(score, row[9])
         confirmed = effective_state == "confirmed" or row[9] == "user" or label == "user"
@@ -1908,17 +1923,83 @@ def get_recurring_bundle(conn, profile: str | None = None) -> dict[str, Any]:
             evidence = {}
         status = "active" if effective_state == "confirmed" else effective_state
         cancelled = effective_state == "cancelled"
-        history = history_totals.get((profile_id, merchant_key), {})
+        lookup_keys = _history_keys_for_obligation(
+            stored_merchant_key,
+            merchant_key,
+            row[3],
+            row[16],
+            row[17],
+        )
+        direct_lookup_keys = _direct_history_keys_for_obligation(
+            stored_merchant_key,
+            merchant_key,
+            row[3],
+            row[16],
+            row[17],
+        )
+        current_history = _best_recent_history(
+            recent_history,
+            profile_id,
+            lookup_keys,
+            preferred_keys=direct_lookup_keys,
+        )
+        if current_history:
+            current_history = _summarize_current_history(
+                current_history,
+                frequency=frequency,
+                expected_amount=amount,
+            )
+        amount_review = current_history.get("amount_review") if current_history else None
+        effective_amount = amount
+        amount_basis = "stored"
+        if amount_review:
+            try:
+                suggested_amount = round(float(amount_review.get("suggested_amount") or 0), 2)
+            except (TypeError, ValueError):
+                suggested_amount = 0
+            if suggested_amount > 0:
+                effective_amount = suggested_amount
+                amount_basis = amount_review.get("basis") or "recent_history"
+        annual = annualize_amount(effective_amount, frequency)
+        display_last_charge = current_history.get("last_paid") if current_history else None
+        display_last_charge = display_last_charge or row[14]
+        display_next_expected = row[7]
+        if (
+            not display_next_expected
+            and display_last_charge
+            and effective_state in {"active", "confirmed"}
+            and not cancelled
+        ):
+            last_seen_for_next = parse_date(display_last_charge)
+            if last_seen_for_next:
+                display_next_expected = advance_recurring_date(last_seen_for_next, frequency).isoformat()
+        evidence_for_item = {
+            **evidence,
+            "last_paid": display_last_charge,
+            "amount_min": current_history.get("amount_min") if current_history else evidence.get("amount_min"),
+            "amount_max": current_history.get("amount_max") if current_history else evidence.get("amount_max"),
+            "historical_seen_count": current_history.get("historical_seen_count") if current_history else evidence.get("historical_seen_count"),
+            "current_cycle_charge_count": current_history.get("current_cycle_charge_count") if current_history else evidence.get("current_cycle_charge_count"),
+        }
+        spend_history = history_totals.get((profile_id, merchant_key), {})
         legacy = legacy_totals.get((profile_id, merchant_key), {})
-        paid_total = float(history.get("total_spent") or legacy.get("total_spent") or 0)
-        paid_count = int(history.get("charge_count") or legacy.get("charge_count") or evidence.get("occurrences") or 0)
+        paid_total = float(spend_history.get("total_spent") or legacy.get("total_spent") or 0)
+        paid_count = int(
+            spend_history.get("charge_count")
+            or legacy.get("charge_count")
+            or current_history.get("historical_seen_count")
+            or evidence.get("occurrences")
+            or 0
+        )
         item = {
             "merchant": row[3] or merchant_key,
             "clean_name": row[3] or merchant_key,
             "logo_url": None,
             "category": row[4] or "Subscriptions",
             "frequency": frequency,
-            "amount": amount,
+            "amount": effective_amount,
+            "stored_amount": amount,
+            "amount_basis": amount_basis,
             "annual_cost": round(annual, 2),
             "status": status,
             "state": effective_state,
@@ -1927,18 +2008,20 @@ def get_recurring_bundle(conn, profile: str | None = None) -> dict[str, Any]:
             "confirmed": confirmed,
             "source": row[9] or "algorithm",
             "matched_by": row[9] or "algorithm",
-            "last_charge": row[14],
-            "next_expected": row[7],
+            "last_charge": display_last_charge,
+            "next_expected": display_next_expected,
             "charge_count": paid_count,
-            "total_spent": round(paid_total or amount * paid_count, 2),
+            "total_spent": round(paid_total or effective_amount * paid_count, 2),
             "price_change": evidence.get("price_change"),
             "cancelled": cancelled,
             "profile": profile_id,
             "obligation_key": obligation_key,
             "merchant_key": merchant_key,
-            "evidence": evidence,
+            "evidence": evidence_for_item,
             "service_tag": row[16],
             "seed_name": row[17],
+            "recent_transactions": current_history.get("recent_transactions") if current_history else [],
+            "amount_review": amount_review,
         }
         items.append(item)
 
@@ -2145,7 +2228,19 @@ def get_scheduled_bundle(
             row[17],
             row[18],
         )
-        history = _best_recent_history(recent_history, profile_id, lookup_keys)
+        direct_lookup_keys = _direct_history_keys_for_obligation(
+            stored_merchant_key,
+            merchant_key,
+            row[3],
+            row[17],
+            row[18],
+        )
+        history = _best_recent_history(
+            recent_history,
+            profile_id,
+            lookup_keys,
+            preferred_keys=direct_lookup_keys,
+        )
         if history:
             history = _summarize_current_history(
                 history,

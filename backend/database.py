@@ -234,6 +234,13 @@ def init_db():
         _migrate_accounts_last_four(conn)
         _migrate_memory_entries_theme(conn)
         _migrate_mira_memory_v2_tables(conn)
+        _migrate_mira_session_summary_tables(conn)
+        _migrate_mira_financial_understanding_tables(conn)
+        _migrate_mira_financial_feedback_tables(conn)
+        _migrate_mira_stated_intent_tables(conn)
+        _migrate_mira_habit_streak_tables(conn)
+        _migrate_mira_monthly_retrospective_tables(conn)
+        _migrate_mira_money_outlook_tables(conn)
         _migrate_public_planning_tables(conn)
         _migrate_user_declared_subscription_category(conn)
         _migrate_user_declared_subscription_expected_day(conn)
@@ -854,6 +861,277 @@ def _migrate_mira_memory_v2_tables(conn: sqlite3.Connection):
     )
 
 
+def _migrate_mira_session_summary_tables(conn: sqlite3.Connection):
+    """Create the off-hot-path Mira session summary table."""
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS mira_session_summaries (
+            id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+            profile_id                  TEXT REFERENCES profiles(id),
+            scope                       TEXT NOT NULL DEFAULT 'profile' CHECK(scope IN ('profile', 'household')),
+            session_key                 TEXT NOT NULL,
+            summary_text                TEXT NOT NULL,
+            topics_json                 TEXT NOT NULL DEFAULT '[]',
+            user_goals_json             TEXT NOT NULL DEFAULT '[]',
+            unresolved_followups_json   TEXT NOT NULL DEFAULT '[]',
+            preferences_seen_json       TEXT NOT NULL DEFAULT '[]',
+            stress_signals_json         TEXT NOT NULL DEFAULT '[]',
+            evidence_refs_json          TEXT NOT NULL DEFAULT '[]',
+            source_turn_ids_json        TEXT NOT NULL DEFAULT '[]',
+            confidence                  REAL NOT NULL DEFAULT 0.75,
+            status                      TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'deleted')),
+            metadata_json               TEXT NOT NULL DEFAULT '{}',
+            created_at                  TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at                  TEXT NOT NULL DEFAULT (datetime('now')),
+            last_used_at                TEXT DEFAULT NULL,
+            UNIQUE(profile_id, session_key)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_mira_session_summaries_active
+            ON mira_session_summaries(profile_id, status, updated_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_mira_session_summaries_session_key
+            ON mira_session_summaries(profile_id, session_key);
+        """
+    )
+
+
+def _migrate_mira_financial_understanding_tables(conn: sqlite3.Connection):
+    """Create the off-hot-path Mira financial understanding read model."""
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS mira_financial_facts (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            profile_id      TEXT DEFAULT NULL,
+            fact_family     TEXT NOT NULL CHECK(fact_family IN ('lifestyle_profile', 'friction_map', 'operating_plan')),
+            kind            TEXT NOT NULL,
+            subject_type    TEXT NOT NULL CHECK(subject_type IN ('profile', 'category', 'merchant', 'subscription', 'account', 'cashflow')),
+            subject_key     TEXT NOT NULL DEFAULT '',
+            summary         TEXT NOT NULL,
+            numbers_json    TEXT NOT NULL DEFAULT '{}',
+            traits_json     TEXT NOT NULL DEFAULT '[]',
+            evidence_json   TEXT NOT NULL DEFAULT '{}',
+            confidence      TEXT NOT NULL DEFAULT 'medium' CHECK(confidence IN ('high', 'medium', 'low')),
+            sensitivity     TEXT NOT NULL DEFAULT 'low' CHECK(sensitivity IN ('low', 'medium', 'high')),
+            generated_at    TEXT NOT NULL DEFAULT (datetime('now')),
+            valid_until     TEXT DEFAULT NULL,
+            status          TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'stale', 'dismissed')),
+            fingerprint     TEXT NOT NULL,
+            UNIQUE(profile_id, fingerprint)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_mira_financial_facts_profile_status
+            ON mira_financial_facts(profile_id, status, fact_family, generated_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_mira_financial_facts_subject
+            ON mira_financial_facts(profile_id, subject_type, subject_key, status);
+        CREATE INDEX IF NOT EXISTS idx_mira_financial_facts_valid_until
+            ON mira_financial_facts(valid_until) WHERE valid_until IS NOT NULL AND status = 'active';
+
+        CREATE TABLE IF NOT EXISTS mira_financial_understanding_runs (
+            id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+            profile_id              TEXT DEFAULT NULL,
+            run_type                TEXT NOT NULL DEFAULT 'manual',
+            started_at              TEXT NOT NULL,
+            finished_at             TEXT DEFAULT NULL,
+            input_bundle_version    TEXT NOT NULL DEFAULT '',
+            fact_count              INTEGER NOT NULL DEFAULT 0,
+            rejected_count          INTEGER NOT NULL DEFAULT 0,
+            model_name              TEXT NOT NULL DEFAULT '',
+            latency_ms              REAL NOT NULL DEFAULT 0,
+            status                  TEXT NOT NULL DEFAULT 'ok',
+            error                   TEXT NOT NULL DEFAULT ''
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_mira_financial_understanding_runs_profile
+            ON mira_financial_understanding_runs(profile_id, started_at DESC);
+        """
+    )
+
+
+def _migrate_mira_financial_feedback_tables(conn: sqlite3.Connection):
+    """Create user feedback records for Mira's financial understanding layer."""
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS mira_financial_feedback (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            profile_id          TEXT DEFAULT NULL,
+            target_type         TEXT NOT NULL CHECK(target_type IN ('fact', 'insight', 'advisor_card', 'advisor_read', 'category', 'merchant', 'profile', 'cashflow', 'account')),
+            target_id           TEXT NOT NULL DEFAULT '',
+            fact_id             INTEGER DEFAULT NULL,
+            insight_id          INTEGER DEFAULT NULL,
+            subject_type        TEXT NOT NULL CHECK(subject_type IN ('profile', 'category', 'merchant', 'subscription', 'account', 'cashflow', 'advisor_read')),
+            subject_key         TEXT NOT NULL DEFAULT '',
+            feedback_type       TEXT NOT NULL CHECK(feedback_type IN ('accepted', 'dismissed', 'corrected', 'snoozed', 'too_sensitive', 'more_like_this', 'less_like_this')),
+            correction_text     TEXT NOT NULL DEFAULT '',
+            normalized_effect   TEXT NOT NULL CHECK(normalized_effect IN ('acknowledge', 'suppress', 'downrank', 'uprank', 'reframe', 'promote_to_memory', 'update_operating_preference')),
+            safe_summary        TEXT NOT NULL DEFAULT '',
+            sensitivity         TEXT NOT NULL DEFAULT 'low' CHECK(sensitivity IN ('low', 'medium', 'high')),
+            source              TEXT NOT NULL DEFAULT 'chat' CHECK(source IN ('chat', 'dashboard', 'memory_ui', 'proactive_card', 'advisor_read')),
+            metadata_json       TEXT NOT NULL DEFAULT '{}',
+            created_at          TEXT NOT NULL DEFAULT (datetime('now')),
+            expires_at          TEXT DEFAULT NULL,
+            status              TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'cleared'))
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_mira_financial_feedback_profile_created
+            ON mira_financial_feedback(profile_id, status, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_mira_financial_feedback_target
+            ON mira_financial_feedback(profile_id, target_type, target_id, status);
+        CREATE INDEX IF NOT EXISTS idx_mira_financial_feedback_subject
+            ON mira_financial_feedback(profile_id, subject_type, subject_key, status);
+        CREATE INDEX IF NOT EXISTS idx_mira_financial_feedback_effect
+            ON mira_financial_feedback(profile_id, normalized_effect, status);
+        """
+    )
+
+
+def _migrate_mira_stated_intent_tables(conn: sqlite3.Connection):
+    """Create subject-scoped stated money commitments for Mira."""
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS mira_stated_intents (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            profile_id          TEXT DEFAULT NULL,
+            memory_id           INTEGER DEFAULT NULL REFERENCES mira_memories(id),
+            subject_type        TEXT NOT NULL CHECK(subject_type IN ('merchant', 'category', 'habit', 'account', 'cashflow')),
+            subject_key         TEXT NOT NULL DEFAULT '',
+            subject_label       TEXT NOT NULL DEFAULT '',
+            intent_kind         TEXT NOT NULL CHECK(intent_kind IN ('cut', 'hold', 'grow', 'monitor', 'avoid', 'increase')),
+            baseline_scope      TEXT NOT NULL DEFAULT 'mtd_vs_prior_3_full_months',
+            target_text         TEXT NOT NULL DEFAULT '',
+            status              TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'paused', 'completed', 'dismissed')),
+            feedback_state      TEXT NOT NULL DEFAULT 'neutral' CHECK(feedback_state IN ('neutral', 'more_like_this', 'less_like_this', 'too_sensitive')),
+            last_evaluated_at   TEXT DEFAULT NULL,
+            evaluation_json     TEXT NOT NULL DEFAULT '{}',
+            created_at          TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at          TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_mira_stated_intents_profile_status
+            ON mira_stated_intents(profile_id, status, updated_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_mira_stated_intents_subject
+            ON mira_stated_intents(profile_id, subject_type, subject_key, status);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_mira_stated_intents_memory
+            ON mira_stated_intents(profile_id, memory_id)
+            WHERE memory_id IS NOT NULL;
+        """
+    )
+
+
+def _migrate_mira_habit_streak_tables(conn: sqlite3.Connection):
+    """Create deterministic positive habit streak facts for Mira."""
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS mira_habit_streaks (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            profile_id          TEXT DEFAULT NULL,
+            subject_type        TEXT NOT NULL CHECK(subject_type IN ('category', 'merchant', 'cashflow', 'habit')),
+            subject_key         TEXT NOT NULL DEFAULT '',
+            subject_label       TEXT NOT NULL DEFAULT '',
+            streak_kind         TEXT NOT NULL CHECK(streak_kind IN ('under_envelope', 'lower_frequency', 'higher_savings', 'on_time_bill', 'lower_variance')),
+            streak_length       INTEGER NOT NULL DEFAULT 0,
+            current_value_json  TEXT NOT NULL DEFAULT '{}',
+            baseline_json       TEXT NOT NULL DEFAULT '{}',
+            summary             TEXT NOT NULL DEFAULT '',
+            confidence          TEXT NOT NULL DEFAULT 'medium' CHECK(confidence IN ('high', 'medium', 'low')),
+            sensitivity         TEXT NOT NULL DEFAULT 'low' CHECK(sensitivity IN ('low', 'medium', 'high')),
+            generated_at        TEXT NOT NULL,
+            valid_until         TEXT NOT NULL,
+            status              TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'stale', 'dismissed')),
+            fingerprint         TEXT NOT NULL,
+            UNIQUE(profile_id, fingerprint)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_mira_habit_streaks_profile_status
+            ON mira_habit_streaks(profile_id, status, generated_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_mira_habit_streaks_subject
+            ON mira_habit_streaks(profile_id, subject_type, subject_key, status);
+        CREATE INDEX IF NOT EXISTS idx_mira_habit_streaks_valid_until
+            ON mira_habit_streaks(valid_until);
+        """
+    )
+
+
+def _migrate_mira_monthly_retrospective_tables(conn: sqlite3.Connection):
+    """Create closed-month retrospective diary entries for Mira."""
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS mira_monthly_retrospectives (
+            id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+            profile_id                  TEXT DEFAULT NULL,
+            month_key                   TEXT NOT NULL,
+            summary                     TEXT NOT NULL DEFAULT '',
+            wins_json                   TEXT NOT NULL DEFAULT '[]',
+            friction_json               TEXT NOT NULL DEFAULT '[]',
+            improvement_themes_json     TEXT NOT NULL DEFAULT '[]',
+            evidence_json               TEXT NOT NULL DEFAULT '{}',
+            confidence                  TEXT NOT NULL DEFAULT 'medium' CHECK(confidence IN ('high', 'medium', 'low')),
+            generated_at                TEXT NOT NULL,
+            status                      TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'dismissed', 'stale')),
+            fingerprint                 TEXT NOT NULL,
+            UNIQUE(profile_id, month_key)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_mira_monthly_retrospectives_profile_month
+            ON mira_monthly_retrospectives(profile_id, month_key DESC);
+        CREATE INDEX IF NOT EXISTS idx_mira_monthly_retrospectives_status
+            ON mira_monthly_retrospectives(profile_id, status, generated_at DESC);
+        """
+    )
+
+
+def _migrate_mira_money_outlook_tables(conn: sqlite3.Connection):
+    """Create cached deterministic money-outlook projections for Mira."""
+    def add_column_if_missing(column: str, ddl: str) -> None:
+        cols = [row[1] for row in conn.execute("PRAGMA table_info(mira_outlook_snapshots)").fetchall()]
+        if column not in cols:
+            conn.execute(f"ALTER TABLE mira_outlook_snapshots ADD COLUMN {column} {ddl}")
+
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS mira_outlook_snapshots (
+            id                                      INTEGER PRIMARY KEY AUTOINCREMENT,
+            profile_id                              TEXT DEFAULT NULL,
+            generated_at                            TEXT NOT NULL,
+            valid_until                             TEXT NOT NULL,
+            month_key                               TEXT NOT NULL,
+            projected_end_balance                   REAL DEFAULT NULL,
+            projected_income_remaining              REAL NOT NULL DEFAULT 0,
+            projected_obligations_remaining         REAL NOT NULL DEFAULT 0,
+            projected_flexible_spend_remaining      REAL NOT NULL DEFAULT 0,
+            projected_savings_delta                 REAL DEFAULT NULL,
+            target_savings_amount                   REAL NOT NULL DEFAULT 0,
+            safe_to_spend_today                     REAL DEFAULT NULL,
+            safe_to_spend_this_week                 REAL DEFAULT NULL,
+            buffer_amount                           REAL DEFAULT NULL,
+            buffer_status                           TEXT NOT NULL DEFAULT 'unknown',
+            low_point_date                          TEXT DEFAULT NULL,
+            low_point_amount                        REAL DEFAULT NULL,
+            buffer_breach                           INTEGER NOT NULL DEFAULT 0,
+            low_point_drivers_json                  TEXT NOT NULL DEFAULT '[]',
+            confidence                              TEXT NOT NULL DEFAULT 'medium' CHECK(confidence IN ('high', 'medium', 'low')),
+            drivers_json                            TEXT NOT NULL DEFAULT '[]',
+            caveats_json                            TEXT NOT NULL DEFAULT '[]',
+            evidence_json                           TEXT NOT NULL DEFAULT '{}',
+            fingerprint                             TEXT NOT NULL,
+            UNIQUE(profile_id, month_key, fingerprint)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_mira_outlook_snapshots_profile_month
+            ON mira_outlook_snapshots(profile_id, month_key, generated_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_mira_outlook_snapshots_valid_until
+            ON mira_outlook_snapshots(valid_until);
+        """
+    )
+    add_column_if_missing("safe_to_spend_today", "REAL DEFAULT NULL")
+    add_column_if_missing("safe_to_spend_this_week", "REAL DEFAULT NULL")
+    add_column_if_missing("buffer_amount", "REAL DEFAULT NULL")
+    add_column_if_missing("buffer_status", "TEXT NOT NULL DEFAULT 'unknown'")
+    add_column_if_missing("low_point_date", "TEXT DEFAULT NULL")
+    add_column_if_missing("low_point_amount", "REAL DEFAULT NULL")
+    add_column_if_missing("buffer_breach", "INTEGER NOT NULL DEFAULT 0")
+    add_column_if_missing("low_point_drivers_json", "TEXT NOT NULL DEFAULT '[]'")
+
+
 def _migrate_public_planning_tables(conn: sqlite3.Connection):
     """Add public-release planning, ledger metadata, split, and manual account support."""
     tx_cols = [row[1] for row in conn.execute("PRAGMA table_info(transactions)").fetchall()]
@@ -877,6 +1155,8 @@ def _migrate_public_planning_tables(conn: sqlite3.Connection):
         conn.execute("ALTER TABLE accounts ADD COLUMN manual_updated_at TEXT DEFAULT NULL")
     if account_cols and "manual_notes" not in account_cols:
         conn.execute("ALTER TABLE accounts ADD COLUMN manual_notes TEXT DEFAULT ''")
+    if account_cols and "usual_due_day" not in account_cols:
+        conn.execute("ALTER TABLE accounts ADD COLUMN usual_due_day INTEGER DEFAULT NULL")
 
     conn.executescript(
         """
@@ -1081,7 +1361,7 @@ def _migrate_transaction_intelligence_tables(conn: sqlite3.Connection):
             evidence_json               TEXT NOT NULL DEFAULT '{}',
             source                      TEXT NOT NULL DEFAULT 'rules',
             method                      TEXT NOT NULL DEFAULT 'deterministic',
-            model_version               TEXT NOT NULL DEFAULT 'transaction_enrichment_rules_v1',
+            model_version               TEXT NOT NULL DEFAULT 'transaction_enrichment_rules_v2',
             taxonomy_version            TEXT NOT NULL DEFAULT 'folio_taxonomy_v1',
             user_reviewed               INTEGER NOT NULL DEFAULT 0,
             created_at                  TEXT NOT NULL DEFAULT (datetime('now')),
@@ -1349,6 +1629,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     account_subtype     TEXT DEFAULT '',
     current_balance     REAL DEFAULT 0.0,
     available_balance   REAL DEFAULT 0.0,
+    usual_due_day       INTEGER DEFAULT NULL,
     currency            TEXT DEFAULT 'USD',
     last_synced_at      TEXT,
     is_active           INTEGER DEFAULT 1,
@@ -1429,7 +1710,7 @@ CREATE TABLE IF NOT EXISTS transaction_enrichment (
     evidence_json               TEXT NOT NULL DEFAULT '{}',
     source                      TEXT NOT NULL DEFAULT 'rules',
     method                      TEXT NOT NULL DEFAULT 'deterministic',
-    model_version               TEXT NOT NULL DEFAULT 'transaction_enrichment_rules_v1',
+    model_version               TEXT NOT NULL DEFAULT 'transaction_enrichment_rules_v2',
     taxonomy_version            TEXT NOT NULL DEFAULT 'folio_taxonomy_v1',
     user_reviewed               INTEGER NOT NULL DEFAULT 0,
     created_at                  TEXT NOT NULL DEFAULT (datetime('now')),
@@ -1676,6 +1957,207 @@ CREATE INDEX IF NOT EXISTS idx_mira_memory_events_memory
     ON mira_memory_events(memory_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_mira_memory_events_profile
     ON mira_memory_events(profile_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS mira_session_summaries (
+    id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+    profile_id                  TEXT REFERENCES profiles(id),
+    scope                       TEXT NOT NULL DEFAULT 'profile' CHECK(scope IN ('profile', 'household')),
+    session_key                 TEXT NOT NULL,
+    summary_text                TEXT NOT NULL,
+    topics_json                 TEXT NOT NULL DEFAULT '[]',
+    user_goals_json             TEXT NOT NULL DEFAULT '[]',
+    unresolved_followups_json   TEXT NOT NULL DEFAULT '[]',
+    preferences_seen_json       TEXT NOT NULL DEFAULT '[]',
+    stress_signals_json         TEXT NOT NULL DEFAULT '[]',
+    evidence_refs_json          TEXT NOT NULL DEFAULT '[]',
+    source_turn_ids_json        TEXT NOT NULL DEFAULT '[]',
+    confidence                  REAL NOT NULL DEFAULT 0.75,
+    status                      TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'deleted')),
+    metadata_json               TEXT NOT NULL DEFAULT '{}',
+    created_at                  TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at                  TEXT NOT NULL DEFAULT (datetime('now')),
+    last_used_at                TEXT DEFAULT NULL,
+    UNIQUE(profile_id, session_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_mira_session_summaries_active
+    ON mira_session_summaries(profile_id, status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_mira_session_summaries_session_key
+    ON mira_session_summaries(profile_id, session_key);
+
+CREATE TABLE IF NOT EXISTS mira_financial_facts (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    profile_id      TEXT DEFAULT NULL,
+    fact_family     TEXT NOT NULL CHECK(fact_family IN ('lifestyle_profile', 'friction_map', 'operating_plan')),
+    kind            TEXT NOT NULL,
+    subject_type    TEXT NOT NULL CHECK(subject_type IN ('profile', 'category', 'merchant', 'subscription', 'account', 'cashflow')),
+    subject_key     TEXT NOT NULL DEFAULT '',
+    summary         TEXT NOT NULL,
+    numbers_json    TEXT NOT NULL DEFAULT '{}',
+    traits_json     TEXT NOT NULL DEFAULT '[]',
+    evidence_json   TEXT NOT NULL DEFAULT '{}',
+    confidence      TEXT NOT NULL DEFAULT 'medium' CHECK(confidence IN ('high', 'medium', 'low')),
+    sensitivity     TEXT NOT NULL DEFAULT 'low' CHECK(sensitivity IN ('low', 'medium', 'high')),
+    generated_at    TEXT NOT NULL DEFAULT (datetime('now')),
+    valid_until     TEXT DEFAULT NULL,
+    status          TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'stale', 'dismissed')),
+    fingerprint     TEXT NOT NULL,
+    UNIQUE(profile_id, fingerprint)
+);
+
+CREATE INDEX IF NOT EXISTS idx_mira_financial_facts_profile_status
+    ON mira_financial_facts(profile_id, status, fact_family, generated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_mira_financial_facts_subject
+    ON mira_financial_facts(profile_id, subject_type, subject_key, status);
+CREATE INDEX IF NOT EXISTS idx_mira_financial_facts_valid_until
+    ON mira_financial_facts(valid_until) WHERE valid_until IS NOT NULL AND status = 'active';
+
+CREATE TABLE IF NOT EXISTS mira_financial_understanding_runs (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    profile_id              TEXT DEFAULT NULL,
+    run_type                TEXT NOT NULL DEFAULT 'manual',
+    started_at              TEXT NOT NULL,
+    finished_at             TEXT DEFAULT NULL,
+    input_bundle_version    TEXT NOT NULL DEFAULT '',
+    fact_count              INTEGER NOT NULL DEFAULT 0,
+    rejected_count          INTEGER NOT NULL DEFAULT 0,
+    model_name              TEXT NOT NULL DEFAULT '',
+    latency_ms              REAL NOT NULL DEFAULT 0,
+    status                  TEXT NOT NULL DEFAULT 'ok',
+    error                   TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_mira_financial_understanding_runs_profile
+    ON mira_financial_understanding_runs(profile_id, started_at DESC);
+
+CREATE TABLE IF NOT EXISTS mira_financial_feedback (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    profile_id          TEXT DEFAULT NULL,
+    target_type         TEXT NOT NULL CHECK(target_type IN ('fact', 'insight', 'advisor_card', 'advisor_read', 'category', 'merchant', 'profile', 'cashflow', 'account')),
+    target_id           TEXT NOT NULL DEFAULT '',
+    fact_id             INTEGER DEFAULT NULL,
+    insight_id          INTEGER DEFAULT NULL,
+    subject_type        TEXT NOT NULL CHECK(subject_type IN ('profile', 'category', 'merchant', 'subscription', 'account', 'cashflow', 'advisor_read')),
+    subject_key         TEXT NOT NULL DEFAULT '',
+    feedback_type       TEXT NOT NULL CHECK(feedback_type IN ('accepted', 'dismissed', 'corrected', 'snoozed', 'too_sensitive', 'more_like_this', 'less_like_this')),
+    correction_text     TEXT NOT NULL DEFAULT '',
+    normalized_effect   TEXT NOT NULL CHECK(normalized_effect IN ('acknowledge', 'suppress', 'downrank', 'uprank', 'reframe', 'promote_to_memory', 'update_operating_preference')),
+    safe_summary        TEXT NOT NULL DEFAULT '',
+    sensitivity         TEXT NOT NULL DEFAULT 'low' CHECK(sensitivity IN ('low', 'medium', 'high')),
+    source              TEXT NOT NULL DEFAULT 'chat' CHECK(source IN ('chat', 'dashboard', 'memory_ui', 'proactive_card', 'advisor_read')),
+    metadata_json       TEXT NOT NULL DEFAULT '{}',
+    created_at          TEXT NOT NULL DEFAULT (datetime('now')),
+    expires_at          TEXT DEFAULT NULL,
+    status              TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'cleared'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_mira_financial_feedback_profile_created
+    ON mira_financial_feedback(profile_id, status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_mira_financial_feedback_target
+    ON mira_financial_feedback(profile_id, target_type, target_id, status);
+CREATE INDEX IF NOT EXISTS idx_mira_financial_feedback_subject
+    ON mira_financial_feedback(profile_id, subject_type, subject_key, status);
+CREATE INDEX IF NOT EXISTS idx_mira_financial_feedback_effect
+    ON mira_financial_feedback(profile_id, normalized_effect, status);
+
+CREATE TABLE IF NOT EXISTS mira_stated_intents (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    profile_id          TEXT DEFAULT NULL,
+    memory_id           INTEGER DEFAULT NULL REFERENCES mira_memories(id),
+    subject_type        TEXT NOT NULL CHECK(subject_type IN ('merchant', 'category', 'habit', 'account', 'cashflow')),
+    subject_key         TEXT NOT NULL DEFAULT '',
+    subject_label       TEXT NOT NULL DEFAULT '',
+    intent_kind         TEXT NOT NULL CHECK(intent_kind IN ('cut', 'hold', 'grow', 'monitor', 'avoid', 'increase')),
+    baseline_scope      TEXT NOT NULL DEFAULT 'mtd_vs_prior_3_full_months',
+    target_text         TEXT NOT NULL DEFAULT '',
+    status              TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'paused', 'completed', 'dismissed')),
+    feedback_state      TEXT NOT NULL DEFAULT 'neutral' CHECK(feedback_state IN ('neutral', 'more_like_this', 'less_like_this', 'too_sensitive')),
+    last_evaluated_at   TEXT DEFAULT NULL,
+    evaluation_json     TEXT NOT NULL DEFAULT '{}',
+    created_at          TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at          TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_mira_stated_intents_profile_status
+    ON mira_stated_intents(profile_id, status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_mira_stated_intents_subject
+    ON mira_stated_intents(profile_id, subject_type, subject_key, status);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_mira_stated_intents_memory
+    ON mira_stated_intents(profile_id, memory_id)
+    WHERE memory_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS mira_habit_streaks (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    profile_id          TEXT DEFAULT NULL,
+    subject_type        TEXT NOT NULL CHECK(subject_type IN ('category', 'merchant', 'cashflow', 'habit')),
+    subject_key         TEXT NOT NULL DEFAULT '',
+    subject_label       TEXT NOT NULL DEFAULT '',
+    streak_kind         TEXT NOT NULL CHECK(streak_kind IN ('under_envelope', 'lower_frequency', 'higher_savings', 'on_time_bill', 'lower_variance')),
+    streak_length       INTEGER NOT NULL DEFAULT 0,
+    current_value_json  TEXT NOT NULL DEFAULT '{}',
+    baseline_json       TEXT NOT NULL DEFAULT '{}',
+    summary             TEXT NOT NULL DEFAULT '',
+    confidence          TEXT NOT NULL DEFAULT 'medium' CHECK(confidence IN ('high', 'medium', 'low')),
+    sensitivity         TEXT NOT NULL DEFAULT 'low' CHECK(sensitivity IN ('low', 'medium', 'high')),
+    generated_at        TEXT NOT NULL,
+    valid_until         TEXT NOT NULL,
+    status              TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'stale', 'dismissed')),
+    fingerprint         TEXT NOT NULL,
+    UNIQUE(profile_id, fingerprint)
+);
+
+CREATE INDEX IF NOT EXISTS idx_mira_habit_streaks_profile_status
+    ON mira_habit_streaks(profile_id, status, generated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_mira_habit_streaks_subject
+    ON mira_habit_streaks(profile_id, subject_type, subject_key, status);
+CREATE INDEX IF NOT EXISTS idx_mira_habit_streaks_valid_until
+    ON mira_habit_streaks(valid_until);
+
+CREATE TABLE IF NOT EXISTS mira_monthly_retrospectives (
+    id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+    profile_id                  TEXT DEFAULT NULL,
+    month_key                   TEXT NOT NULL,
+    summary                     TEXT NOT NULL DEFAULT '',
+    wins_json                   TEXT NOT NULL DEFAULT '[]',
+    friction_json               TEXT NOT NULL DEFAULT '[]',
+    improvement_themes_json     TEXT NOT NULL DEFAULT '[]',
+    evidence_json               TEXT NOT NULL DEFAULT '{}',
+    confidence                  TEXT NOT NULL DEFAULT 'medium' CHECK(confidence IN ('high', 'medium', 'low')),
+    generated_at                TEXT NOT NULL,
+    status                      TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'dismissed', 'stale')),
+    fingerprint                 TEXT NOT NULL,
+    UNIQUE(profile_id, month_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_mira_monthly_retrospectives_profile_month
+    ON mira_monthly_retrospectives(profile_id, month_key DESC);
+CREATE INDEX IF NOT EXISTS idx_mira_monthly_retrospectives_status
+    ON mira_monthly_retrospectives(profile_id, status, generated_at DESC);
+
+CREATE TABLE IF NOT EXISTS mira_outlook_snapshots (
+    id                                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    profile_id                              TEXT DEFAULT NULL,
+    generated_at                            TEXT NOT NULL,
+    valid_until                             TEXT NOT NULL,
+    month_key                               TEXT NOT NULL,
+    projected_end_balance                   REAL DEFAULT NULL,
+    projected_income_remaining              REAL NOT NULL DEFAULT 0,
+    projected_obligations_remaining         REAL NOT NULL DEFAULT 0,
+    projected_flexible_spend_remaining      REAL NOT NULL DEFAULT 0,
+    projected_savings_delta                 REAL DEFAULT NULL,
+    target_savings_amount                   REAL NOT NULL DEFAULT 0,
+    confidence                              TEXT NOT NULL DEFAULT 'medium' CHECK(confidence IN ('high', 'medium', 'low')),
+    drivers_json                            TEXT NOT NULL DEFAULT '[]',
+    caveats_json                            TEXT NOT NULL DEFAULT '[]',
+    evidence_json                           TEXT NOT NULL DEFAULT '{}',
+    fingerprint                             TEXT NOT NULL,
+    UNIQUE(profile_id, month_key, fingerprint)
+);
+
+CREATE INDEX IF NOT EXISTS idx_mira_outlook_snapshots_profile_month
+    ON mira_outlook_snapshots(profile_id, month_key, generated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_mira_outlook_snapshots_valid_until
+    ON mira_outlook_snapshots(valid_until);
 
 CREATE TABLE IF NOT EXISTS subscription_seeds (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,

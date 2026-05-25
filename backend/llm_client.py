@@ -4,8 +4,10 @@ Local LLM client for Ollama-backed categorization, Mira, and receipt parsing.
 """
 
 import base64
+import contextvars
 import json as _json
 import os
+import time
 import httpx
 from dotenv import load_dotenv
 from log_config import get_logger
@@ -15,14 +17,105 @@ load_dotenv()
 
 logger = get_logger(__name__)
 
+_LLM_CALL_TRACE = contextvars.ContextVar("llm_call_trace", default=None)
+
+
+def start_trace():
+    """Start request-scoped LLM telemetry collection.
+
+    The trace deliberately stores timings and token counts only, never prompt
+    text or model output text.
+    """
+
+    return _LLM_CALL_TRACE.set([])
+
+
+def finish_trace(token) -> list[dict]:
+    calls = current_trace_calls()
+    try:
+        _LLM_CALL_TRACE.reset(token)
+    except ValueError:
+        # Starlette may advance/close sync streaming generators from different
+        # worker contexts. Keep telemetry best-effort and never surface context
+        # bookkeeping errors to the user after an answer has already streamed.
+        _LLM_CALL_TRACE.set(None)
+    return calls
+
+
+def current_trace_calls() -> list[dict]:
+    calls = _LLM_CALL_TRACE.get()
+    return list(calls) if isinstance(calls, list) else []
+
+
+def _record_llm_call(record: dict) -> None:
+    calls = _LLM_CALL_TRACE.get()
+    if isinstance(calls, list):
+        calls.append(record)
+
+
+def _ns_to_ms(value) -> float | None:
+    try:
+        return round(float(value) / 1_000_000, 2)
+    except (TypeError, ValueError):
+        return None
+
+
+def _messages_char_count(messages: list[dict] | None, system: str | None = None) -> int:
+    total = len(system or "")
+    for msg in messages or []:
+        if not isinstance(msg, dict):
+            continue
+        total += len(str(msg.get("content") or ""))
+    return total
+
+
+def _ollama_timing_record(
+    *,
+    purpose: str,
+    model: str,
+    stream: bool,
+    messages: list[dict] | None,
+    system: str | None = None,
+    max_tokens: int | None = None,
+    started: float,
+    first_token_ms: float | None = None,
+    output_chars: int = 0,
+    final_event: dict | None = None,
+    error: str | None = None,
+    think: bool | None = None,
+) -> dict:
+    event = final_event or {}
+    return {
+        "provider": "ollama",
+        "purpose": purpose,
+        "model": model,
+        "stream": bool(stream),
+        "max_tokens": max_tokens,
+        "prompt_chars": _messages_char_count(messages, system),
+        "output_chars": int(output_chars or 0),
+        "first_token_ms": round(first_token_ms, 2) if first_token_ms is not None else None,
+        "wall_ms": round((time.perf_counter() - started) * 1000, 2),
+        "load_duration_ms": _ns_to_ms(event.get("load_duration")),
+        "prompt_eval_duration_ms": _ns_to_ms(event.get("prompt_eval_duration")),
+        "eval_duration_ms": _ns_to_ms(event.get("eval_duration")),
+        "total_duration_ms": _ns_to_ms(event.get("total_duration")),
+        "prompt_eval_count": event.get("prompt_eval_count"),
+        "eval_count": event.get("eval_count"),
+        "done_reason": event.get("done_reason"),
+        "think": think,
+        "error": error or None,
+    }
+
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "ollama").strip().lower() or "ollama"
+_TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
 
 # Ollama settings
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://host.docker.internal:11434")
 OLLAMA_MODEL_CATEGORIZE = os.getenv("OLLAMA_MODEL_CATEGORIZE", "gemma4:e4b")
 OLLAMA_MODEL_CONTROLLER = os.getenv("OLLAMA_MODEL_CONTROLLER", OLLAMA_MODEL_CATEGORIZE)
-OLLAMA_MODEL_COPILOT = os.getenv("OLLAMA_MODEL_COPILOT", "gemma4:26b")
+OLLAMA_MODEL_COPILOT = os.getenv("OLLAMA_MODEL_COPILOT", "gemma4:e4b")
 OLLAMA_MODEL_RECEIPT = os.getenv("OLLAMA_MODEL_RECEIPT", "gemma4:e4b")
+OLLAMA_MODEL_ADVISOR = os.getenv("MIRA_ADVISOR_LENS_MODEL", os.getenv("OLLAMA_MODEL_ADVISOR", "gemma4:e4b"))
 LLAMACPP_BASE_URL = os.getenv("LLAMACPP_BASE_URL", "http://host.docker.internal:8081")
 LLAMACPP_MODEL = os.getenv("LLAMACPP_MODEL", "local")
 LLAMACPP_TIMEOUT = float(os.getenv("LLAMACPP_TIMEOUT", os.getenv("OLLAMA_TIMEOUT_COPILOT", "240")))
@@ -36,6 +129,7 @@ LLAMACPP_THINK = os.getenv("LLAMACPP_THINK", "false").strip().lower() in {"1", "
 _OLLAMA_TIMEOUT_CATEGORIZE = float(os.getenv("OLLAMA_TIMEOUT_CATEGORIZE", "600"))  # 10 min
 _OLLAMA_TIMEOUT_CONTROLLER = float(os.getenv("OLLAMA_TIMEOUT_CONTROLLER", "90"))    # 1.5 min
 _OLLAMA_TIMEOUT_COPILOT = float(os.getenv("OLLAMA_TIMEOUT_COPILOT", "240"))        # 4 min
+_OLLAMA_TIMEOUT_ADVISOR = float(os.getenv("MIRA_ADVISOR_LENS_TIMEOUT", os.getenv("OLLAMA_TIMEOUT_ADVISOR", "600")))
 _OLLAMA_CONTROLLER_KEEP_ALIVE = os.getenv(
     "OLLAMA_CONTROLLER_KEEP_ALIVE",
     os.getenv("OLLAMA_PREWARM_KEEP_ALIVE", "15m"),
@@ -44,6 +138,8 @@ _OLLAMA_COPILOT_KEEP_ALIVE = os.getenv(
     "OLLAMA_COPILOT_KEEP_ALIVE",
     os.getenv("OLLAMA_PREWARM_KEEP_ALIVE", "15m"),
 ).strip() or "15m"
+_OLLAMA_ADVISOR_KEEP_ALIVE = os.getenv("MIRA_ADVISOR_LENS_KEEP_ALIVE", os.getenv("OLLAMA_ADVISOR_KEEP_ALIVE", "2m")).strip() or "2m"
+_OLLAMA_ADVISOR_THINK = os.getenv("MIRA_ADVISOR_LENS_THINK", "0").strip().lower() in _TRUE_ENV_VALUES
 
 
 def is_available() -> bool:
@@ -70,6 +166,7 @@ def get_ollama_config() -> dict:
             "categorize_model": OLLAMA_MODEL_CATEGORIZE,
             "controller_model": OLLAMA_MODEL_CONTROLLER,
             "copilot_model": OLLAMA_MODEL_COPILOT,
+            "advisor_model": OLLAMA_MODEL_ADVISOR,
         }
 
 
@@ -92,6 +189,8 @@ def _model_for_purpose(ollama_config: dict, purpose: str) -> str:
             or ollama_config.get("categorize_model")
             or OLLAMA_MODEL_CONTROLLER
         )
+    if purpose == "advisor":
+        return ollama_config.get("advisor_model") or OLLAMA_MODEL_ADVISOR
     return ollama_config.get("copilot_model") or OLLAMA_MODEL_COPILOT
 
 
@@ -100,12 +199,16 @@ def _timeout_for_purpose(purpose: str) -> float:
         return _OLLAMA_TIMEOUT_CATEGORIZE
     if purpose == "controller":
         return _OLLAMA_TIMEOUT_CONTROLLER
+    if purpose == "advisor":
+        return _OLLAMA_TIMEOUT_ADVISOR
     return _OLLAMA_TIMEOUT_COPILOT
 
 
 def _keep_alive_for_purpose(purpose: str) -> str | None:
     if purpose == "controller":
         return _OLLAMA_CONTROLLER_KEEP_ALIVE
+    if purpose == "advisor":
+        return _OLLAMA_ADVISOR_KEEP_ALIVE
     if purpose == "copilot":
         return _OLLAMA_COPILOT_KEEP_ALIVE
     return None
@@ -123,7 +226,7 @@ def complete(
     Args:
         prompt:     The user message content.
         max_tokens: Maximum tokens to generate.
-        purpose:    "categorize", "controller", or "copilot" selects the local Ollama model.
+        purpose:    "categorize", "controller", "copilot", or "advisor" selects the local Ollama model.
 
     Returns:
         Stripped response text from the model.
@@ -246,11 +349,27 @@ def _chat_with_tools_ollama(
         payload["tools"] = ollama_tools
 
     url = f"{ollama_config['base_url'].rstrip('/')}/api/chat"
-    resp = httpx.post(url, json=payload, timeout=timeout)
-    result = resp.json()
-    if "message" not in result:
-        raise Exception(f"Ollama tool API error: {result}")
-    message = result["message"]
+    started = time.perf_counter()
+    result = {}
+    try:
+        resp = httpx.post(url, json=payload, timeout=timeout)
+        result = resp.json()
+        if "message" not in result:
+            raise Exception(f"Ollama tool API error: {result}")
+        message = result["message"]
+    except Exception as exc:
+        _record_llm_call(_ollama_timing_record(
+            purpose=purpose,
+            model=model,
+            stream=False,
+            messages=messages,
+            system=system,
+            max_tokens=max_tokens,
+            started=started,
+            final_event=result if isinstance(result, dict) else {},
+            error=str(exc),
+        ))
+        raise
 
     tool_calls = []
     for idx, call in enumerate(message.get("tool_calls") or []):
@@ -267,8 +386,20 @@ def _chat_with_tools_ollama(
             "args": args,
         })
 
+    content = (message.get("content") or "").strip()
+    _record_llm_call(_ollama_timing_record(
+        purpose=purpose,
+        model=model,
+        stream=False,
+        messages=messages,
+        system=system,
+        max_tokens=max_tokens,
+        started=started,
+        output_chars=len(content),
+        final_event=result,
+    ))
     return {
-        "content": (message.get("content") or "").strip(),
+        "content": content,
         "tool_calls": tool_calls,
         "stop_reason": result.get("done_reason") or "stop",
     }
@@ -342,36 +473,92 @@ def _chat_with_tools_stream_ollama(messages, tools, system, max_tokens, purpose)
         payload["tools"] = ollama_tools
 
     url = f"{ollama_config['base_url'].rstrip('/')}/api/chat"
-    with httpx.stream("POST", url, json=payload, timeout=timeout) as resp:
-        call_idx = 0
-        for raw_line in resp.iter_lines():
-            line = raw_line.strip()
-            if not line:
-                continue
-            try:
-                event = _json.loads(line)
-            except Exception:
-                continue
-            message = event.get("message") or {}
-            content = message.get("content")
-            if content:
-                yield ("text", content)
-            for call in message.get("tool_calls") or []:
-                fn = call.get("function") or {}
-                args = fn.get("arguments") or {}
-                if isinstance(args, str):
-                    try:
-                        args = _json.loads(args)
-                    except Exception:
-                        args = {}
-                yield ("tool_call", {
-                    "id": call.get("id") or f"call_{call_idx}",
-                    "name": fn.get("name") or "",
-                    "args": args,
-                })
-                call_idx += 1
-            if event.get("done"):
-                yield ("stop", event.get("done_reason") or "stop")
+    started = time.perf_counter()
+    first_token_ms = None
+    output_chars = 0
+    final_event = {}
+    recorded = False
+    try:
+        with httpx.stream("POST", url, json=payload, timeout=timeout) as resp:
+            call_idx = 0
+            for raw_line in resp.iter_lines():
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    event = _json.loads(line)
+                except Exception:
+                    continue
+                message = event.get("message") or {}
+                content = message.get("content")
+                if content:
+                    if first_token_ms is None:
+                        first_token_ms = (time.perf_counter() - started) * 1000
+                    output_chars += len(content)
+                    yield ("text", content)
+                for call in message.get("tool_calls") or []:
+                    if first_token_ms is None:
+                        first_token_ms = (time.perf_counter() - started) * 1000
+                    fn = call.get("function") or {}
+                    args = fn.get("arguments") or {}
+                    if isinstance(args, str):
+                        try:
+                            args = _json.loads(args)
+                        except Exception:
+                            args = {}
+                    yield ("tool_call", {
+                        "id": call.get("id") or f"call_{call_idx}",
+                        "name": fn.get("name") or "",
+                        "args": args,
+                    })
+                    call_idx += 1
+                if event.get("done"):
+                    final_event = event
+                    _record_llm_call(_ollama_timing_record(
+                        purpose=purpose,
+                        model=model,
+                        stream=True,
+                        messages=messages,
+                        system=system,
+                        max_tokens=max_tokens,
+                        started=started,
+                        first_token_ms=first_token_ms,
+                        output_chars=output_chars,
+                        final_event=final_event,
+                    ))
+                    recorded = True
+                    yield ("stop", event.get("done_reason") or "stop")
+    except Exception as exc:
+        _record_llm_call(_ollama_timing_record(
+            purpose=purpose,
+            model=model,
+            stream=True,
+            messages=messages,
+            system=system,
+            max_tokens=max_tokens,
+            started=started,
+            first_token_ms=first_token_ms,
+            output_chars=output_chars,
+            final_event=final_event,
+            error=str(exc),
+        ))
+        recorded = True
+        raise
+    finally:
+        if not recorded and _LLM_CALL_TRACE.get() is not None:
+            _record_llm_call(_ollama_timing_record(
+                purpose=purpose,
+                model=model,
+                stream=True,
+                messages=messages,
+                system=system,
+                max_tokens=max_tokens,
+                started=started,
+                first_token_ms=first_token_ms,
+                output_chars=output_chars,
+                final_event=final_event,
+                error="stream_closed_before_done",
+            ))
 
 
 def _messages_for_openai(messages: list[dict], system: str | None) -> list[dict]:
@@ -592,9 +779,10 @@ def _complete_ollama(prompt: str, max_tokens: int, purpose: str, response_format
     model = _model_for_purpose(ollama_config, purpose)
     timeout = _timeout_for_purpose(purpose)
     url = f"{ollama_config['base_url'].rstrip('/')}/api/chat"
+    messages = [{"role": "user", "content": prompt}]
     payload = {
         "model": model,
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": messages,
         "stream": False,
         "options": {"num_predict": max_tokens},
     }
@@ -610,16 +798,47 @@ def _complete_ollama(prompt: str, max_tokens: int, purpose: str, response_format
         # and randomness for faster, steadier output.
         payload["think"] = False
         payload["options"]["temperature"] = 0
+    elif purpose == "advisor":
+        payload["think"] = _OLLAMA_ADVISOR_THINK
+        payload["options"]["temperature"] = 0
 
-    resp = httpx.post(
-        url,
-        json=payload,
-        timeout=timeout,
-    )
-    result = resp.json()
-    if "message" not in result:
-        raise Exception(f"Ollama API error: {result}")
-    return result["message"]["content"].strip()
+    started = time.perf_counter()
+    result = {}
+    try:
+        resp = httpx.post(
+            url,
+            json=payload,
+            timeout=timeout,
+        )
+        result = resp.json()
+        if "message" not in result:
+            raise Exception(f"Ollama API error: {result}")
+        content = result["message"]["content"].strip()
+        _record_llm_call(_ollama_timing_record(
+            purpose=purpose,
+            model=model,
+            stream=False,
+            messages=messages,
+            max_tokens=max_tokens,
+            started=started,
+            output_chars=len(content),
+            final_event=result,
+            think=payload.get("think"),
+        ))
+        return content
+    except Exception as exc:
+        _record_llm_call(_ollama_timing_record(
+            purpose=purpose,
+            model=model,
+            stream=False,
+            messages=messages,
+            max_tokens=max_tokens,
+            started=started,
+            final_event=result if isinstance(result, dict) else {},
+            error=str(exc),
+            think=payload.get("think"),
+        ))
+        raise
 
 
 def _complete_stream_ollama(prompt: str, max_tokens: int, purpose: str):
@@ -627,9 +846,10 @@ def _complete_stream_ollama(prompt: str, max_tokens: int, purpose: str):
     model = _model_for_purpose(ollama_config, purpose)
     timeout = _timeout_for_purpose(purpose)
     url = f"{ollama_config['base_url'].rstrip('/')}/api/chat"
+    messages = [{"role": "user", "content": prompt}]
     payload = {
         "model": model,
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": messages,
         "stream": True,
         "options": {"num_predict": max_tokens},
     }
@@ -640,21 +860,78 @@ def _complete_stream_ollama(prompt: str, max_tokens: int, purpose: str):
     if purpose in {"categorize", "controller", "copilot"}:
         payload["think"] = False
         payload["options"]["temperature"] = 0
+    elif purpose == "advisor":
+        payload["think"] = _OLLAMA_ADVISOR_THINK
+        payload["options"]["temperature"] = 0
 
-    with httpx.stream("POST", url, json=payload, timeout=timeout) as resp:
-        for raw_line in resp.iter_lines():
-            line = raw_line.strip()
-            if not line:
-                continue
-            try:
-                event = _json.loads(line)
-            except Exception:
-                continue
-            content = (event.get("message") or {}).get("content")
-            if content:
-                yield content
-            if event.get("done"):
-                break
+    started = time.perf_counter()
+    first_token_ms = None
+    output_chars = 0
+    final_event = {}
+    recorded = False
+    try:
+        with httpx.stream("POST", url, json=payload, timeout=timeout) as resp:
+            for raw_line in resp.iter_lines():
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    event = _json.loads(line)
+                except Exception:
+                    continue
+                content = (event.get("message") or {}).get("content")
+                if content:
+                    if first_token_ms is None:
+                        first_token_ms = (time.perf_counter() - started) * 1000
+                    output_chars += len(content)
+                    yield content
+                if event.get("done"):
+                    final_event = event
+                    _record_llm_call(_ollama_timing_record(
+                        purpose=purpose,
+                        model=model,
+                        stream=True,
+                        messages=messages,
+                        max_tokens=max_tokens,
+                        started=started,
+                        first_token_ms=first_token_ms,
+                        output_chars=output_chars,
+                        final_event=final_event,
+                        think=payload.get("think"),
+                    ))
+                    recorded = True
+                    break
+    except Exception as exc:
+        _record_llm_call(_ollama_timing_record(
+            purpose=purpose,
+            model=model,
+            stream=True,
+            messages=messages,
+            max_tokens=max_tokens,
+            started=started,
+            first_token_ms=first_token_ms,
+            output_chars=output_chars,
+            final_event=final_event,
+            error=str(exc),
+            think=payload.get("think"),
+        ))
+        recorded = True
+        raise
+    finally:
+        if not recorded and _LLM_CALL_TRACE.get() is not None:
+            _record_llm_call(_ollama_timing_record(
+                purpose=purpose,
+                model=model,
+                stream=True,
+                messages=messages,
+                max_tokens=max_tokens,
+                started=started,
+                first_token_ms=first_token_ms,
+                output_chars=output_chars,
+                final_event=final_event,
+                error="stream_closed_before_done",
+                think=payload.get("think"),
+            ))
 
 
 def _complete_ollama_vision(

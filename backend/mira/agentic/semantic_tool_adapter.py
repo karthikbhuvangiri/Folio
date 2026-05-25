@@ -106,6 +106,8 @@ def semantic_validation_issue(tool_name: str, args: dict[str, Any], prior_steps:
         return _validate_net_worth(args)
     if canonical_tool == "review_data_quality":
         return _validate_data_quality(args)
+    if canonical_tool == "review_financial_context":
+        return _validate_financial_context(args)
     if canonical_tool == "manage_memory":
         return _validate_memory(args)
     if canonical_tool == "preview_finance_change":
@@ -138,6 +140,8 @@ def adapt_semantic_execution(tool_name: str, args: dict[str, Any]) -> SemanticEx
         return _net_worth_call(final_args)
     if canonical_tool == "review_data_quality":
         return _data_quality_call(final_args)
+    if canonical_tool == "review_financial_context":
+        return _financial_context_call(final_args)
     if canonical_tool == "manage_memory":
         return _memory_call(final_args)
     if canonical_tool == "preview_finance_change":
@@ -204,7 +208,7 @@ def semantic_selector_shape_error(tool_name: str, args: dict[str, Any]) -> str:
 def _transaction_args(args: dict[str, Any]) -> dict[str, Any]:
     filters = _dict(args.get("filters"))
     view = str(args.get("view") or "").strip().lower()
-    limit = 1 if view in {"latest", "detail"} else _limit(args, 25)
+    limit = 1 if view in {"latest", "detail"} else _limit(args, 50)
     search = filters.get("search")
     if view == "detail" and filters.get("transaction_id") and not search:
         search = filters.get("transaction_id")
@@ -217,6 +221,7 @@ def _transaction_args(args: dict[str, Any]) -> dict[str, Any]:
         "reviewed": filters.get("reviewed"),
         "limit": limit,
         "offset": args.get("offset"),
+        "sort": args.get("sort"),
     })
 
 
@@ -366,6 +371,21 @@ def _data_quality_call(args: dict[str, Any]) -> SemanticExecutionCall:
     return SemanticExecutionCall("review_data_quality", args, "get_data_health_summary", {})
 
 
+def _financial_context_call(args: dict[str, Any]) -> SemanticExecutionCall:
+    filters = _dict(args.get("filters"))
+    payload = _dict(args.get("payload"))
+    return SemanticExecutionCall("review_financial_context", args, "review_financial_context", _clean({
+        "view": args.get("view") or "relevant",
+        "subject_type": filters.get("subject_type"),
+        "subject_key": filters.get("subject_key"),
+        "question": payload.get("question"),
+        "intent": payload.get("intent"),
+        "max_facts": payload.get("max_facts") or args.get("limit") or 5,
+        "amount": payload.get("amount"),
+        "month_key": payload.get("month_key"),
+    }))
+
+
 def _memory_call(args: dict[str, Any]) -> SemanticExecutionCall:
     view = str(args.get("view") or "").strip().lower()
     payload = _dict(args.get("payload"))
@@ -416,7 +436,7 @@ def _chart_call(args: dict[str, Any]) -> SemanticExecutionCall:
 
 
 def _validate_query_transactions(args: dict[str, Any]) -> SemanticValidationIssue:
-    return _validate_sort(args, allowed={"", "date_desc"}, label="transaction sort")
+    return _validate_sort(args, allowed={"", "date_desc", "date_asc", "amount_desc", "amount_asc"}, label="transaction sort")
 
 
 def _validate_summarize_spending(args: dict[str, Any]) -> SemanticValidationIssue:
@@ -482,6 +502,15 @@ def _validate_net_worth(args: dict[str, Any]) -> SemanticValidationIssue:
 def _validate_data_quality(args: dict[str, Any]) -> SemanticValidationIssue:
     _ = args
     return SemanticValidationIssue()
+
+
+def _validate_financial_context(args: dict[str, Any]) -> SemanticValidationIssue:
+    filters = _dict(args.get("filters"))
+    subject_type = str(filters.get("subject_type") or "").strip().lower()
+    if subject_type and subject_type not in {"profile", "category", "merchant", "subscription", "account", "cashflow"}:
+        return SemanticValidationIssue("clarify", "I need a supported financial context subject type.")
+    payload = _dict(args.get("payload"))
+    return _validate_number_bounds(payload, "max_facts", 1, 8, required=False)
 
 
 def _validate_memory(args: dict[str, Any]) -> SemanticValidationIssue:

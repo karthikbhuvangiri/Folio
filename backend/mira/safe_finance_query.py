@@ -3096,33 +3096,28 @@ def _realistic_trim_levers_handler(conn, metric: str, ctx: dict[str, Any]) -> di
     levers: list[dict[str, Any]] = []
     private = execute_metric(conn, {"metric": "private_discretionary_patterns", "range": ctx["range"].token, "limit": 12}, profile=ctx["profile"])
     private_rows = private.get("rows") or []
-    private_by_category = {str(row.get("category") or ""): row for row in private_rows}
-
-    vaping = private_by_category.get("Vaping")
-    if vaping:
-        months = vaping.get("monthly_series") or []
+    for private_row in private_rows:
+        category = str(private_row.get("category") or "Private discretionary")
+        months = private_row.get("monthly_series") or []
         active_avg = _avg([row.get("total") for row in months if _num(row.get("total")) > 0])
-        last_seen = _parse_date(vaping.get("last_date"))
+        last_seen = _parse_date(private_row.get("last_date"))
         days_since = (_ctx_end_date(ctx) - last_seen).days if last_seen else None
-        if days_since is not None and days_since >= 45:
+        if days_since is not None and days_since >= 45 and active_avg > 0:
             levers.append(
                 {
                     "lever_type": "protect_pause",
-                    "subject": "Vaping",
+                    "subject": category,
                     "measured_amount": active_avg,
                     "amount_basis": "average active monthly spend before the visible pause",
                     "friction": "medium",
                     "action": "Protect the apparent pause instead of re-optimizing smaller categories first.",
                     "tradeoff": "Do not keep relitigating old spend if the pause is real.",
                     "caveat": "Only treat this as a pause if no newer transactions are missing from sync.",
-                    "sample_evidence_ids": vaping.get("sample_evidence_ids") or [],
+                    "sample_evidence_ids": private_row.get("sample_evidence_ids") or [],
                 }
             )
-
-    alcohol = private_by_category.get("Alcohol")
-    if alcohol:
-        months = list(reversed(alcohol.get("monthly_series") or []))
-        recent = [row for row in months if str(row.get("month") or "") >= "2026-01"]
+        months = sorted([row for row in private_row.get("monthly_series") or [] if _num(row.get("total")) > 0], key=lambda row: str(row.get("month") or ""))
+        recent = months[-4:]
         latest = recent[-1] if recent else None
         baseline = _avg([row.get("total") for row in recent[:-1][-3:]])
         latest_total = _num(latest.get("total")) if latest else 0.0
@@ -3131,32 +3126,37 @@ def _realistic_trim_levers_handler(conn, metric: str, ctx: dict[str, Any]) -> di
             levers.append(
                 {
                     "lever_type": "soft_ceiling",
-                    "subject": "Alcohol",
+                    "subject": category,
                     "measured_amount": soft_ceiling_delta,
                     "amount_basis": "latest month above recent three-month baseline",
                     "friction": "low",
                     "action": "Use a soft ceiling near the earlier monthly rhythm rather than a zero-spend rule.",
                     "tradeoff": "Do not moralize the category; tune the monthly rhythm.",
-                    "caveat": "If April was event-related, do not treat it as the new baseline.",
-                    "sample_evidence_ids": alcohol.get("sample_evidence_ids") or [],
+                    "caveat": "If the latest month was event-related, do not treat it as the new baseline.",
+                    "sample_evidence_ids": private_row.get("sample_evidence_ids") or [],
                 }
             )
 
     leaks = execute_metric(conn, {"metric": "small_frequent_leak", "range": ctx["range"].token, "limit": 12}, profile=ctx["profile"])
-    amazon_rows = [row for row in leaks.get("rows") or [] if str(row.get("merchant") or "").lower().startswith("amazon")]
-    if amazon_rows:
-        small_total = _round(sum(_num(row.get("small_total")) for row in amazon_rows))
+    small_rows = [row for row in leaks.get("rows") or [] if _num(row.get("small_total")) >= 25]
+    if small_rows:
+        selected_rows = small_rows[:3]
+        small_total = _round(sum(_num(row.get("small_total")) for row in selected_rows))
+        top = selected_rows[0]
+        subject = str(top.get("merchant") or top.get("category") or "Repeated small purchases")
+        if len(selected_rows) > 1:
+            subject = f"{subject} and similar small purchases"
         levers.append(
             {
                 "lever_type": "purchase_consolidation",
-                "subject": "Amazon-style small purchases",
+                "subject": subject,
                 "measured_amount": small_total,
                 "amount_basis": "small purchases under the metric threshold in the selected range",
                 "friction": "low",
                 "action": "Consolidate small orders into a weekly cart or add a 48-hour pause.",
                 "tradeoff": "This is a tune-up, not the main thesis.",
                 "caveat": "Some small purchases may be household essentials.",
-                "sample_evidence_ids": [eid for row in amazon_rows for eid in (row.get("sample_evidence_ids") or [])][:8],
+                "sample_evidence_ids": [eid for row in selected_rows for eid in (row.get("sample_evidence_ids") or [])][:8],
             }
         )
 
@@ -3178,19 +3178,24 @@ def _realistic_trim_levers_handler(conn, metric: str, ctx: dict[str, Any]) -> di
         )
 
     recurring = execute_metric(conn, {"metric": "recurring_obligation_calendar", "range": ctx["range"].token, "limit": 20}, profile=ctx["profile"])
-    insurance = next((row for row in recurring.get("rows") or [] if row.get("category") == "Insurance" and _num(row.get("monthly_equivalent")) > 100), None)
-    if insurance:
+    recurring_rows = recurring.get("rows") or []
+    reviewable_recurring = max(
+        (row for row in recurring_rows if _num(row.get("monthly_equivalent")) > 100 and row.get("category") not in {"Rent", "Mortgage"}),
+        key=lambda row: _num(row.get("monthly_equivalent")),
+        default=None,
+    )
+    if reviewable_recurring:
         levers.append(
             {
                 "lever_type": "comparison_shop",
-                "subject": insurance.get("merchant") or "Insurance",
-                "measured_amount": _round(insurance.get("monthly_equivalent")),
+                "subject": reviewable_recurring.get("merchant") or reviewable_recurring.get("category") or "Recurring service",
+                "measured_amount": _round(reviewable_recurring.get("monthly_equivalent")),
                 "amount_basis": "monthly recurring obligation",
                 "friction": "medium",
                 "action": "Comparison-shop or renegotiate periodically; do not treat this as daily overspending.",
                 "tradeoff": "The right move is vendor review, not broad restraint.",
-                "caveat": "Coverage changes can create real risk, so compare like-for-like.",
-                "sample_evidence_ids": [f"metric:recurring_obligation_calendar:{idx}" for idx, row in enumerate(recurring.get("rows") or [], start=1) if row is insurance][:1],
+                "caveat": "Coverage or service-level changes can create real risk, so compare like-for-like.",
+                "sample_evidence_ids": [f"metric:recurring_obligation_calendar:{idx}" for idx, row in enumerate(recurring_rows, start=1) if row is reviewable_recurring][:1],
             }
         )
 
@@ -3316,20 +3321,19 @@ def _financial_timeline_events_handler(conn, metric: str, ctx: dict[str, Any]) -
         )
 
     private = execute_metric(conn, {"metric": "private_discretionary_patterns", "range": range_token, "limit": 12}, profile=ctx["profile"])
-    private_by_category = {str(row.get("category") or ""): row for row in private.get("rows") or []}
-    vaping = private_by_category.get("Vaping")
-    if vaping:
-        months = vaping.get("monthly_series") or []
+    for private_row in private.get("rows") or []:
+        category = str(private_row.get("category") or "Private discretionary")
+        months = private_row.get("monthly_series") or []
         active_avg = _avg([row.get("total") for row in months if _num(row.get("total")) > 0])
-        last_seen = _parse_date(vaping.get("last_date"))
+        last_seen = _parse_date(private_row.get("last_date"))
         days_since = (_ctx_end_date(ctx) - last_seen).days if last_seen else None
-        if days_since is not None and days_since >= 45:
+        if days_since is not None and days_since >= 45 and active_avg > 0:
             events.append(
                 {
                     "event_type": "private_spend_pause",
-                    "event_date": vaping.get("last_date"),
-                    "period": str(vaping.get("last_date") or "")[:7],
-                    "subject": "Vaping",
+                    "event_date": private_row.get("last_date"),
+                    "period": str(private_row.get("last_date") or "")[:7],
+                    "subject": category,
                     "measured_amount": active_avg,
                     "amount_basis": "average active monthly spend before the visible pause",
                     "importance_score": 78,
@@ -3337,13 +3341,11 @@ def _financial_timeline_events_handler(conn, metric: str, ctx: dict[str, Any]) -
                     "interpretation_hint": "The useful read is to protect the pause if it is real, not keep relitigating old spend.",
                     "action_hint": "Confirm sync completeness, then preserve the behavior change.",
                     "caveat": "Local-only sensitive category; no motive inference.",
-                    "sample_evidence_ids": vaping.get("sample_evidence_ids") or [],
+                    "sample_evidence_ids": private_row.get("sample_evidence_ids") or [],
                 }
             )
 
-    alcohol = private_by_category.get("Alcohol")
-    if alcohol:
-        months = [row for row in reversed(alcohol.get("monthly_series") or []) if _num(row.get("total")) > 0]
+        months = sorted([row for row in private_row.get("monthly_series") or [] if _num(row.get("total")) > 0], key=lambda row: str(row.get("month") or ""))
         latest = months[-1] if months else None
         baseline = _avg([row.get("total") for row in months[:-1][-3:]])
         latest_total = _num(latest.get("total")) if latest else 0.0
@@ -3354,7 +3356,7 @@ def _financial_timeline_events_handler(conn, metric: str, ctx: dict[str, Any]) -
                     "event_type": "private_spend_rhythm_change",
                     "event_date": f"{latest.get('month')}-01",
                     "period": latest.get("month"),
-                    "subject": "Alcohol",
+                    "subject": category,
                     "measured_amount": delta,
                     "amount_basis": "latest active month above recent three-month rhythm",
                     "importance_score": 58,
@@ -3362,7 +3364,7 @@ def _financial_timeline_events_handler(conn, metric: str, ctx: dict[str, Any]) -
                     "interpretation_hint": "This is a soft-ceiling candidate, not a morality read.",
                     "action_hint": "Reset the monthly rhythm if it was not event-related.",
                     "caveat": "Do not treat event-related months as the new baseline.",
-                    "sample_evidence_ids": alcohol.get("sample_evidence_ids") or [],
+                    "sample_evidence_ids": private_row.get("sample_evidence_ids") or [],
                 }
             )
 

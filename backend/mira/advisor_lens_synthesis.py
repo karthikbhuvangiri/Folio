@@ -88,7 +88,7 @@ _LENSES: tuple[dict[str, Any], ...] = (
     {
         "id": "money_map",
         "name": "where money normally goes, event-adjusted baseline, controllability, and leakage before cuts",
-        "theme_obligations": ("money_map_baseline", "category_ledger_matters", "avoidable_leakage_first"),
+        "theme_obligations": ("money_map_baseline", "category_ledger_matters", "avoidable_leakage_status"),
         "metrics": (
             "money_flow_baseline",
             "category_advisor_ledger",
@@ -126,7 +126,7 @@ _LENSES: tuple[dict[str, Any], ...] = (
     {
         "id": "events_noise",
         "name": "event clusters, trip spend, refunds/noise, and baseline exclusions",
-        "theme_obligations": ("trip_event_exclusion", "period_reliability_matters"),
+        "theme_obligations": ("event_noise_exclusion", "period_reliability_matters"),
         "metrics": ("advisor_period_reliability", "financial_timeline_events", "spending_event_clusters", "monthly_spend_series"),
     },
     {
@@ -134,11 +134,11 @@ _LENSES: tuple[dict[str, Any], ...] = (
         "name": "spend types, practical reduction levers, sensitive categories, and tune-ups",
         "theme_obligations": (
             "merchant_lifecycle_matters",
-            "protect_vaping_pause",
-            "alcohol_soft_ceiling",
+            "private_discretionary_pause",
+            "private_discretionary_rhythm",
             "fees_inspection_first",
-            "amazon_tune_up",
-            "geico_vendor_review",
+            "small_purchase_consolidation",
+            "recurring_service_review",
         ),
         "metrics": (
             "merchant_lifecycle",
@@ -178,17 +178,25 @@ THESIS_CATALOG: dict[str, str] = {
     "liquidity_not_primary_risk": "Liquidity is strong enough that cash panic is not the main read.",
     "fixed_floor_matters": "The fixed monthly floor should anchor the operating plan.",
     "income_continuity_uncertain": "Income continuity/source labeling needs verification before trusting forward assumptions.",
-    "trip_event_exclusion": "Trip/event spend should be separated from normal lifestyle baseline.",
-    "avoidable_leakage_first": "Avoidable leakage such as fees or duplicate/review rows should be fixed before painful lifestyle cuts.",
-    "protect_vaping_pause": "Private vaping spend has changed materially; protect any reduction if sync confirms it.",
-    "alcohol_soft_ceiling": "Private alcohol rhythm is a soft-ceiling/tuning issue, not a morality read.",
+    "event_noise_exclusion": "Trip/event or other unusual spend should be separated from the normal lifestyle baseline.",
+    "avoidable_leakage_status": "Avoidable leakage such as fees, interest, or duplicate/review rows should be checked before painful lifestyle cuts.",
+    "private_discretionary_pause": "Detected private discretionary spend has changed materially; protect any reduction if sync confirms it.",
+    "private_discretionary_rhythm": "Detected private discretionary spend should be handled as a soft-ceiling/tuning issue, not a morality read.",
     "fees_inspection_first": "Fees should be inspected before broad category cuts.",
-    "amazon_tune_up": "Amazon-style small purchases are a low-friction tune-up, not the main thesis.",
-    "geico_vendor_review": "GEICO is a vendor-review/quote candidate, not day-to-day overspending.",
+    "small_purchase_consolidation": "Repeated small purchases are a low-friction consolidation tune-up, not the main thesis.",
+    "recurring_service_review": "Recurring service or provider costs are review/quote candidates, not day-to-day overspending.",
     "data_quality_limits_precision": "The read must state data-quality limits such as low-confidence rows, missing investments, duplicates, or unreviewed transactions.",
     "missing_data_caveats": "The recommendation must state what incomplete data could change.",
 }
 REQUIRED_THESES = tuple(THESIS_CATALOG.keys())
+THESIS_ID_ALIASES: dict[str, str] = {
+    "trip_event_exclusion": "event_noise_exclusion",
+    "avoidable_leakage_first": "avoidable_leakage_status",
+    "protect_vaping_pause": "private_discretionary_pause",
+    "alcohol_soft_ceiling": "private_discretionary_rhythm",
+    "amazon_tune_up": "small_purchase_consolidation",
+    "geico_vendor_review": "recurring_service_review",
+}
 
 _THESIS_DIRECT_METRICS: dict[str, tuple[str, ...]] = {
     "period_reliability_matters": ("advisor_period_reliability",),
@@ -202,13 +210,13 @@ _THESIS_DIRECT_METRICS: dict[str, tuple[str, ...]] = {
     "liquidity_not_primary_risk": ("cash_runway", "cash_vs_liability_position"),
     "fixed_floor_matters": ("floor_burn", "recurring_obligation_calendar"),
     "income_continuity_uncertain": ("income_source_continuity", "financial_timeline_events", "income_source_concentration"),
-    "trip_event_exclusion": ("financial_timeline_events", "spending_event_clusters"),
-    "avoidable_leakage_first": ("avoidable_leakage", "realistic_trim_levers", "financial_timeline_events"),
-    "protect_vaping_pause": ("realistic_trim_levers", "private_discretionary_patterns", "financial_timeline_events"),
-    "alcohol_soft_ceiling": ("realistic_trim_levers", "private_discretionary_patterns", "financial_timeline_events"),
+    "event_noise_exclusion": ("financial_timeline_events", "spending_event_clusters"),
+    "avoidable_leakage_status": ("avoidable_leakage", "realistic_trim_levers", "financial_timeline_events"),
+    "private_discretionary_pause": ("realistic_trim_levers", "private_discretionary_patterns", "financial_timeline_events"),
+    "private_discretionary_rhythm": ("realistic_trim_levers", "private_discretionary_patterns", "financial_timeline_events"),
     "fees_inspection_first": ("realistic_trim_levers", "financial_timeline_events", "category_driver_decomposition"),
-    "amazon_tune_up": ("realistic_trim_levers", "small_frequent_leak"),
-    "geico_vendor_review": ("recurring_obligation_calendar", "realistic_trim_levers", "financial_timeline_events"),
+    "small_purchase_consolidation": ("realistic_trim_levers", "small_frequent_leak"),
+    "recurring_service_review": ("recurring_obligation_calendar", "realistic_trim_levers", "financial_timeline_events"),
     "data_quality_limits_precision": ("advisor_data_quality_profile",),
     "missing_data_caveats": ("safe_to_spend_status", "goal_capacity_statement", "goal_feasibility", "floor_burn", "income_source_continuity", "advisor_data_quality_profile"),
 }
@@ -222,12 +230,28 @@ _ANCHOR_MERGE_THESES = {
     "money_map_baseline",
     "goal_capacity_reality",
     "liquidity_not_primary_risk",
-    "trip_event_exclusion",
+    "event_noise_exclusion",
     "category_ledger_matters",
     "merchant_lifecycle_matters",
     "savings_scenarios_are_options",
     "external_transfer_labeling",
 }
+
+
+def _canonical_thesis_id(thesis_id: Any) -> str:
+    text = str(thesis_id or "").strip()
+    return THESIS_ID_ALIASES.get(text, text)
+
+
+def applicable_required_theses(evidence_or_bundle: dict[str, Any]) -> tuple[str, ...]:
+    """Return thesis IDs that are required for the specific evidence at hand."""
+
+    evidence_map = build_lens_evidence_map(evidence_or_bundle) if isinstance(evidence_or_bundle.get("metrics"), dict) else evidence_or_bundle
+    applicable: list[str] = []
+    for thesis_id in REQUIRED_THESES:
+        if _fallback_thesis_packet(thesis_id, evidence_map):
+            applicable.append(thesis_id)
+    return tuple(applicable)
 
 _LENS_OUTPUT_SCHEMA = {
     "type": "object",
@@ -585,6 +609,7 @@ def draft_lens_advisor_memo(
         return {"status": "disabled", "payload": {}, "errors": []}
 
     evidence_map = build_lens_evidence_map(bundle)
+    required_thesis_ids = applicable_required_theses(evidence_map)
     lens_reads: list[dict[str, Any]] = []
     errors: list[str] = []
     for lens in _LENSES:
@@ -606,7 +631,7 @@ def draft_lens_advisor_memo(
     candidate_theses = merge_lens_theses(lens_reads, evidence_map)
     if lens_reads:
         candidate_theses = _fill_required_thesis_fallbacks(candidate_theses, evidence_map)
-    missing = [thesis_id for thesis_id in REQUIRED_THESES if thesis_id not in {item.get("thesis_id") for item in candidate_theses}]
+    missing = [thesis_id for thesis_id in required_thesis_ids if thesis_id not in {_canonical_thesis_id(item.get("thesis_id")) for item in candidate_theses}]
     if missing:
         try:
             repair = _complete_json(
@@ -650,7 +675,7 @@ def draft_lens_advisor_memo(
         if not quality.get("ok") and candidate_theses:
             try:
                 repaired = _complete_json(
-                    build_lens_final_repair_prompt(candidate_theses, payload, quality),
+                    build_lens_final_repair_prompt(candidate_theses, payload, quality, required_thesis_ids=required_thesis_ids),
                     max_tokens=ADVISOR_LENS_FINAL_MAX_TOKENS,
                     response_format=_FINAL_OUTPUT_SCHEMA,
                     complete_fn=complete_fn,
@@ -724,6 +749,7 @@ def build_lens_evidence_map(bundle: dict[str, Any]) -> dict[str, dict[str, Any]]
 
 def merge_lens_theses(lens_reads: list[dict[str, Any]], evidence_map: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
     best: dict[str, tuple[int, dict[str, Any]]] = {}
+    applicable = applicable_required_theses(evidence_map)
     for lens_read in lens_reads:
         if not isinstance(lens_read, dict):
             continue
@@ -738,15 +764,17 @@ def merge_lens_theses(lens_reads: list[dict[str, Any]], evidence_map: dict[str, 
             score += min(len(candidate.get("paragraph") or ""), 500) // 50
             if thesis_id not in best or score > best[thesis_id][0]:
                 best[thesis_id] = (score, candidate)
-    return [best[thesis_id][1] for thesis_id in REQUIRED_THESES if thesis_id in best]
+    ordered_ids = [*applicable, *[thesis_id for thesis_id in REQUIRED_THESES if thesis_id in best and thesis_id not in applicable]]
+    return [best[thesis_id][1] for thesis_id in ordered_ids if thesis_id in best]
 
 
 def _fill_required_thesis_fallbacks(
     candidate_theses: list[dict[str, Any]],
     evidence_map: dict[str, dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    by_id = {str(item.get("thesis_id") or ""): item for item in candidate_theses if isinstance(item, dict)}
-    for thesis_id in REQUIRED_THESES:
+    by_id = {_canonical_thesis_id(item.get("thesis_id")): item for item in candidate_theses if isinstance(item, dict)}
+    applicable = applicable_required_theses(evidence_map)
+    for thesis_id in applicable:
         fallback = _fallback_thesis_candidate(thesis_id, evidence_map)
         if not fallback:
             continue
@@ -760,7 +788,8 @@ def _fill_required_thesis_fallbacks(
             by_id[thesis_id] = fallback
         elif thesis_id in _ANCHOR_MERGE_THESES:
             by_id[thesis_id] = _merge_anchor_candidate(current, fallback)
-    return [by_id[thesis_id] for thesis_id in REQUIRED_THESES if thesis_id in by_id]
+    ordered_ids = [*applicable, *[thesis_id for thesis_id in REQUIRED_THESES if thesis_id in by_id and thesis_id not in applicable]]
+    return [by_id[thesis_id] for thesis_id in ordered_ids if thesis_id in by_id]
 
 
 def _merge_anchor_candidate(current: dict[str, Any], fallback: dict[str, Any]) -> dict[str, Any]:
@@ -943,7 +972,7 @@ def _fallback_thesis_packet(thesis_id: str, evidence_map: dict[str, dict[str, An
             "Income continuity and source labeling need verification.",
             "Income continuity and source labeling need verification before trusting forward assumptions.",
         )
-    if thesis_id == "trip_event_exclusion":
+    if thesis_id == "event_noise_exclusion":
         cluster_ids = _event_cluster_anchor_ids(evidence_map)
         evidence_id = cluster_ids[0] if cluster_ids else "metric:money_flow_baseline:summary"
         if evidence_id not in evidence_map:
@@ -955,40 +984,75 @@ def _fallback_thesis_packet(thesis_id: str, evidence_map: dict[str, dict[str, An
             "Trip/event spend should be separated from the normal baseline.",
             paragraph or "Trip/event spend should be separated from the normal lifestyle baseline before deciding what actually changed.",
         )
-    if thesis_id == "avoidable_leakage_first":
+    if thesis_id == "avoidable_leakage_status":
         summary_id = "metric:avoidable_leakage:summary"
         values = _evidence_values(evidence_map, summary_id).get("summary_numbers") or {}
-        if not values.get("fee_or_interest_total") and not values.get("recurring_duplicate_candidate_count"):
+        if summary_id not in evidence_map:
             return None
         amount = _money(values.get("fee_or_interest_total"))
+        duplicate_count = _number(values.get("recurring_duplicate_candidate_count"))
+        if _float_value(values.get("fee_or_interest_total")) > 0 or _float_value(values.get("recurring_duplicate_candidate_count")) > 0:
+            summary = "Avoidable leakage should be inspected before painful lifestyle cuts."
+            paragraph = f"Avoidable leakage should be checked before painful lifestyle cuts; the safe evidence shows {amount} in fee or interest review rows and {duplicate_count} recurring duplicate candidate."
+        else:
+            summary = "The leakage check is clear, so do not invent fee friction as the main fix."
+            paragraph = "The avoidable leakage check does not show fee, interest, or duplicate-row pressure, so Mira should not force a fee-cut thesis when the evidence points elsewhere."
         return _fallback_packet(
             thesis_id,
             [summary_id, *(_first_metric_row_ids(evidence_map, "avoidable_leakage", limit=1))],
-            "Avoidable leakage should be inspected before painful lifestyle cuts.",
-            f"Avoidable leakage should be inspected before painful lifestyle cuts; the safe evidence shows {amount} in fee or interest review rows.",
+            summary,
+            paragraph,
         )
-    if thesis_id == "protect_vaping_pause":
-        evidence_id = _metric_row_id_with_value(evidence_map, "private_discretionary_patterns", "category", "Vaping")
+    if thesis_id == "private_discretionary_pause":
+        evidence_id = _metric_row_id_by_predicate(
+            evidence_map,
+            "realistic_trim_levers",
+            lambda values: values.get("lever_type") == "protect_pause",
+        ) or _metric_row_id_by_predicate(
+            evidence_map,
+            "financial_timeline_events",
+            lambda values: values.get("event_type") == "private_spend_pause",
+        )
         if not evidence_id:
             return None
+        values = _evidence_values(evidence_map, evidence_id)
+        subject = str(values.get("subject") or "private discretionary spend")
         return _fallback_packet(
             thesis_id,
             [evidence_id],
-            "Private vaping spend is lower than prior peaks and should be protected if sync is complete.",
-            "Private vaping spend is lower than prior peaks and the reduction should be protected if the current sync is complete.",
+            f"{subject} is lower than prior peaks and should be protected if sync is complete.",
+            f"{subject} is lower than prior peaks, so the useful read is to protect the lower private-spend rhythm if the current sync is complete.",
         )
-    if thesis_id == "alcohol_soft_ceiling":
-        evidence_id = _metric_row_id_with_value(evidence_map, "private_discretionary_patterns", "category", "Alcohol")
+    if thesis_id == "private_discretionary_rhythm":
+        evidence_id = _metric_row_id_by_predicate(
+            evidence_map,
+            "realistic_trim_levers",
+            lambda values: values.get("lever_type") == "soft_ceiling",
+        ) or _metric_row_id_by_predicate(
+            evidence_map,
+            "financial_timeline_events",
+            lambda values: values.get("event_type") == "private_spend_rhythm_change",
+        )
         if not evidence_id:
             return None
+        values = _evidence_values(evidence_map, evidence_id)
+        subject = str(values.get("subject") or "private discretionary spend")
         return _fallback_packet(
             thesis_id,
             [evidence_id],
-            "Alcohol is a soft-ceiling/tuning issue, not a morality read.",
-            "Alcohol should be treated as a soft-ceiling/tuning issue, not a morality read or the primary financial risk.",
+            f"{subject} is a soft-ceiling/tuning issue, not a morality read.",
+            f"{subject} should be treated as a private-spend soft-ceiling/tuning issue, not a morality read or the primary financial risk.",
         )
     if thesis_id == "fees_inspection_first":
-        evidence_id = _first_metric_row_id(evidence_map, "avoidable_leakage") or _first_metric_row_id(evidence_map, "category_driver_decomposition")
+        evidence_id = _metric_row_id_by_predicate(
+            evidence_map,
+            "realistic_trim_levers",
+            lambda values: values.get("lever_type") == "inspect_fee",
+        ) or _metric_row_id_by_predicate(
+            evidence_map,
+            "financial_timeline_events",
+            lambda values: values.get("event_type") == "fee_pressure",
+        ) or _first_metric_row_id(evidence_map, "avoidable_leakage")
         if not evidence_id:
             return None
         return _fallback_packet(
@@ -997,25 +1061,41 @@ def _fallback_thesis_packet(thesis_id: str, evidence_map: dict[str, dict[str, An
             "Fees should be inspected before broad category cuts.",
             "Fees should be inspected before broad category cuts because they are preventable friction, not intentional lifestyle spending.",
         )
-    if thesis_id == "amazon_tune_up":
-        evidence_id = _first_metric_row_id(evidence_map, "small_frequent_leak") or _first_metric_row_id(evidence_map, "realistic_trim_levers")
+    if thesis_id == "small_purchase_consolidation":
+        evidence_id = _metric_row_id_by_predicate(
+            evidence_map,
+            "realistic_trim_levers",
+            lambda values: values.get("lever_type") == "purchase_consolidation",
+        ) or _first_metric_row_id(evidence_map, "small_frequent_leak")
         if not evidence_id:
             return None
+        values = _evidence_values(evidence_map, evidence_id)
+        subject = str(values.get("subject") or values.get("merchant") or "repeated small purchases")
         return _fallback_packet(
             thesis_id,
             [evidence_id],
-            "Amazon-style purchases are a tune-up, not the main thesis.",
-            "Amazon-style purchases are a tune-up that can be consolidated, not the main thesis or a reason to overcorrect.",
+            f"{subject} are a consolidation tune-up, not the main thesis.",
+            f"{subject} are a low-friction purchase-consolidation tune-up, not the main thesis or a reason to overcorrect.",
         )
-    if thesis_id == "geico_vendor_review":
-        evidence_id = _metric_row_id_with_value(evidence_map, "recurring_obligation_calendar", "merchant", "GEICO")
+    if thesis_id == "recurring_service_review":
+        evidence_id = _metric_row_id_by_predicate(
+            evidence_map,
+            "realistic_trim_levers",
+            lambda values: values.get("lever_type") == "comparison_shop",
+        ) or _metric_row_id_by_predicate(
+            evidence_map,
+            "financial_timeline_events",
+            lambda values: values.get("event_type") == "upcoming_recurring_constraint",
+        )
         if not evidence_id:
             return None
+        values = _evidence_values(evidence_map, evidence_id)
+        subject = str(values.get("subject") or values.get("merchant") or "recurring service")
         return _fallback_packet(
             thesis_id,
             [evidence_id],
-            "GEICO is a vendor-review and quote candidate.",
-            "GEICO should be treated as a vendor-review and quote candidate rather than day-to-day overspending.",
+            f"{subject} is a recurring service review candidate.",
+            f"{subject} should be treated as a vendor-review, quote, or service-level check rather than day-to-day overspending.",
         )
     if thesis_id == "data_quality_limits_precision":
         summary_id = "metric:advisor_data_quality_profile:summary"
@@ -1091,6 +1171,18 @@ def _metric_row_id_with_value(evidence_map: dict[str, dict[str, Any]], metric: s
     return None
 
 
+def _metric_row_id_by_predicate(
+    evidence_map: dict[str, dict[str, Any]],
+    metric: str,
+    predicate: Callable[[dict[str, Any]], bool],
+) -> str | None:
+    for evidence_id in _first_metric_row_ids(evidence_map, metric, limit=40):
+        values = _evidence_values(evidence_map, evidence_id)
+        if predicate(values):
+            return evidence_id
+    return None
+
+
 def _event_cluster_anchor_ids(evidence_map: dict[str, dict[str, Any]]) -> list[str]:
     rows: list[tuple[str, dict[str, Any]]] = []
     for evidence_id in _first_metric_row_ids(evidence_map, "spending_event_clusters", limit=8):
@@ -1159,16 +1251,21 @@ def compose_lens_final_payload(
 ) -> dict[str, Any]:
     if not isinstance(final_payload, dict):
         return {}
-    by_id = {str(thesis.get("thesis_id") or ""): thesis for thesis in candidate_theses}
-    requested_order = [str(value) for value in final_payload.get("thesis_order") or [] if str(value) in by_id]
+    normalized_theses = [
+        {**thesis, "thesis_id": _canonical_thesis_id(thesis.get("thesis_id"))}
+        for thesis in candidate_theses
+        if isinstance(thesis, dict)
+    ]
+    by_id = {_canonical_thesis_id(thesis.get("thesis_id")): thesis for thesis in normalized_theses}
+    requested_order = [_canonical_thesis_id(value) for value in final_payload.get("thesis_order") or [] if _canonical_thesis_id(value) in by_id]
     ordered_ids = requested_order + [thesis_id for thesis_id in by_id if thesis_id not in requested_order]
     ordered_theses = [by_id[thesis_id] for thesis_id in ordered_ids]
     memo_markdown = _repair_supported_name_phrases(
         clean_memo_text(final_payload.get("memo_markdown")),
-        [{"values": thesis} for thesis in candidate_theses if isinstance(thesis, dict)],
+        [{"values": thesis} for thesis in normalized_theses],
     )
-    memo_markdown = _repair_final_memo_theme_language(memo_markdown, candidate_theses, ordered_ids)
-    memo_markdown = _repair_final_memo_anchor_language(memo_markdown, candidate_theses, ordered_ids)
+    memo_markdown = _repair_final_memo_theme_language(memo_markdown, normalized_theses, ordered_ids)
+    memo_markdown = _repair_final_memo_anchor_language(memo_markdown, normalized_theses, ordered_ids)
     action_plan = build_advisor_ranked_actions({"memo_markdown": memo_markdown, "theses": ordered_theses})
     if evidence_map:
         ordered_theses = _augment_structured_memo_evidence(ordered_theses, evidence_map)
@@ -1199,7 +1296,7 @@ def _augment_structured_memo_evidence(
     theses: list[dict[str, Any]],
     evidence_map: dict[str, dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    by_id = {str(thesis.get("thesis_id") or ""): dict(thesis) for thesis in theses if isinstance(thesis, dict)}
+    by_id = {_canonical_thesis_id(thesis.get("thesis_id")): {**dict(thesis), "thesis_id": _canonical_thesis_id(thesis.get("thesis_id"))} for thesis in theses if isinstance(thesis, dict)}
 
     def add(thesis_id: str, evidence_ids: list[str]) -> None:
         thesis = by_id.get(thesis_id)
@@ -1219,10 +1316,10 @@ def _augment_structured_memo_evidence(
     add("savings_scenarios_are_options", _first_metric_row_ids(evidence_map, "savings_scenarios", limit=1))
     add("category_ledger_matters", _first_metric_row_ids(evidence_map, "category_advisor_ledger", limit=6))
     add("merchant_lifecycle_matters", ["metric:merchant_lifecycle:summary", *_first_metric_row_ids(evidence_map, "merchant_lifecycle", limit=6)])
-    add("trip_event_exclusion", _event_cluster_anchor_ids(evidence_map))
-    add("avoidable_leakage_first", ["metric:avoidable_leakage:summary", *_first_metric_row_ids(evidence_map, "avoidable_leakage", limit=2)])
+    add("event_noise_exclusion", _event_cluster_anchor_ids(evidence_map))
+    add("avoidable_leakage_status", ["metric:avoidable_leakage:summary", *_first_metric_row_ids(evidence_map, "avoidable_leakage", limit=2)])
     add("fees_inspection_first", _first_metric_row_ids(evidence_map, "avoidable_leakage", limit=2))
-    return [by_id.get(str(thesis.get("thesis_id") or ""), thesis) for thesis in theses]
+    return [by_id.get(_canonical_thesis_id(thesis.get("thesis_id")), thesis) for thesis in theses]
 
 
 def _compose_structured_advisor_memo(
@@ -1260,8 +1357,13 @@ def _structured_bottom_line(evidence_map: dict[str, dict[str, Any]]) -> str:
         f"## {SECTION_THE_READ}",
         f"Cash is doing its job. With {cash} in cash-like balances, {liabilities} in liabilities, and {runway_days} days of runway, I would not make this a cash-panic story.",
         f"The better read is capacity and control: reconciled operating burn is {burn}, leaving {capacity} before configured goals.",
-        f"The first dollar I would chase is not a lifestyle cut. Fees or interest total {fee_total}, so I would clean up that friction before asking you to shrink broad categories.",
     ]
+    if _float_value(leakage.get("fee_or_interest_total")) > 0:
+        lines.append(
+            f"The first dollar I would chase is not a lifestyle cut. Fees or interest total {fee_total}, so I would clean up that friction before asking you to shrink broad categories."
+        )
+    else:
+        lines.append("The leakage check is not showing fee or interest drag, so I would not invent a fee-cut thesis just to have one.")
     status = income.get("status")
     if status:
         lines.append("The main caveat is income continuity: I would verify the current source labels before trusting the forward plan.")
@@ -1275,7 +1377,7 @@ def _structured_normal_month(evidence_map: dict[str, dict[str, Any]]) -> str:
     recurring = _metric_summary(evidence_map, "recurring_obligation_calendar")
     rows = [
         ("Average monthly income", _money(operating.get("avg_monthly_income")), "The income base I would plan around."),
-        ("Normal spending", _money(operating.get("event_adjusted_normal_spend") or money_flow.get("avg_monthly_spend_after_event_exclusions")), "Trip/event noise is pulled out, so this does not punish a one-off month."),
+        ("Normal spending", _money(operating.get("event_adjusted_normal_spend") or money_flow.get("avg_monthly_spend_after_event_exclusions")), "Trip/event spend is separated from the normal baseline, so this does not punish a one-off month."),
         ("Fixed floor already visible", _money(operating.get("fixed_floor_visible_in_spend")), "Obligations already sitting inside normal spend."),
         ("Fixed floor gap", _money(operating.get("fixed_floor_gap_not_visible_in_spend")), "The extra floor Mira adds back so burn is not understated."),
         ("Reconciled operating burn", _money(operating.get("reconciled_operating_burn")), "The real monthly hurdle after the fixed monthly floor is respected."),
@@ -1381,14 +1483,14 @@ def _structured_action_why(action: dict[str, Any]) -> str:
         return why
     thesis_id = str(action.get("thesis_id") or "")
     fallbacks = {
-        "avoidable_leakage_first": "This is the cheapest first fix: preventable fees or interest should be handled before lifestyle cuts.",
+        "avoidable_leakage_status": "This is the first gate: check preventable leakage before asking for lifestyle cuts.",
         "income_continuity_uncertain": "This is the assumption underneath the plan: cash is strong, but forward income still needs confirmation.",
         "goal_capacity_reality": "Capacity only becomes useful after it is assigned to named goals.",
         "fixed_floor_matters": "The floor tells us what has to be protected before flexible spend gets judged.",
-        "geico_vendor_review": "This is a vendor review, not a daily behavior problem.",
-        "amazon_tune_up": "This is a small-friction tune-up, not the main financial thesis.",
-        "alcohol_soft_ceiling": "This is a rhythm-setting issue, not a morality read.",
-        "protect_vaping_pause": "This looks like a reduction to protect before looking for new cuts.",
+        "recurring_service_review": "This is a vendor review, not a daily behavior problem.",
+        "small_purchase_consolidation": "This is a small-friction tune-up, not the main financial thesis.",
+        "private_discretionary_rhythm": "This is a rhythm-setting issue, not a morality read.",
+        "private_discretionary_pause": "This looks like a reduction to protect before looking for new cuts.",
     }
     return fallbacks.get(thesis_id, why)
 
@@ -1402,9 +1504,13 @@ def _structured_do_not_overcorrect(evidence_map: dict[str, dict[str, Any]]) -> s
         f"## {SECTION_DO_NOT_OVERREACT}",
         f"- Do not manufacture cash anxiety. Cash-like balance is {_money(position.get('cash_like_balance'))}, cash runway is {_number(runway.get('cash_runway_days'))} days, and liabilities are {_money(position.get('liability_total'))}.",
         "- Do not let a trip/event cluster become a permanent lifestyle verdict unless you confirm it is repeating.",
-        "- Private vaping spend is lower than prior peaks; protect the lower rhythm if sync is complete. The point is preservation, not judgment.",
-        "- Alcohol belongs in soft-ceiling territory: set a rhythm if it helps, but do not turn it into a morality read.",
     ]
+    for values in _metric_rows(evidence_map, "realistic_trim_levers", limit=12):
+        subject = values.get("subject") or "Private discretionary spend"
+        if values.get("lever_type") == "protect_pause":
+            lines.append(f"- {subject} appears lower than prior peaks; protect the lower rhythm if sync is complete. The point is preservation, not judgment.")
+        elif values.get("lever_type") == "soft_ceiling":
+            lines.append(f"- {subject} belongs in soft-ceiling territory: set a rhythm if it helps, but do not turn it into a morality read.")
     if scenario:
         lines.append(f"- Savings scenarios are optional planning sensitivities, not commands: {scenario.get('subject') or 'the top scenario'} has a planning sensitivity of {_money(scenario.get('monthly_effect'))} per month.")
     return "\n".join(lines)
@@ -1964,7 +2070,7 @@ def build_advisor_ranked_actions(memo: dict[str, Any], *, max_items: int = 6) ->
     if not isinstance(memo, dict):
         return []
     theses = [item for item in memo.get("theses") or [] if isinstance(item, dict)]
-    by_id = {str(item.get("thesis_id") or ""): item for item in theses}
+    by_id = {_canonical_thesis_id(item.get("thesis_id")): {**item, "thesis_id": _canonical_thesis_id(item.get("thesis_id"))} for item in theses}
     actions: list[dict[str, Any]] = []
 
     def add(
@@ -1994,10 +2100,10 @@ def build_advisor_ranked_actions(memo: dict[str, Any], *, max_items: int = 6) ->
         )
 
     add(
-        "avoidable_leakage_first",
-        title="Fix preventable leakage first",
-        action="Inspect fee and interest rows, then set the payment timing or due-date guardrail before broad category cuts or cutting intentional spending.",
-        tradeoff="These come before broad category cuts; do not turn a fee cluster into a broad lifestyle verdict.",
+        "avoidable_leakage_status",
+        title="Check preventable leakage first",
+        action="Use the leakage check as the first gate before broad category cuts; fix fee, interest, or duplicate-row friction only when the evidence shows it.",
+        tradeoff="Do not force a leakage story when the check is clean.",
     )
     add(
         "income_continuity_uncertain",
@@ -2019,25 +2125,25 @@ def build_advisor_ranked_actions(memo: dict[str, Any], *, max_items: int = 6) ->
         tradeoff="Do not compare every month against raw spending without separating structural obligations.",
     )
     add(
-        "geico_vendor_review",
-        title="Review GEICO like a vendor, not a lifestyle problem",
-        action="Quote or compare coverage like-for-like before changing anything.",
-        tradeoff="Do not reduce coverage just to make the number smaller.",
+        "recurring_service_review",
+        title="Review recurring services like vendors",
+        action="Compare, renegotiate, or monitor recurring provider costs before treating them as day-to-day overspending.",
+        tradeoff="Do not reduce coverage or service quality just to make the number smaller.",
     )
     add(
-        "amazon_tune_up",
-        title="Consolidate Amazon-style small purchases",
-        action="Batch or review small purchases before touching categories that affect daily quality of life.",
+        "small_purchase_consolidation",
+        title="Consolidate repeated small purchases",
+        action="Batch or review repeated small purchases before touching categories that affect daily quality of life.",
         tradeoff="Do not treat small-purchase cleanup as the main financial thesis.",
     )
     add(
-        "alcohol_soft_ceiling",
+        "private_discretionary_rhythm",
         title="Use a soft ceiling for private rhythms",
         action="Set a gentle ceiling or check-in rhythm only after the lower-pain operational fixes are handled.",
         tradeoff="Do not moralize the category or make it the first lever.",
     )
     add(
-        "protect_vaping_pause",
+        "private_discretionary_pause",
         title="Protect private-spend reductions already working",
         action="Keep the lower rhythm intact if sync confirms it before looking for new cuts.",
         tradeoff="Do not overcorrect if the improvement is already happening.",
@@ -2104,7 +2210,7 @@ def _repair_final_memo_theme_language(memo: str, candidate_theses: list[dict[str
             missing.append("goal_capacity_reality")
     if not missing:
         return memo
-    by_id = {str(thesis.get("thesis_id") or ""): thesis for thesis in candidate_theses if isinstance(thesis, dict)}
+    by_id = {_canonical_thesis_id(thesis.get("thesis_id")): thesis for thesis in candidate_theses if isinstance(thesis, dict)}
     repaired = memo
     for thesis_id in missing:
         thesis = by_id.get(thesis_id)
@@ -2123,14 +2229,14 @@ def _theme_repair_addition(memo: str, thesis_id: str, thesis: dict[str, Any]) ->
     paragraph = clean_memo_text(thesis.get("paragraph") or thesis.get("summary"))
     if thesis_id == "goal_capacity_reality" and _text_has_goal_capacity(memo) and _text_has_no_active_goal_status(paragraph):
         return "No active goals are configured, so this is planning capacity before explicit goal targets rather than proof that a specific goal is funded."
-    if thesis_id == "protect_vaping_pause" and "vaping" in str(memo or "").lower():
-        return "The point is the lower rhythm versus prior peaks, not a judgment about the category."
+    if thesis_id == "private_discretionary_pause":
+        return "The point is the lower private-spend rhythm versus prior peaks, not a judgment about the category."
     return paragraph
 
 
 def _repair_final_memo_anchor_language(memo: str, candidate_theses: list[dict[str, Any]], thesis_ids: list[str]) -> str:
     """Preserve exact advisor anchor facts that the final LLM may compress away."""
-    by_id = {str(thesis.get("thesis_id") or ""): thesis for thesis in candidate_theses if isinstance(thesis, dict)}
+    by_id = {_canonical_thesis_id(thesis.get("thesis_id")): thesis for thesis in candidate_theses if isinstance(thesis, dict)}
     repaired = memo
     for thesis_id in thesis_ids:
         if thesis_id not in _ANCHOR_MERGE_THESES:
@@ -2163,7 +2269,7 @@ def _anchor_repair_addition(thesis_id: str, paragraph: str) -> str:
         return f"Net external transfer outflow is {transfer_amount}, so external transfers should be labeled before they are judged as lifestyle spending." if transfer_amount else paragraph
     if thesis_id == "savings_scenarios_are_options":
         return paragraph
-    if thesis_id == "trip_event_exclusion":
+    if thesis_id == "event_noise_exclusion":
         return paragraph
     if thesis_id in {"category_ledger_matters", "merchant_lifecycle_matters"}:
         return paragraph
@@ -2180,7 +2286,7 @@ def _anchor_fact_missing(memo: str, thesis_id: str, paragraph: str) -> bool:
     if thesis_id in {"money_map_baseline", "goal_capacity_reality"}:
         burn_amount = _money_after_phrase(paragraph, "reconciled operating burn")
         return bool(burn_amount and burn_amount not in memo)
-    if thesis_id == "trip_event_exclusion":
+    if thesis_id == "event_noise_exclusion":
         cluster_amounts = _money_tokens(paragraph)
         cluster_dates = _date_tokens(paragraph)
         return bool(cluster_amounts and any(amount not in memo for amount in cluster_amounts)) or bool(
@@ -2229,13 +2335,13 @@ def _section_for_thesis(thesis_id: str) -> str:
         return f"## {SECTION_NORMAL_MONTH}"
     if thesis_id in {"liquidity_not_primary_risk", "income_continuity_uncertain"}:
         return f"## {SECTION_THE_READ}"
-    if thesis_id in {"trip_event_exclusion", "protect_vaping_pause"}:
+    if thesis_id in {"event_noise_exclusion", "private_discretionary_pause"}:
         return f"## {SECTION_NOISE}"
     if thesis_id == "fixed_floor_matters":
         return f"## {SECTION_NORMAL_MONTH}"
-    if thesis_id in {"avoidable_leakage_first", "fees_inspection_first", "amazon_tune_up", "geico_vendor_review"}:
+    if thesis_id in {"avoidable_leakage_status", "fees_inspection_first", "small_purchase_consolidation", "recurring_service_review"}:
         return f"## {SECTION_ACTIONS}"
-    if thesis_id == "alcohol_soft_ceiling":
+    if thesis_id == "private_discretionary_rhythm":
         return f"## {SECTION_DO_NOT_OVERREACT}"
     return f"## {SECTION_VERIFY}"
 
@@ -2268,8 +2374,9 @@ def validate_lens_advisor_memo(payload: dict[str, Any], evidence_map: dict[str, 
     if not theses:
         failures.append("missing_theses")
 
-    thesis_ids = [str(item.get("thesis_id") or "") for item in theses if isinstance(item, dict)]
-    missing_theses = sorted(set(REQUIRED_THESES) - set(thesis_ids))
+    thesis_ids = [_canonical_thesis_id(item.get("thesis_id")) for item in theses if isinstance(item, dict)]
+    applicable_theses = applicable_required_theses(evidence_map)
+    missing_theses = sorted(set(applicable_theses) - set(thesis_ids))
     unknown_theses = sorted({thesis_id for thesis_id in thesis_ids if thesis_id not in THESIS_CATALOG})
     if missing_theses:
         failures.append("missing_required_thesis")
@@ -2312,7 +2419,7 @@ def validate_lens_advisor_memo(payload: dict[str, Any], evidence_map: dict[str, 
     shame_hits = [phrase for phrase in _SHAMING_PHRASES if phrase in lowered]
     raw_field_hits = _raw_field_name_hits(visible_text)
     loose_approximation_hits = _loose_approximation_hits(visible_text)
-    missing_memo_theme_markers = _missing_memo_theme_markers(memo, thesis_ids)
+    missing_memo_theme_markers = _missing_memo_theme_markers(memo, [thesis_id for thesis_id in thesis_ids if thesis_id in applicable_theses])
     cited_evidence_items = [evidence_map[eid] for eid in cited_ids if eid in evidence_map]
     goal_capacity_goal_status_missing = (
         "goal_capacity_reality" in thesis_ids
@@ -2344,7 +2451,7 @@ def validate_lens_advisor_memo(payload: dict[str, Any], evidence_map: dict[str, 
     if unsupported:
         failures.append("unsupported_numeric_claim")
 
-    coverage_count = len(set(thesis_ids) & set(REQUIRED_THESES))
+    coverage_count = len(set(thesis_ids) & set(applicable_theses))
     score = (
         coverage_count * 10
         - len(missing_theses) * 12
@@ -2361,7 +2468,9 @@ def validate_lens_advisor_memo(payload: dict[str, Any], evidence_map: dict[str, 
         "ok": not failures,
         "score": score,
         "coverage_count": coverage_count,
-        "required_count": len(REQUIRED_THESES),
+        "required_count": len(applicable_theses),
+        "applicable_required_theses": list(applicable_theses),
+        "non_applicable_theses": [thesis_id for thesis_id in REQUIRED_THESES if thesis_id not in applicable_theses],
         "missing_theses": missing_theses,
         "unknown_theses": unknown_theses,
         "invalid_evidence_ids": sorted(set(invalid_evidence)),
@@ -2633,8 +2742,8 @@ def build_lens_prompt(bundle: dict[str, Any], lens: dict[str, Any]) -> str:
 - For goal capacity, explain what monthly room remains after reconciled operating burn and configured goal requirements.
 - For savings scenarios, call them optional planning sensitivities, not commands.
 - For data quality, explain what limits precision without using backend language.
-- For avoidable leakage, separate preventable friction from intentional spending.
-- For alcohol, call it a soft-ceiling/tuning issue and not a morality read.
+- For avoidable leakage, separate preventable friction from intentional spending; if the leakage check is clean, say so without inventing fee friction.
+- For detected private discretionary spend, use neutral rhythm, pause, or soft-ceiling language; never moralize or infer motive.
 - For fees, say whether fees should be inspected before broad category cuts.
 - For trip/event spend, say it should be separated from normal baseline.
 - For the operating floor, use the phrase "fixed monthly floor".
@@ -2715,9 +2824,10 @@ Final composer rules:
 - Savings scenarios are optional planning sensitivities, not commands or moral judgments.
 - Data-quality limitations should explain what could change the smaller recommendations.
 - Do not call range-wide event exclusions current-month exclusions unless the current-month event-exclusion field supports it.
-- For avoidable leakage, explain what looks like fixable friction before recommending any painful lifestyle cuts.
-- For alcohol, call it a soft-ceiling/tuning issue and not a morality read.
-- For vaping, the caveat is sync completeness; say "pause" only when the safe lever explicitly says pause, otherwise call it a reduction or lower rhythm.
+- For avoidable leakage, explain what looks like fixable friction before recommending painful lifestyle cuts; if the leakage check is clean, say it is clean.
+- For detected private discretionary spend, use neutral rhythm, pause, or soft-ceiling language; never moralize or infer motive.
+- For recurring service/provider spend, call it a vendor or service review, quote, or service-level check rather than daily overspending.
+- For repeated small purchases, call it consolidation or batching, not the main thesis.
 - For fees, say whether fees should be inspected before broad category cuts.
 - For trip/event spend, say it should be separated from normal baseline.
 - For the operating floor, use the phrase "fixed monthly floor".
@@ -2768,7 +2878,10 @@ def build_lens_final_repair_prompt(
     candidate_theses: list[dict[str, Any]],
     prior_payload: dict[str, Any],
     quality: dict[str, Any],
+    *,
+    required_thesis_ids: tuple[str, ...] | list[str] | None = None,
 ) -> str:
+    required_ids = list(required_thesis_ids or quality.get("applicable_required_theses") or REQUIRED_THESES)
     repair_input = {
         "validated_candidate_theses": candidate_theses,
         "prior_memo_markdown": str((prior_payload or {}).get("memo_markdown") or "")[:5000],
@@ -2777,7 +2890,7 @@ def build_lens_final_repair_prompt(
         "raw_field_name_hits": quality.get("raw_field_name_hits") or [],
         "loose_approximation_hits": quality.get("loose_approximation_hits") or [],
         "missing_memo_theme_markers": quality.get("missing_memo_theme_markers") or [],
-        "required_thesis_ids": list(REQUIRED_THESES),
+        "required_thesis_ids": required_ids,
     }
     return _prompt_header(
         "Repair the final private analyst memo after validation failure. Keep the same thesis IDs and evidence. Rewrite only memo_markdown and thesis_order."
@@ -2791,9 +2904,10 @@ def build_lens_final_repair_prompt(
 - Preserve every required_thesis_ids item already present in validated_candidate_theses.
 - Keep a "The Money Map" section when money_map_baseline is present.
 - Keep a "The Month I Would Plan Around" section when goal_capacity_reality is present.
-- For avoidable leakage, explain fixable friction before painful lifestyle cuts.
-- For alcohol, call it a soft-ceiling/tuning issue and not a morality read.
-- For vaping, the caveat is sync completeness; say "pause" only when the safe lever explicitly says pause, otherwise call it a reduction or lower rhythm.
+- For avoidable leakage, explain fixable friction before painful lifestyle cuts; if the leakage check is clean, say it is clean.
+- For detected private discretionary spend, use neutral rhythm, pause, or soft-ceiling language; never moralize or infer motive.
+- For recurring service/provider spend, call it a vendor or service review, quote, or service-level check rather than daily overspending.
+- For repeated small purchases, call it consolidation or batching, not the main thesis.
 - For fees, say whether fees should be inspected before broad category cuts.
 - For trip/event spend, say it should be separated from normal baseline.
 - For the operating floor, use the phrase "fixed monthly floor".
@@ -2804,7 +2918,7 @@ Repair input JSON:
 
 
 def _validated_candidate(thesis: dict[str, Any], evidence_map: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
-    thesis_id = str(thesis.get("thesis_id") or "").strip()
+    thesis_id = _canonical_thesis_id(thesis.get("thesis_id"))
     if thesis_id not in THESIS_CATALOG:
         return None
     evidence_ids = [str(value) for value in thesis.get("evidence_ids") or [] if str(value).strip()]
@@ -3104,18 +3218,18 @@ def _ensure_thesis_language(thesis_id: str, summary: str, paragraph: str, caveat
         additions.append("Liquidity is not the main read, so cash panic should not drive the recommendation.")
     elif thesis_id == "fixed_floor_matters" and "fixed monthly floor" not in combined:
         additions.append("The fixed monthly floor should anchor the operating plan.")
-    elif thesis_id == "trip_event_exclusion" and not _text_has_trip_exclusion(combined):
+    elif thesis_id == "event_noise_exclusion" and not _text_has_trip_exclusion(combined):
         additions.append("Trip/event spend should be separated from the normal lifestyle baseline.")
-    elif thesis_id == "avoidable_leakage_first" and not _text_has_avoidable_leakage(combined):
-        additions.append("Avoidable leakage should be fixed before painful lifestyle cuts.")
-    elif thesis_id == "protect_vaping_pause" and "vaping" in combined:
-        if "protect" not in combined:
-            additions.append("If sync is complete, protect the vaping reduction rather than treating it as spend to claw back elsewhere.")
+    elif thesis_id == "avoidable_leakage_status" and not _text_has_avoidable_leakage(combined):
+        additions.append("The leakage check should come before painful lifestyle cuts, even when the useful answer is that the check is clean.")
+    elif thesis_id == "private_discretionary_pause":
+        if "protect" not in combined and "preserve" not in combined:
+            additions.append("If sync is complete, protect the private-spend reduction rather than treating it as spend to claw back elsewhere.")
         if not _text_has_private_reduction_context(combined):
             additions.append("The point is the lower rhythm versus prior peaks, not a judgment about the category.")
-    elif thesis_id == "alcohol_soft_ceiling":
+    elif thesis_id == "private_discretionary_rhythm":
         if "soft ceiling" not in combined and "tuning" not in combined:
-            additions.append("Treat alcohol as a soft-ceiling/tuning issue.")
+            additions.append("Treat the private-spend rhythm as a soft-ceiling/tuning issue.")
         if "moral" not in combined:
             additions.append("It is not a morality read.")
     elif thesis_id == "fees_inspection_first" and not _text_has_fee_inspection(combined):
@@ -3153,25 +3267,33 @@ def _missing_memo_theme_markers(memo: str, thesis_ids: list[str]) -> list[str]:
             ok = "fixed monthly floor" in text
         elif thesis_id == "income_continuity_uncertain":
             ok = "income" in text and ("source" in text or "unlabeled" in text or "continuity" in text or "verification" in text)
-        elif thesis_id == "trip_event_exclusion":
+        elif thesis_id == "event_noise_exclusion":
             ok = _text_has_trip_exclusion(text)
-        elif thesis_id == "avoidable_leakage_first":
+        elif thesis_id == "avoidable_leakage_status":
             ok = _text_has_avoidable_leakage(text)
-        elif thesis_id == "protect_vaping_pause":
+        elif thesis_id == "private_discretionary_pause":
             ok = (
-                "vaping" in text
-                and ("protect" in text or "protected" in text)
+                ("private" in text or "sensitive" in text)
+                and ("protect" in text or "protected" in text or "preserve" in text)
                 and ("sync" in text or "reduction" in text or "lower" in text)
                 and _text_has_private_reduction_context(text)
             )
-        elif thesis_id == "alcohol_soft_ceiling":
-            ok = "alcohol" in text and ("soft ceiling" in text or "soft-ceiling" in text or "tuning" in text) and "moral" in text
+        elif thesis_id == "private_discretionary_rhythm":
+            ok = (
+                ("private" in text or "sensitive" in text)
+                and ("soft ceiling" in text or "soft-ceiling" in text or "tuning" in text)
+                and "moral" in text
+            )
         elif thesis_id == "fees_inspection_first":
             ok = _text_has_fee_inspection(text)
-        elif thesis_id == "amazon_tune_up":
-            ok = "amazon" in text and ("tune" in text or "consolidat" in text or "weekly cart" in text)
-        elif thesis_id == "geico_vendor_review":
-            ok = "geico" in text and ("vendor" in text or "quote" in text or "comparison" in text)
+        elif thesis_id == "small_purchase_consolidation":
+            ok = ("small purchase" in text or "small-purchase" in text or "small order" in text or "repeated purchase" in text) and (
+                "tune" in text or "consolidat" in text or "batch" in text or "cart" in text
+            )
+        elif thesis_id == "recurring_service_review":
+            ok = ("recurring" in text or "vendor" in text or "service" in text or "provider" in text) and (
+                "review" in text or "quote" in text or "comparison" in text or "renegotiate" in text
+            )
         elif thesis_id == "data_quality_limits_precision":
             ok = _text_has_data_quality_limits(text)
         elif thesis_id == "missing_data_caveats":
@@ -3251,7 +3373,7 @@ def _text_has_data_quality_limits(text: str) -> bool:
 def _text_has_trip_exclusion(text: str) -> bool:
     return (
         ("trip" in text or "travel" in text or "event" in text)
-        and ("baseline" in text or "separate" in text or "subtract" in text or "exclude" in text)
+        and ("baseline" in text or "separate" in text or "subtract" in text or "exclude" in text or "pulled out" in text or "pull out" in text)
     )
 
 
@@ -3298,10 +3420,16 @@ def _text_has_no_active_goal_status(text: str) -> bool:
 
 
 def _text_has_avoidable_leakage(text: str) -> bool:
-    return (
+    normalized = " ".join(str(text or "").lower().split())
+    clean_check = (
+        "leakage check" in normalized
+        and ("clean" in normalized or "clear" in normalized or "not showing" in normalized or "does not show" in normalized)
+    )
+    friction_check = (
         ("leakage" in text or "fees" in text or "fee" in text or "interest" in text)
         and ("friction" in text or "preventable" in text or "before painful" in text or "before lifestyle" in text or "before broad" in text)
     )
+    return clean_check or friction_check
 
 
 def _text_has_private_reduction_context(text: str) -> bool:
@@ -3741,7 +3869,7 @@ def _advisor_context_block(memo: dict[str, Any], *, delta: dict[str, Any] | None
         "If the user asks for fresh/current exact totals, rely on live Folio evidence instead.\n"
         "Follow-up answer guidance: answer directly with no conversational opener; do not say Hey, TL;DR, no sweat, don't sweat, trimming the fat, or fun outlier. "
         "For focus/risk questions, liquidity is not the main risk; state that cash/liquidity is not the concern, then name income continuity, the fixed monthly floor, and low-pain tune-ups. "
-        "For reduce-without-pain questions, say fees, Amazon-style small purchases, and GEICO/vendor review come before broad category cuts. "
+        "For reduce-without-pain questions, say leakage checks, repeated small-purchase consolidation, and recurring service/vendor reviews come before broad category cuts. "
         "For travel/event questions, say not to overreact because the event is separated from the normal baseline. "
         "For biggest-risk questions, include the caveat that missing goals, budgets, labels, or stale sync can change the recommendation.\n"
     )
@@ -3754,7 +3882,7 @@ def _advisor_context_block(memo: dict[str, Any], *, delta: dict[str, Any] | None
         "- If the question asks about a travel/event month, begin with: Do not overreact to the travel month; then explain baseline separation.\n"
         "- For priorities/focus, state in the first sentence that cash/liquidity is not the main risk; income continuity, the fixed monthly floor, and practical tune-ups matter more.\n"
         "- For travel/event spend, explicitly say not to overreact; separate the event from the normal baseline and avoid treating it as lifestyle drift until confirmed.\n"
-        "- For reduce-without-pain questions, explicitly say fees, Amazon-style small purchases, and GEICO/vendor review come before broad category cuts. Include the sentence: These come before broad category cuts.\n"
+        "- For reduce-without-pain questions, explicitly say leakage checks, repeated small-purchase consolidation, and recurring service/vendor reviews come before broad category cuts. Include the sentence: These come before broad category cuts.\n"
         "- For sensitive private rhythms, use soft-ceiling/tuning language; do not call it a habit, joke about it, moralize it, or say to ignore it.\n"
         "- For biggest-risk questions, lead with income continuity against the fixed monthly floor, then include the caveat that missing goals, budgets, or stale sync can change the recommendation."
     )
@@ -3870,6 +3998,7 @@ __all__ = [
     "advisor_lens_synthesis_enabled",
     "advisor_lens_store_enabled",
     "advisor_lens_ui_enabled",
+    "applicable_required_theses",
     "build_lens_evidence_bundle",
     "build_lens_evidence_map",
     "build_advisor_read_cards",

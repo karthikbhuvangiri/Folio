@@ -399,17 +399,26 @@ def _mira_agentic_runtime_payload() -> dict:
     }
 
 
-def _mira_enabled() -> bool:
-    explicit = os.getenv("MIRA_ENABLED")
-    if explicit is not None and explicit.strip():
-        return explicit.strip().lower() in _TRUE_ENV_VALUES
-
+def _mira_llm_configured() -> bool:
     provider = os.getenv("LLM_PROVIDER", "ollama").strip().lower() or "ollama"
     if provider == "llamacpp":
         return bool(os.getenv("LLAMACPP_BASE_URL", "").strip())
     if provider == "ollama":
         return bool(os.getenv("OLLAMA_BASE_URL", "").strip() and os.getenv("OLLAMA_MODEL_COPILOT", "").strip())
     return False
+
+
+def _mira_enabled() -> bool:
+    explicit = os.getenv("MIRA_ENABLED")
+    if explicit is not None and explicit.strip():
+        return explicit.strip().lower() in _TRUE_ENV_VALUES
+    if DEMO_MODE:
+        return True
+    return _mira_llm_configured()
+
+
+def _mira_demo_preview_only() -> bool:
+    return DEMO_MODE and not _mira_llm_configured()
 
 
 def _categorization_status_payload(*, preload_distilbert: bool = False) -> dict:
@@ -493,6 +502,7 @@ def _app_config_payload(db=None) -> dict:
         cash_low_point_radar_enabled_flag = cash_low_point_radar_enabled()
     except Exception as exc:
         logger.debug("Failed to load money outlook flags: %s", exc)
+    mira_demo_preview_only = _mira_demo_preview_only()
     payload = {
         "demoMode": DEMO_MODE,
         "bankLinkingEnabled": not DEMO_MODE,
@@ -500,9 +510,10 @@ def _app_config_payload(db=None) -> dict:
         "demoPersistence": "ephemeral" if DEMO_MODE else "persistent",
         "receiptIntelligenceEnabled": RECEIPT_INTELLIGENCE_ENABLED,
         "miraEnabled": _mira_enabled(),
-        "miraAdvisorReadUiEnabled": advisor_read_ui_enabled,
-        "miraAdvisorReadContextEnabled": advisor_read_context_enabled,
-        "miraAdvisorReadGenerationEnabled": advisor_read_generation_enabled,
+        "miraDemoPreviewOnly": mira_demo_preview_only,
+        "miraAdvisorReadUiEnabled": advisor_read_ui_enabled or mira_demo_preview_only,
+        "miraAdvisorReadContextEnabled": False if mira_demo_preview_only else advisor_read_context_enabled,
+        "miraAdvisorReadGenerationEnabled": False if mira_demo_preview_only else advisor_read_generation_enabled,
         "miraFinancialFeedbackLoopEnabled": financial_feedback_loop_enabled,
         "miraStatedIntentMemoryEnabled": stated_intent_memory_enabled,
         "miraHabitStreaksEnabled": habit_streaks_enabled_flag,
@@ -732,6 +743,30 @@ def _public_advisor_read_payload(memo: dict, *, delta: dict | None = None, feedb
     return public_memo
 
 
+def _demo_advisor_read_response(profile: str | None) -> dict | None:
+    try:
+        from mira.demo_advisor_read import load_demo_advisor_read
+    except Exception as exc:
+        logger.debug("Failed to load static demo advisor read module: %s", exc)
+        return None
+
+    demo_memo = load_demo_advisor_read(profile)
+    if not demo_memo:
+        return None
+    return {
+        "enabled": True,
+        "context_enabled": False,
+        "generation_enabled": False,
+        "memo": _public_advisor_read_payload(demo_memo),
+        "job": {
+            "status": "demo_preview",
+            "reason": "static_demo_advisor_read",
+            "profile": profile or "household",
+        },
+        "empty_reason": None,
+    }
+
+
 _ADVISOR_FOLLOWUP_TYPES = {
     "focus",
     "levers",
@@ -896,9 +931,11 @@ _ADVISOR_FIRST_ACTION_TERMS = (
     "fees",
     "interest",
     "leakage",
-    "amazon",
-    "geico",
+    "small purchase",
+    "purchase",
     "vendor",
+    "provider",
+    "service",
     "recurring",
     "subscription",
 )
@@ -1205,7 +1242,7 @@ def _advisor_read_followup_reject_reasons(
     kind = _advisor_read_followup_kind(followup_type)
     if kind == "focus" and not ("cash" in lowered and ("income" in lowered or "fixed" in lowered or "floor" in lowered)):
         reasons.append("missing_focus_thesis")
-    if kind == "levers" and not any(term in lowered for term in ("fee", "amazon", "geico", "vendor", "recurring", "subscription", "soft ceiling", "rhythm", "private")):
+    if kind == "levers" and not any(term in lowered for term in ("fee", "leakage", "small purchase", "purchase", "vendor", "provider", "service", "recurring", "subscription", "soft ceiling", "rhythm", "private")):
         reasons.append("missing_lever_thesis")
     if kind == "event_noise" and not (
         ("travel" in lowered or "event" in lowered or "trip" in lowered)
@@ -1225,7 +1262,7 @@ def _advisor_read_followup_reject_reasons(
     if _advisor_question_asks_for_actions(question or ""):
         has_action_language = (
             ("first" in lowered or "start" in lowered or "priority" in lowered)
-            and any(term in lowered for term in ("fee", "leakage", "income", "geico", "amazon", "capacity", "goal"))
+            and any(term in lowered for term in ("fee", "leakage", "income", "vendor", "service", "purchase", "capacity", "goal"))
         )
         if not has_action_language:
             reasons.append("missing_ranked_action")
@@ -1367,7 +1404,7 @@ def _advisor_read_followup_fallback(public_memo: dict, followup_type: str) -> st
             answer += "\n\nDo not turn this into broad cuts before the low-pain cleanup is done."
             return answer
         return (
-            "Start with the tune-ups before broad cuts: fees, Amazon-style small purchases, recurring charges, and vendor reviews are the lower-pain places to inspect first.\n\n"
+            "Start with the tune-ups before broad cuts: leakage checks, repeated small purchases, recurring charges, and vendor reviews are the lower-pain places to inspect first.\n\n"
             "Do not overcorrect from one noisy month or a private rhythm that is already improving; the read treats those as tuning signals, not a character verdict.\n\n"
             f"Next move: check the repeat charges and vendor pricing first, then only trim broader categories if the pattern survives that cleanup. Caveat: {caveat}"
         )
@@ -4683,12 +4720,17 @@ def mira_advisor_read_endpoint(
     profile: str | None = Depends(validate_profile),
     db=Depends(get_db_session),
 ):
+    advisor_profile = _advisor_read_effective_profile(db, profile)
+    if _mira_demo_preview_only():
+        demo_response = _demo_advisor_read_response(advisor_profile)
+        if demo_response:
+            return demo_response
+
     from mira.advisor_lens_synthesis import advisor_lens_context_enabled, advisor_lens_ui_enabled, list_lens_advisor_memos
 
     enabled = advisor_lens_ui_enabled()
     context_enabled = advisor_lens_context_enabled()
     generation_enabled = _advisor_read_generation_enabled()
-    advisor_profile = _advisor_read_effective_profile(db, profile)
     memo = None
     if enabled:
         memos = list_lens_advisor_memos(profile=advisor_profile, conn=db, limit=1)
@@ -4711,6 +4753,24 @@ def mira_advisor_read_refresh_endpoint(
     profile: str | None = Depends(validate_profile),
     db=Depends(get_db_session),
 ):
+    advisor_profile = _advisor_read_effective_profile(db, profile)
+    if _mira_demo_preview_only():
+        demo_response = _demo_advisor_read_response(advisor_profile)
+        if demo_response:
+            return {
+                "status": "demo_preview",
+                **demo_response,
+                "preflight": {
+                    "status": "loaded",
+                    "decision": "static_demo_advisor_read",
+                    "reason": "demo_mode_without_llm",
+                    "stored_delta_count": 0,
+                    "expired_delta_count": 0,
+                    "duplicate_delta": False,
+                    "needs_full_rebuild": False,
+                },
+            }
+
     from mira.advisor_lens_synthesis import (
         advisor_lens_context_enabled,
         advisor_lens_ui_enabled,
@@ -4721,7 +4781,6 @@ def mira_advisor_read_refresh_endpoint(
     enabled = advisor_lens_ui_enabled()
     context_enabled = advisor_lens_context_enabled()
     generation_enabled = _advisor_read_generation_enabled()
-    advisor_profile = _advisor_read_effective_profile(db, profile)
     memo = None
     preflight: dict | None = None
     if enabled:
@@ -4781,12 +4840,21 @@ def mira_advisor_read_generate_endpoint(
     profile: str | None = Depends(validate_profile),
     db=Depends(get_db_session),
 ):
+    advisor_profile = _advisor_read_effective_profile(db, profile)
+    if _mira_demo_preview_only():
+        demo_response = _demo_advisor_read_response(advisor_profile)
+        if demo_response:
+            return {
+                "status": "disabled",
+                "reason": "demo_preview_static_read",
+                **demo_response,
+            }
+
     from mira.advisor_lens_synthesis import advisor_lens_context_enabled, advisor_lens_ui_enabled, list_lens_advisor_memos
 
     enabled = advisor_lens_ui_enabled()
     context_enabled = advisor_lens_context_enabled()
     generation_enabled = _advisor_read_generation_enabled()
-    advisor_profile = _advisor_read_effective_profile(db, profile)
     memos = list_lens_advisor_memos(profile=advisor_profile, conn=db, limit=1) if enabled else []
     memo = None
     if memos:

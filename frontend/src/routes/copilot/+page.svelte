@@ -29,8 +29,10 @@
     let copilotModelInstalling = false;
     let modelDropdownOpen = false;
     let appConfig = {
+        demoMode: false,
         receiptIntelligenceEnabled: false,
         miraAgenticRuntime: 'current',
+        miraDemoPreviewOnly: false,
         miraAdvisorReadUiEnabled: false,
         miraAdvisorReadContextEnabled: false,
         miraAdvisorReadGenerationEnabled: false,
@@ -373,6 +375,7 @@
     $: advisorReadVisible = advisorReadEnabled || appConfig.miraAdvisorReadUiEnabled;
     $: advisorReadFollowupEnabled = advisorReadContextEnabled || appConfig.miraAdvisorReadContextEnabled;
     $: advisorReadCanGenerate = advisorReadGenerationEnabled || appConfig.miraAdvisorReadGenerationEnabled;
+    $: miraDemoPreviewOnly = Boolean(appConfig.miraDemoPreviewOnly);
     $: advisorReadJobRunning = ['queued', 'running'].includes(advisorReadJob?.status);
     $: advisorReadTitle = advisorRead
         ? 'Your financial portrait'
@@ -403,7 +406,8 @@
     onMount(async () => {
         const prompt = $page.url.searchParams.get('prompt');
         if (prompt) input = prompt;
-        await Promise.all([refreshSidebar(), loadLocalLlm(), loadAppConfig()]);
+        await loadAppConfig();
+        await Promise.all([refreshSidebar(), miraDemoPreviewOnly ? Promise.resolve() : loadLocalLlm()]);
         lastLoadedProfile = activeProfileId;
         await restoreReceiptFromNavigation();
         // Load categories for chip form dropdowns
@@ -921,6 +925,10 @@
     async function send() {
         const question = input.trim();
         if (!question) return;
+        if (miraDemoPreviewOnly) {
+            setNotice('Mira chat is disabled in the public demo because no local model is attached.');
+            return;
+        }
 
         if (shouldRouteTypedAdvisorReadFollowup(question)) {
             await sendAdvisorReadFollowup('general', question);
@@ -2587,14 +2595,16 @@
                         {/if}
                     </section>
                 {/if}
-                <p class="copilot-starter-label">Start here</p>
-                <div class="copilot-starter-row">
-                    {#each starterChips as chip}
-                        <button on:click={() => activateChip(chip)} class="copilot-suggestion-btn">
-                            {chip.label}
-                        </button>
-                    {/each}
-                </div>
+                {#if !miraDemoPreviewOnly}
+                    <p class="copilot-starter-label">Start here</p>
+                    <div class="copilot-starter-row">
+                        {#each starterChips as chip}
+                            <button on:click={() => activateChip(chip)} class="copilot-suggestion-btn">
+                                {chip.label}
+                            </button>
+                        {/each}
+                    </div>
+                {/if}
             {/if}
     </section>
 
@@ -2881,8 +2891,9 @@
                 <div class="copilot-composer-row">
                     <div class="flex-1 relative">
                         <textarea bind:value={input} on:keydown={handleKeydown}
-                            placeholder="Ask Mira about your money, code, ideas, or changes to your app data…"
+                            placeholder={miraDemoPreviewOnly ? "Mira is visible in the demo; chat is available in local mode." : "Ask Mira about your money, code, ideas, or changes to your app data…"}
                             rows="1"
+                            disabled={miraDemoPreviewOnly}
                             class="w-full px-4 py-3 text-[13px] resize-none transition-all copilot-composer-textarea"></textarea>
                         {#if localLlmStatus?.provider === 'ollama'}
                             <div class="copilot-model-inline">
@@ -2950,13 +2961,13 @@
                             <span class="material-symbols-outlined text-white text-[18px]">stop</span>
                         </button>
                     {:else}
-                        <button on:click={send} disabled={!input.trim()} class="copilot-send-btn">
+                        <button on:click={send} disabled={!input.trim() || miraDemoPreviewOnly} class="copilot-send-btn">
                             <span class="material-symbols-outlined text-white text-[18px]">arrow_upward</span>
                         </button>
                     {/if}
                 </div>
                 <p class="text-[9px] text-center mt-2" style="color: var(--text-muted)">
-                    Mira can explain decisions, draft safe changes for your approval, and keep the conversation private.
+                    {miraDemoPreviewOnly ? 'Mira is shown in demo mode without connecting to a local model.' : 'Mira can explain decisions, draft safe changes for your approval, and keep the conversation private.'}
                 </p>
             </div>
         </section>

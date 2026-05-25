@@ -1,0 +1,26 @@
+# Python environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Local SQLite data should be mounted at /data, never baked into the image
+*.db
+*.db-shm
+*.db-wal
+data/
+
+# Local secrets/config
+.env
+.env.*
+
+# OS/editor noise
+.DS_Store
+.vscode/
+.idea/
+
+# Test/build noise
+.coverage
+htmlcov/

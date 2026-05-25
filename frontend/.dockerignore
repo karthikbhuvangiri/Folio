@@ -1,0 +1,19 @@
+# Dependencies and build output are produced inside the Docker build
+node_modules/
+build/
+.svelte-kit/
+.vite/
+
+# Local env/config
+.env
+.env.*
+
+# OS/editor noise
+.DS_Store
+.vscode/
+.idea/
+
+# Logs/caches
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
